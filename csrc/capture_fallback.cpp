@@ -1,5 +1,6 @@
-// Boxed fallback registered on DispatchKey::PrivateUse2. Activated when the
-// user enters `with capture():` which pushes kCaptureKey into TLS include set.
+// Boxed fallback registered on DispatchKey::TESTING_ONLY_GenericMode.
+// Activated when the user enters `with capture():` which pushes
+// kCaptureKey into the TLS include set.
 //
 // On each invocation we:
 //   1. Classify each stack input as captured-tensor / prev-step-output /
@@ -12,6 +13,13 @@
 //      dispatcher then picks the actual backend kernel.
 //   4. Stash output TensorImpl identities so subsequent steps can resolve
 //      their inputs as prev-step references.
+//
+// Position: kCaptureKey (TESTING_ONLY_GenericMode, enum #411) is one of
+// the highest-priority dispatch keys — well above AutogradFunctionality
+// (#333) and ADInplaceOrView (#304). So when the user calls .backward()
+// inside the with-block (allow_grad=True path), the backward aten ops
+// dispatched by the autograd engine also pass through this fallback.
+// That's why a single trace can carry forward + backward.
 
 #include "capture_context.h"
 

@@ -76,11 +76,47 @@ seqlen) the copy can dominate any dispatcher savings. Pick observation
 points consciously.
 
 
+Quick start (forward + backward, experimental):
+===============================================
+
+The dispatcher fallback sits above AutogradFunctionality in priority,
+so backward aten ops dispatched by the autograd engine are also
+visible. Opt in with `allow_grad=True`:
+
+    x = torch.randn(8, requires_grad=True)
+    x.grad = torch.zeros_like(x)         # MUST pre-allocate
+    grad_out = torch.ones(8)
+
+    with tdc.capture(allow_grad=True) as trace:
+        y = x * x * 2
+        y.backward(grad_out)             # forward + backward both recorded
+
+    x.grad.zero_(); trace.replay()       # x.grad reflects the new gradient
+
+Replay internally pushes `at::AutoDispatchBelowAutograd` so autograd
+wrappers are skipped — replay is pure aten-op execution, no second
+backward graph is built.
+
+Caveats:
+  - `x.grad` must be pre-allocated BEFORE the capture block.
+    AccumulateGrad's first-time branch is a direct C++ assignment
+    that is NOT dispatched and cannot be recorded; pre-allocating
+    forces the `add_` accumulating branch, which IS dispatched.
+  - `.grad` accumulates across replays. Zero it manually for one-shot
+    semantics.
+  - For leaf tensors with `requires_grad=True`, `resize_()` is
+    forbidden. Use `x.data = new_tensor` to swap storage while
+    keeping the same TensorImpl identity that the trace captured.
+  - Backward through reductions (`sum`, `mean`, `norm`, ...) bakes
+    shape literals in trace and does NOT support dynamic shape on
+    replay. Element-wise / matmul backward chains are fine.
+
+
 Limitations (v1):
 =================
 
-- Must be inside `torch.no_grad()`. Autograd support is future work
-  (see design doc §17.1).
+- Default `allow_grad=False` requires `torch.no_grad()`. Use
+  `allow_grad=True` for the experimental backward support above.
 - The captured Tensor *objects* (Python identity) must be the same
   ones used at replay. Their metadata (sizes/strides/data_ptr) can
   change freely.
@@ -128,10 +164,17 @@ def capture(allow_grad: bool = False):
       - ``requires_grad`` of captured tensors must not change between
         capture and replay (it influences which dispatch keys are in
         the keyset, hence which kernels are selected).
-      - Replay re-runs autograd at the forward steps, building a fresh
-        backward graph that's then discarded. This double-work limits
-        the dispatcher savings; see design doc §17.1 for v2 paths that
-        eliminate it.
+      - For dynamic-shape leaf inputs, prefer ``x.data = new_tensor``
+        over ``x.resize_(...)`` (leaf tensors with ``requires_grad``
+        refuse in-place resize).
+      - Backward ops whose schemas include shape literals — most
+        notably ``sum``/``mean``/``norm`` backward (the ``expand``
+        with saved shape) — bake those literals at capture and will
+        not adapt to new shapes on replay. Element-wise and matmul
+        backward chains are dynamic-shape safe.
+      - Replay internally pushes ``at::AutoDispatchBelowAutograd``,
+        so autograd wrappers are skipped on replay (no second
+        backward graph gets built and discarded).
 
     Observing replay results
     ------------------------

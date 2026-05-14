@@ -112,13 +112,91 @@ returning a `[B, S=2048, L=256]` tensor = several MB) the copy itself
 can dominate the dispatcher savings. Pick observation points
 consciously — only copy what you actually need to inspect.
 
+### Pattern C: Forward + backward capture (experimental, `allow_grad=True`)
+
+The dispatcher fallback fires at `TESTING_ONLY_GenericMode` (priority
+#3), which is **above** `AutogradFunctionality` (#19). When grad is
+enabled inside the capture block, the autograd engine dispatches
+backward aten ops through the dispatcher, and our fallback records
+them just like forward ops. A single trace can therefore contain the
+entire forward + backward of one training-style step.
+
+```python
+x = torch.randn(8, requires_grad=True)
+x.grad = torch.zeros_like(x)           # MUST pre-allocate (see below)
+grad_out = torch.ones(8)
+
+with tdc.capture(allow_grad=True) as trace:
+    y = x * x * 2
+    y.backward(grad_out)               # forward + backward both recorded
+
+# Replay reproduces the gradient.
+x.grad.zero_()
+trace.replay()
+# x.grad now contains 4*x (dy/dx for y = 2x^2 with grad seed 1)
+```
+
+Replay internally pushes `at::AutoDispatchBelowAutograd` so the
+dispatcher skips VariableType wrappers — autograd does NOT re-run at
+replay time. This avoids:
+  - building a fresh backward graph that nobody traverses (wasted work)
+  - attaching `grad_fn` to `.grad` (which would prevent subsequent
+    `resize_` between replays)
+
+**Caveats with `allow_grad=True`**:
+
+1. **Pre-allocate `.grad`** before entering the capture block:
+
+   ```python
+   x.grad = torch.zeros_like(x)
+   ```
+
+   `AccumulateGrad` takes a direct C++ assignment path when `.grad`
+   is `None`, which is NOT a dispatched op — it would be silently
+   missed and replay would not update `.grad`. After pre-allocation
+   the `add_` accumulate path is taken, which IS dispatched and
+   recorded.
+
+2. **`.grad` accumulates across replays** (same semantics as calling
+   `.backward()` repeatedly in eager). Zero it manually for one-shot
+   semantics:
+
+   ```python
+   x.grad.zero_(); trace.replay()
+   ```
+
+3. **`requires_grad` must not change** between capture and replay
+   (it affects which dispatch keys are in the keyset).
+
+4. **Dynamic-shape leaves**: a leaf tensor with `requires_grad=True`
+   refuses `resize_()`. Use `x.data = new_tensor` instead — this
+   keeps the same `TensorImpl` (so the trace's captured ref stays
+   valid) and replaces storage/sizes:
+
+   ```python
+   x.data = torch.randn(new_n)        # ✓ correct
+   x.grad.resize_as_(x).zero_()       # x.grad doesn't need this trick
+   ```
+
+5. **Backward through reductions bakes shape literals**: ops like
+   `sum().backward()` capture the input's shape as an
+   `IntArrayRef` literal inside the backward's `expand` op. Replay
+   at a different shape uses the stale literal and produces wrong
+   gradients. **Element-wise** backward chains (`mul`, `add`,
+   `relu`, `silu`, plain `matmul`, ...) work cleanly with dynamic
+   shape; backward through `sum`/`mean`/`norm` does not, and you
+   need to re-capture per shape.
+
+   See `test/test_backward.py::test_backward_dynamic_shape_with_reduction_fails`
+   for the documented expected-failure example.
+
 ## Why `replay()` returns nothing
 
 A trace is a recording of **side effects**, not a pure function. A
 typical captured block in production writes to multiple tensors (KV
 cache slices, attention output buffer, sometimes statistics counters);
 returning "the last step's output" would silently hide all the other
-writes and mislead callers. Patterns A and B above are explicit about
+writes and mislead callers. Patterns A/B/C above are explicit about
 which tensors are observation points.
 
 ## Tests
@@ -127,7 +205,16 @@ which tensors are observation points.
 python -m unittest discover test -v        # all tests
 python -m unittest test.test_correctness   # 7 correctness tests
 python -m unittest test.test_dynamic_shape # 4 dynamic-shape tests
+python -m unittest test.test_backward      # 8 backward tests
 python test/test_benchmark.py              # 5 benchmarks with numbers
+```
+
+Benchmarks accept `TDC_DEVICE` for cross-device runs:
+
+```bash
+TDC_DEVICE=cuda  python -m unittest test.test_benchmark
+TDC_DEVICE=npu   python -m unittest test.test_benchmark
+TDC_DEVICE=mps   python -m unittest test.test_benchmark
 ```
 
 ## Layout
@@ -143,14 +230,17 @@ setup.py                    CppExtension config (MAX_JOBS<=4)
 test/
   test_correctness.py       7 tests, no_grad guard, nested rejection
   test_dynamic_shape.py     4 tests, varied batch / resize / mutation
-  test_benchmark.py         5 benchmarks, eager vs replay timings
+  test_backward.py          8 tests, allow_grad capture + replay
+  test_benchmark.py         5 benchmarks, eager vs replay timings;
+                             reads TDC_DEVICE for cross-device runs
 ```
 
 ## Known v1 limitations (intentional)
 
-- Must capture inside `torch.no_grad()`. Autograd support is future
-  work — see design doc §17.1 (route B1: cache autograd wrapper as
-  kernel; route B2: capture forward + backward together AOT-style).
+- **Forward + autograd default**: `capture()` defaults to
+  `allow_grad=False` and requires `torch.no_grad()`. Backward support
+  is opt-in via `allow_grad=True` (see Pattern C above) and has its
+  own caveats listed there.
 - The captured Tensor **objects** (Python identity) must be the same
   ones used at replay. Their metadata (sizes/strides/data_ptr) can
   change freely. Use Pattern B to track output-side identity for code
@@ -161,6 +251,9 @@ test/
 - `as_strided` and similar ops whose `size`/`stride` args are baked as
   Python ints are frozen at capture-time values. Use shape-derived
   parameters (e.g., `view(-1, 8)`) if you need shape-following views.
+  The same limitation hits backward ops whose schemas include shape
+  literals — most notably reductions' backward (`sum_backward` calls
+  `expand(saved_shape)`). Pattern C documents this.
 - TensorList args (e.g., `aten::cat([t1, t2, ...])`) are recorded as
   literal IValues; in-place mutation of list elements may not
   propagate. Common patterns work fine; corner-case workloads might.
@@ -170,9 +263,15 @@ test/
 1. Boxed fallback registered on `TESTING_ONLY_GenericMode` fires on
    every aten op while capture is active; it classifies inputs
    (captured tensor / prior-step output / literal IValue), records the
-   step, and runs the op normally.
+   step, and runs the op normally. Because GenericMode sits above
+   AutogradFunctionality in priority, autograd's backward dispatches
+   are also visible when `allow_grad=True`.
 2. `Trace::replay()` re-pushes inputs onto a stack (reading current
    metadata from the captured Tensor objects, so mutations propagate)
-   and invokes each step's op via `op.callBoxed(stack)`.
+   and invokes each step's op via `op.callBoxed(stack)`. Replay also
+   pushes `at::AutoDispatchBelowAutograd` so autograd wrappers do not
+   re-execute — every replay is pure aten-op execution.
 3. Dynamic shape is automatic because each push reads the Tensor's
-   current `sizes/strides/data_ptr`, and the kernel adapts.
+   current `sizes/strides/data_ptr`, and the kernel adapts. The few
+   ops that bake shape into literals (`as_strided`,
+   `sum_backward`'s `expand`, ...) are the documented exceptions.
