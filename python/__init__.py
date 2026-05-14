@@ -105,13 +105,33 @@ is_capturing = _ext.is_capturing
 
 
 @contextlib.contextmanager
-def capture():
+def capture(allow_grad: bool = False):
     """Capture all aten ops in scope into a replayable Trace.
 
-    Must be called inside ``torch.no_grad()`` — the v1 implementation skips
-    autograd at replay, so any autograd graph built during capture would be
-    bound to capture-time tensors and produce wrong gradients on replay.
-    Backward support is tracked as a future extension.
+    By default this must be called inside ``torch.no_grad()`` — capture +
+    replay is most predictable for inference workloads. Set
+    ``allow_grad=True`` to enable experimental forward+backward capture:
+    the dispatcher fallback fires before AutogradFunctionality (priority
+    #3 vs #19), so calling ``loss.backward()`` inside the capture block
+    records all backward aten ops too. Replay re-runs the full op
+    sequence, updating ``.grad`` on the captured leaf tensors.
+
+    Caveats with ``allow_grad=True``:
+      - Leaf tensor's ``.grad`` must be allocated BEFORE capture
+        (e.g., ``x.grad = torch.zeros_like(x)``). Otherwise
+        ``AccumulateGrad`` takes the assignment branch on the first
+        backward, which is a C++ direct assignment NOT visible to the
+        dispatcher; replay would silently fail to update ``.grad``.
+      - ``.grad`` accumulates on every replay (just like calling
+        ``.backward()`` repeatedly in eager). Zero it manually between
+        replays if you want non-accumulating semantics.
+      - ``requires_grad`` of captured tensors must not change between
+        capture and replay (it influences which dispatch keys are in
+        the keyset, hence which kernels are selected).
+      - Replay re-runs autograd at the forward steps, building a fresh
+        backward graph that's then discarded. This double-work limits
+        the dispatcher savings; see design doc §17.1 for v2 paths that
+        eliminate it.
 
     Observing replay results
     ------------------------
@@ -141,13 +161,13 @@ def capture():
     input's metadata on every replay.
 
     Raises:
-        RuntimeError: if called with grad enabled.
+        RuntimeError: if called with grad enabled and ``allow_grad=False``.
         RuntimeError: if another capture is already active on this thread.
     """
-    if torch.is_grad_enabled():
+    if not allow_grad and torch.is_grad_enabled():
         raise RuntimeError(
-            "tdc.capture() must be inside torch.no_grad(); v1 does not "
-            "support autograd."
+            "tdc.capture() requires torch.no_grad() by default; pass "
+            "allow_grad=True for experimental forward+backward capture."
         )
     trace = _ext.begin_capture()
     try:

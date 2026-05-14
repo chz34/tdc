@@ -21,6 +21,7 @@
 
 #include "capture_context.h"
 
+#include <ATen/core/LegacyTypeDispatch.h>      // AutoDispatchBelowAutograd
 #include <ATen/core/dispatch/Dispatcher.h>
 #include <c10/core/impl/LocalDispatchKeySet.h>
 #include <c10/util/Exception.h>
@@ -31,6 +32,19 @@ namespace tdc {
 void Trace::replay() {
     // Defensive: ensure our capture key is NOT included during replay.
     c10::impl::ExcludeDispatchKeyGuard guard{c10::DispatchKeySet(kCaptureKey)};
+
+    // Exclude Autograd at replay so the dispatcher does NOT re-enter
+    // VariableType wrappers. This serves two purposes:
+    //   1. The captured trace already records both forward and backward
+    //      aten ops (if any) — re-running autograd at replay would
+    //      build a second backward graph that nobody traverses, wasting
+    //      cycles and dirtying tensor states (attaching grad_fn to
+    //      .grad, version-counter bumps, ...).
+    //   2. The captured forward steps' grad_fn metadata is bound to
+    //      capture-time tensor identities; rebuilding it would break
+    //      observation buffers (e.g., x.grad acquiring grad_fn means
+    //      it can no longer be resize_'d for the next replay).
+    at::AutoDispatchBelowAutograd no_autograd_guard;
 
     if (steps_.empty()) {
         return;
