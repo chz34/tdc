@@ -117,23 +117,26 @@ class TestBenchmark(unittest.TestCase):
             p.requires_grad_(False)
 
         x = torch.randn(4, d_model)
-        out = torch.empty(4, 8)
+        obs = torch.empty(4, d_model)  # observation buffer, outlives trace
 
         @torch.no_grad()
         def eager():
             return model(x)
 
+        # Capture eager() AND copy the return value into `obs`. The model
+        # itself is unchanged (natural Python style); the extra
+        # resize_as_+copy_ inside the capture block is the single
+        # convention that makes results externally observable across
+        # replays.
         with torch.no_grad():
             eager()  # warm caches
             with tdc.capture() as trace:
-                out = eager()
+                result = eager()
+                obs.resize_as_(result)
+                obs.copy_(result)
         n_ops = len(trace)
         print(f"\n[FFN dynamic shape] d_model={d_model}, d_ff={d_ff}, "
               f"captured_ops={n_ops}")
-        # Note: numerical correctness for the dispatcher capture mechanism
-        # is validated in test_dynamic_shape.py. Here we only measure
-        # timing — with a pure-functional model + a void replay(), there
-        # is no externally-observable return value to compare against.
 
         batches = [1, 4, 16, 64, 256]
         replay_total_us = 0.0
@@ -145,13 +148,15 @@ class TestBenchmark(unittest.TestCase):
             x.resize_(batch, d_model)
             x.copy_(x_new)
 
-            eager_out = eager()
-            print(eager_out.shape)
-
-            # Smoke check: replay completes without crash at this shape.
+            # Numerical correctness: replay writes into `obs` via the
+            # captured copy_. Compare to an eager reference.
             with torch.no_grad():
                 trace.replay()
-            print(out.shape)
+                replay_out = obs.clone()
+                eager_out = eager()
+            torch.testing.assert_close(
+                replay_out, eager_out,
+                msg=lambda m: f"numerics mismatch at batch={batch}: {m}")
 
             es = bench(eager, iters=iters, warmup=20)
             rs = bench(trace.replay, iters=iters, warmup=20)
@@ -162,7 +167,7 @@ class TestBenchmark(unittest.TestCase):
             print(f"  batch={batch:4d}  eager={es['median_us']:7.2f}us  "
                   f"replay={rs['median_us']:7.2f}us  "
                   f"ratio={rs['median_us']/es['median_us']:.2f}x  "
-                  f"per_op_save={per_op_save:5.0f}ns")
+                  f"per_op_save={per_op_save:5.0f}ns  ✓numerics")
 
         ratio = replay_total_us / eager_total_us
         print(f"\n[FFN dynamic shape total across {batches}]")
@@ -205,6 +210,7 @@ class TestBenchmark(unittest.TestCase):
             p.requires_grad_(False)
 
         x = torch.randn(B, capture_S, L)
+        obs = torch.empty(B, capture_S, L)  # observation buffer
 
         @torch.no_grad()
         def eager():
@@ -213,7 +219,9 @@ class TestBenchmark(unittest.TestCase):
         with torch.no_grad():
             eager()
             with tdc.capture() as trace:
-                eager()
+                result = eager()
+                obs.resize_as_(result)
+                obs.copy_(result)
 
         n_ops = len(trace)
         print(f"\n[SwiGLU dynamic seqlen] B={B}, L={L}, d_ff={d_ff}, "
@@ -237,10 +245,14 @@ class TestBenchmark(unittest.TestCase):
             x.resize_(B, S, L)
             x.copy_(x_new)
 
-            # Smoke check at this shape; full numerical correctness lives
-            # in test_dynamic_shape.py.
+            # Numerical correctness: replay's captured copy_ updates `obs`.
             with torch.no_grad():
                 trace.replay()
+                replay_out = obs.clone()
+                eager_out = eager()
+            torch.testing.assert_close(
+                replay_out, eager_out,
+                msg=lambda m: f"numerics mismatch at S={S}: {m}")
 
             es = bench(eager, iters=iters, warmup=20)
             rs = bench(trace.replay, iters=iters, warmup=20)
@@ -253,7 +265,7 @@ class TestBenchmark(unittest.TestCase):
                   f"replay={rs['median_us']:8.2f}us  "
                   f"ratio={rs['median_us']/es['median_us']:.2f}x  "
                   f"speedup={speedup:.2f}x  "
-                  f"per_op_save={per_op_save:5.0f}ns")
+                  f"per_op_save={per_op_save:5.0f}ns  ✓numerics")
 
         ratio = replay_total_us / eager_total_us
         print(f"\n[SwiGLU dynamic seqlen total across S={seqlens}]")

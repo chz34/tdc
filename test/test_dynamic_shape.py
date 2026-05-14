@@ -71,43 +71,50 @@ class TestDynamicShape(unittest.TestCase):
 
     def test_varied_batch(self):
         # Capture a tiny linear at batch=4 and replay at multiple batches.
+        #
+        # The function is written in fully natural Python style — `out = expr`
+        # rebinds a local variable to a freshly-allocated tensor and returns
+        # it. This rebinding is NOT visible to the caller, so to make replay
+        # results externally observable we add ONE convention inside the
+        # capture block: copy the function's return value into a caller-
+        # provided buffer. The user's existing function code is untouched.
         torch.manual_seed(0)
         w = torch.randn(8, 8)
         b = torch.randn(8)
 
         with torch.no_grad():
-            # We supply an `out=` so we can inspect the result deterministically.
-            def matmul_plus_b(x, w, b, out):
-                torch.matmul(x, w.t(), out=out)
-                out.add_(b)
+            def matmul_plus_b(x, w, b):
+                out = torch.matmul(x, w.t())
+                out = out + b
                 return out
 
             x = torch.randn(4, 8)
-            out = torch.empty(4, 8)
+            obs = torch.empty(4, 8)  # observation buffer; outlives the trace
             with tdc.capture() as trace:
-                matmul_plus_b(x, w, b, out)
-            # Sanity at capture-time batch.
+                result = matmul_plus_b(x, w, b)
+                obs.resize_as_(result)   # in-place resize, captured
+                obs.copy_(result)        # in-place copy, captured
             ref = (x @ w.t()) + b
-            torch.testing.assert_close(out, ref)
+            torch.testing.assert_close(obs, ref)
 
-            # No manual `out.resize_` needed — kernel auto-resizes.
+            # Replay across varied batches — resize_as_ + copy_ in the trace
+            # make `obs` follow whatever shape `result` takes each replay.
             for batch in (1, 2, 8, 16):
                 x.resize_(batch, 8)
                 x.normal_()
                 trace.replay()
                 ref = (x @ w.t()) + b
-                print(out.shape)
-                torch.testing.assert_close(out, ref,
+                torch.testing.assert_close(obs, ref,
                                            msg=f"mismatch at batch={batch}")
 
-            # No manual `out.resize_` needed — kernel auto-resizes.
+            # Same again, mutating x's data via copy_ instead of normal_.
             for batch in (1, 2, 8, 16):
                 x_new = torch.randn(batch, 8)
                 x.resize_(x_new.shape)
                 x.copy_(x_new)
                 trace.replay()
                 ref = (x @ w.t()) + b
-                torch.testing.assert_close(out, ref,
+                torch.testing.assert_close(obs, ref,
                                            msg=f"mismatch at batch={batch}")
 
 
