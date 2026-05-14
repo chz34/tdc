@@ -170,7 +170,7 @@ class TestBenchmark(unittest.TestCase):
                   f"per_op_save={per_op_save:5.0f}ns  ✓numerics")
 
         ratio = replay_total_us / eager_total_us
-        print(f"\n[FFN dynamic shape total across {batches}]")
+        print(f"\n[FFN dynamic batch total across {batches}]")
         print(f"  total_ratio = {ratio:.2f}x   (single capture, {len(batches)} shapes)")
         self.assertLess(ratio, 1.0, "FFN replay regressed vs eager")
 
