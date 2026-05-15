@@ -180,9 +180,61 @@ placeholder 机制属于 v2,初版不包含。初版的约束就是"原对象不
 | 自定义 DispatchKey + fallback | 标准外部扩展 | 仍要被 dispatcher 调一次(capture 期,正是我们要的) | **✓** |
 | Python key 的 `__torch_dispatch__` hook | Python 实现简单 | 已被 PoC 证伪——位置在 dispatcher 外,省不到 dispatcher | ✗ |
 
-**选**:用 `PrivateUse2` 作为 capture key,配合 TLS `IncludeDispatchKeyGuard`
-启用。capture 期 fallback 每个 op 都进一次,之后 replay 期把它从 TLS 里排
-除,直调 cached kernel。
+**选**:用 `TESTING_ONLY_GenericMode` 作为 capture key,配合 TLS
+`IncludeDispatchKeyGuard` 启用。capture 期 fallback 每个 op 都进一次,
+之后 replay 期把它从 TLS 里排除,直调 cached kernel。
+
+> ⚠ 历史:最初设计选用 `PrivateUse2`(backend bit),但有三个本质问题
+> 让它不可行,见 §6.1.1 — 现在和未来都不应使用 PU2 作为 capture key。
+
+### 6.1.1 为什么不选 PrivateUse2(及 PrivateUse 系列 backend bit)
+
+PrivateUse1/2/3 是 backend bit,位于 dispatcher 链路最底端(优先级低于
+所有 functionality keys,包括 AutogradFunctionality #333、ADInplaceOrView
+#304、AutocastCPU #349、Tracer 等)。最初设计倾向用它,实施时发现三重问题:
+
+**问题 1:backend bit 与 Dense functionality 共享 bit 位**
+
+DispatchKeySet 内部把 backend bit 和 Dense functionality 用同一组 bit 位
+表示。`keyset - DispatchKeySet(PrivateUse2)` 这种 subtraction 会同时**清掉
+Dense 功能位**,导致 redispatch 时 effective_ks 退化为空,composite kernel
+内部的 redispatch 报"no kernel for Undefined"——之前实施时踩过的真实坑。
+
+要解决得自己实现"只清 backend bit、保留 Dense"的工具(`remove_backend()`
+是可用 API),但每个用 keyset 计算的地方都得记得用对——本质上是把
+backend bit 当 functionality key 用,违反设计意图。
+
+**问题 2:位置低于 autograd → 看不到 forward 高层 op,被动接收 autograd
+内部行为**
+
+PU2 fallback 在 dispatcher 链中**先经过 AutogradCPU wrapper、ADInplaceOrView、
+Autocast 等所有 functionality keys 之后**才触发。这意味着:
+
+- forward 时,我们看到的是 autograd wrapper 已经做完 `collect_next_edges`、
+  `SavedVariable(self)` 之后的 decomposed leaf op
+- autograd 内部把 forward 输入 shape 通过 `SavedVariable` **作为 IntArrayRef
+  保存到 backward node**,这事**在 dispatcher 之外发生**——我们无论用哪个
+  key 都看不到。但 PU2 因为更晚被触发,**多了一层"我们和 autograd
+  内部行为已经无法解耦"的耦合**
+
+**问题 3:autograd wrapper 的 reduced_ks 不保证保留 PU2 backend bit**
+
+autograd codegen 出来的 wrapper 内部用 `at::redispatch::xxx(reduced_ks, ...)`
+继续往下走。reduced_ks 的构造逻辑(`ks & after_ADInplaceOrView_keyset` 等)
+**不保证保留 PU2 backend bit**——取决于具体实现细节和 PyTorch 版本。这会导致
+某些 autograd 内部 dispatch 调用绕过我们的 fallback,trace 不完整。
+
+GenericMode 在 #411(仅次于 PythonDispatcher / PreDispatch),**位于所有
+wrapper 之上**,几乎所有 redispatch chain 都会先经过它,trace 完整性更可靠。
+
+**结论**:PrivateUse2 看似是"独立 backend"的自然选择,但实际上是三重坑的
+组合,且没有任何场景下它能做 GenericMode 做不到的事。**当前实现不用,未来
+方向也不用**(包括 v2 走 aot_autograd backend 路线时,fallback 仍应选
+GenericMode)。
+
+如果要彻底脱离 `TESTING_ONLY_*` 这种测试预留 key(详见 §13 风险 10),正确
+做法是**向 PyTorch 上游提案新加一个 functionality key**(如 `OpDispatchCapture`),
+不是回退到 PU2。
 
 ### 6.2 capture fallback 内部逻辑
 
@@ -223,24 +275,26 @@ void capture_fallback(const c10::OperatorHandle& op,
 
 ## 7. 与 autograd 的关系
 
-capture key 位于 backend 层(`PrivateUse2`),优先级低于 `AutogradCPU`(enum
-333)和 `ADInplaceOrView`(304)。capture 时 dispatcher 链如下:
+capture key (`TESTING_ONLY_GenericMode`, #411) 位于 dispatcher 链最顶端
+附近,**高于** `AutogradFunctionality`(#333)和 `ADInplaceOrView`(#304)。
+capture 时 dispatcher 链如下:
 
 ```
+CaptureFallback (GenericMode)   ← 我们在这里:第一个被触发,record step
+  ↓ exclude(GenericMode) + redispatch(effective_ks)
 AutogradCPU wrapper             ← 跑 collect_next_edges / save_for_backward /
                                   构造 backward node;挂到 capture-time 的 output
   ↓ AutoDispatchBelowADInplaceOrView, redispatch
 ADInplaceOrView                 ← 跑 view 元信息 / in-place version bump
   ↓ redispatch
-CaptureFallback (PrivateUse2)   ← 我们在这里:lookup 拿到 CPU kernel,record
-  ↓
 CPU kernel                       ← 真实计算
 ```
 
-即:**capture 期间 autograd 是真的跑了的**,只是 capture 看到的是 autograd
-"展开"之后的低层 op。replay 时为了拿满 dispatcher 节省,我们 exclude
-PrivateUse2 **和 Autograd**,直调 cached CPU kernel —— 此时 autograd wrapper
-**不再** 跑,产生的新 output tensor **没有** grad_fn。
+即:**capture 期间 autograd 是真的跑了的**,我们的 fallback 在 autograd
+之**前**触发,先 record,然后 redispatch 让 autograd 正常处理。replay 时
+为了避免重新跑一遍 autograd wrapper、防止 `.grad` 被加上新 grad_fn 而
+不能 resize_,我们用 `at::AutoDispatchBelowAutograd` 跳过 autograd
+wrapper,直接走到 backend kernel。
 
 这就是 autograd 不被支持的真正原因:**capture-time 建好的 backward graph
 绑定到了 capture-time 的 input/output 对象,replay 产生的新 output 没有
@@ -420,7 +474,7 @@ torch_dispatch_capture/
 ├── csrc/
 │   ├── capture_context.h         # CaptureContext + Trace 声明
 │   ├── capture_context.cpp       # TLS context 实现
-│   ├── capture_fallback.cpp      # boxed fallback,注册到 PrivateUse2
+│   ├── capture_fallback.cpp      # boxed fallback,注册到 TESTING_ONLY_GenericMode
 │   ├── trace.cpp                 # Trace::replay 实现
 │   └── bindings.cpp              # pybind11 → Python
 ├── python/
@@ -521,10 +575,12 @@ n_ops=128 workload=elementwise(batch=B)
    backward 不会(因为根本没建)。预期行为。
 
 6. **TorchDispatchMode 与 capture 共存**。如用户在 capture 时压了一个
-   `TorchDispatchMode`(`Python` key,enum 229),由于 `PrivateUse2` 是
-   backend bit(低优先级)< `Python`,用户 mode 先 fire、redispatch 后我
-   们的 capture fallback 才 fire——我们看到的是 mode 处理过的结果。OK,
-   符合大多数预期(用户的 mode 是想要 capture 的)。
+   `TorchDispatchMode`(`Python` key,enum 229),由于 `TESTING_ONLY_GenericMode`
+   (#411) **高于** `Python` key,我们的 capture fallback **先 fire**,
+   redispatch 后才轮到用户 mode。即:我们看到的是 mode 处理**之前**的原始
+   op。要让 mode 先跑,需要用户先 enter mode 再 enter capture——但即便如此,
+   mode 的 redispatch 还会再回到我们(因为 TLS 里我们的 key 一直在),
+   可能产生不预期的双重拦截。**建议不与 TorchDispatchMode 嵌套使用**。
 
 7. **`as_strided` 类硬编码 size/stride 的 view ops**。capture 时 size/stride
    作为 literal IValue 冻结,replay 时不跟随 input shape 变化。文档明确
@@ -549,21 +605,29 @@ n_ops=128 workload=elementwise(batch=B)
 `torch/csrc/utils/python_arg_parser.cpp:588` 的
 "Note [__torch_dispatch__ dispatching order]":
 **user mode → user subclass → infra mode → infra subclass**。`Python` key
-(enum 229)的处理位于 dispatcher 中游,我们的 `PrivateUse2`(backend bit)
-位置更低。
+(enum 229)的处理位于 dispatcher 中游,我们的 `TESTING_ONLY_GenericMode`
+(#411) 位置更高(仅次于 PythonDispatcher / PreDispatch)。
 
 实际触发顺序:
 ```
-TorchDispatchMode (if any)             ← Python key 在前 (#28)
+CaptureFallback (TESTING_ONLY_GenericMode)  ← 我们最先触发 (#411)
+  ↓ exclude(GenericMode) + redispatch(effective_ks)
+TorchDispatchMode (if any)                   ← Python key (#229)
   ↓ redispatch
-AutogradCPU / ADInplaceOrView / ...
+AutogradCPU / ADInplaceOrView / ...          ← #333 / #304
   ↓ redispatch
-CaptureFallback (PrivateUse2)          ← 我们在这里 (#40 backend tier)
-  ↓ effective_ks 不含 PrivateUse2,直接 lookup
-真实 backend kernel (CPU/CUDA/...)
+真实 backend kernel (CPU/CUDA/...)            ← Dense + backend bit
 ```
 
-意义:capture 看到的就是真正会跑的 backend kernel 形态,**已经被** mode、
+意义:capture 看到的是用户写的**原始** op(autograd / mode 都还没处理),
+record 之后我们 redispatch,让 dispatcher chain 继续正常处理。这样 trace 里
+存的是用户层面的 op 序列,而**不是** mode / autograd 分解后的 leaf。replay
+时仍然走完整 chain(autograd 重新处理一遍)——除非用户启用 v1 的
+`AutoDispatchBelowAutograd` 路径(`allow_grad=True` 时 replay 端默认开启)。
+
+历史说明:早期设计中考虑过用 `PrivateUse2`(backend bit,优先级低于
+所有 wrapper),那条路有三重问题(详见 §6.1.1),所以选了 GenericMode 这条
+"在所有 wrapper 之上"的路径。
 autograd、view-meta 都处理过了。这是想要的——replay 不需要再过这些层。
 
 ## 15. 实施分阶段
