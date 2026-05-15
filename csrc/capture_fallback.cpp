@@ -83,11 +83,11 @@ void capture_fallback(const c10::OperatorHandle& op,
     const auto n_returns = schema.returns().size();
 
     // Execute via explicit redispatch. We pass effective_ks (the input
-    // keyset minus our PrivateUse2 backend bit) so the dispatcher resumes
-    // exactly where it would have without us. ExcludeDispatchKeyGuard
-    // additionally guards against composite kernels that re-enter the
-    // dispatcher freshly (via at::_ops::xxx::call rather than redispatch),
-    // because those calls would otherwise re-pick PU2 from TLS.
+    // keyset minus our capture key) so the dispatcher resumes exactly
+    // where it would have without us. ExcludeDispatchKeyGuard additionally
+    // guards against composite kernels that re-enter the dispatcher freshly
+    // (via at::_ops::xxx::call rather than redispatch), because those
+    // calls would otherwise re-pick our key from TLS.
     {
         c10::impl::ExcludeDispatchKeyGuard exclude(kCaptureKey);
         op.redispatchBoxed(effective_ks, stack);

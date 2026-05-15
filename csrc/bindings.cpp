@@ -6,10 +6,10 @@
 //   - is_capturing()
 //   - The Trace class (wrapped) with .replay() / .size() / .dump()
 //
-// Note: This module also registers the boxed fallback on PrivateUse2 by
-// virtue of including capture_fallback.cpp's TORCH_LIBRARY_IMPL block in
-// the build. We rely on static initializer order for registration to happen
-// at import time.
+// Note: This module also registers the boxed fallback on the capture key
+// (TESTING_ONLY_GenericMode) by virtue of compiling capture_fallback.cpp's
+// TORCH_LIBRARY_IMPL block into the same .so. We rely on static initializer
+// order for registration to happen at import time.
 
 #include "capture_context.h"
 
