@@ -172,12 +172,52 @@ replay time. This avoids:
    uses the dispatched `add_` accumulate path that we record.
 
 2. **`.grad` accumulates across replays** (same semantics as calling
-   `.backward()` repeatedly in eager). Zero it manually for one-shot
-   semantics:
+   `.backward()` repeatedly in eager). You have two choices for
+   controlling this, both fine — pick whichever fits your training
+   loop:
+
+   **(a) zero outside the trace**, the standard PyTorch idiom. The
+   user's existing training loop calls `optimizer.zero_grad()` (or a
+   manual `.grad.zero_()`) between replays exactly as it would
+   between eager `.backward()` calls:
 
    ```python
-   x.grad.zero_(); trace.replay()
+   for batch in dataloader:
+       x.data = batch
+       optimizer.zero_grad(set_to_none=False)   # MUST be False
+       trace.replay()
+       optimizer.step()
    ```
+
+   ⚠ The default `set_to_none=True` rebinds `.grad = None`, which
+   destroys the Tensor reference the trace is holding. Always pass
+   `set_to_none=False` (or use a manual loop `for p in params:
+   p.grad.zero_()`).
+
+   **(b) zero inside the trace.** Put `optimizer.zero_grad(set_to_none=False)`
+   (or any in-place zero) inside the capture block; those zero ops
+   are recorded as steps and replay will perform them automatically
+   on every call. The training loop then has nothing to do between
+   replays:
+
+   ```python
+   with tdc.capture(allow_grad=True) as trace:
+       optimizer.zero_grad(set_to_none=False)   # also captured
+       loss = compute_loss(model, x)
+       loss.backward()
+
+   for batch in dataloader:
+       x.data = batch
+       trace.replay()              # zero + forward + backward, atomically
+       optimizer.step()
+   ```
+
+   This costs N extra `zero_` ops per replay (one per parameter),
+   each one a cheap memset, but the training-loop code is shorter
+   and there's no way to forget the `set_to_none=False` flag. For
+   gradient-accumulation training (where you intentionally do NOT
+   zero between mini-batches), use form (a) and skip the
+   `zero_grad` call as usual.
 
 3. **`requires_grad` must not change** between capture and replay
    (it affects which dispatch keys are in the keyset).
