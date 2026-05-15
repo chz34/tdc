@@ -2,16 +2,32 @@
 
 These tests opt into experimental backward support via
 ``tdc.capture(allow_grad=True)``. Our dispatcher fallback fires at
-TESTING_ONLY_GenericMode (priority #3), which is above AutogradFunctionality
-(#19), so calling ``.backward()`` inside the capture block records the full
+TESTING_ONLY_GenericMode, which has priority above AutogradFunctionality,
+so calling ``.backward()`` inside the capture block records the full
 forward + backward op sequence into a single trace.
 
-Two correctness preconditions the user must meet:
-  1. ``x.grad`` is pre-allocated before capture, so AccumulateGrad takes
-     the in-place ``add_`` branch (a dispatched op we record), not the
-     direct C++ assignment branch (which we cannot record).
-  2. ``x.grad`` is zeroed before each replay if non-accumulating
-     gradient semantics are desired.
+Recommended user pattern — warmup, then capture (CUDA-Graph idiom):
+
+  # Warmup: run forward + backward once eagerly to bring everything into
+  # steady state (allocates `.grad`, lets allocators settle, etc.).
+  loss = compute_loss(...)
+  loss.backward()
+  # zero grads if non-accumulating semantics is desired
+  optimizer.zero_grad() or for-each-leaf .grad.zero_()
+
+  # Capture
+  with tdc.capture(allow_grad=True) as trace:
+      loss = compute_loss(...)
+      loss.backward()
+
+  # Replay
+  for ... in steps:
+      for_each_leaf .grad.zero_()  # if non-accumulating
+      trace.replay()
+
+The warmup pass is the key — it ensures ``AccumulateGrad`` always takes
+the in-place ``add_`` path (a dispatched op that we record), instead of
+the first-time direct-assignment branch that bypasses the dispatcher.
 """
 import unittest
 
@@ -33,7 +49,8 @@ class TestBackward(unittest.TestCase):
 
     def test_allow_grad_lets_capture_proceed(self):
         x = torch.randn(3, requires_grad=True)
-        x.grad = torch.zeros_like(x)
+        (x * x).sum().backward()             # warmup: allocates x.grad
+        x.grad.zero_()
         with tdc.capture(allow_grad=True) as trace:
             y = (x * x).sum()
             y.backward()
@@ -48,7 +65,10 @@ class TestBackward(unittest.TestCase):
         """y = sum(x*x); dy/dx = 2x. Replay should reproduce."""
         torch.manual_seed(0)
         x = torch.randn(3, requires_grad=True)
-        x.grad = torch.zeros_like(x)         # pre-alloc for AccumulateGrad
+
+        # Warmup pass — x.grad gets allocated here, NOT inside capture.
+        (x * x).sum().backward()
+        x.grad.zero_()
 
         with tdc.capture(allow_grad=True) as trace:
             y = (x * x).sum()
@@ -74,7 +94,8 @@ class TestBackward(unittest.TestCase):
     def test_grad_accumulates_on_repeated_replay(self):
         """Repeated replay without zero_ accumulates — matches eager."""
         x = torch.ones(4, requires_grad=True)
-        x.grad = torch.zeros_like(x)
+        (x * 2).sum().backward()             # warmup
+        x.grad.zero_()
 
         with tdc.capture(allow_grad=True) as trace:
             (x * 2).sum().backward()
@@ -92,11 +113,13 @@ class TestBackward(unittest.TestCase):
         """Single nn.Linear forward + backward, all on the captured trace."""
         torch.manual_seed(0)
         model = torch.nn.Linear(4, 4, bias=False).eval()
-        for p in model.parameters():
-            p.grad = torch.zeros_like(p)        # pre-alloc
-
         x = torch.randn(2, 4, requires_grad=True)
-        x.grad = torch.zeros_like(x)
+
+        # Warmup pass — allocates grads for x AND model.weight.
+        model(x).sum().backward()
+        x.grad.zero_()
+        for p in model.parameters():
+            p.grad.zero_()
 
         with tdc.capture(allow_grad=True) as trace:
             y = model(x)
@@ -142,8 +165,11 @@ class TestBackward(unittest.TestCase):
         """Element-wise forward+backward, dynamic shape via x.data assign."""
         torch.manual_seed(0)
         x = torch.randn(4, requires_grad=True)
-        x.grad = torch.zeros_like(x)
         grad_out = torch.ones(4)
+
+        # Warmup pass — allocates x.grad.
+        (x * x * 2).backward(grad_out)
+        x.grad.zero_()
 
         with tdc.capture(allow_grad=True) as trace:
             y = x * x * 2                # y = 2*x*x, dy/dx = 4x
@@ -163,8 +189,11 @@ class TestBackward(unittest.TestCase):
         """ReLU + multiply + add backward across varying shape."""
         torch.manual_seed(0)
         x = torch.randn(5, requires_grad=True)
-        x.grad = torch.zeros_like(x)
         grad_out = torch.ones(5)
+
+        # Warmup pass.
+        (torch.relu(x * 3) + x).backward(grad_out)
+        x.grad.zero_()
 
         with tdc.capture(allow_grad=True) as trace:
             y = torch.relu(x * 3) + x
@@ -205,9 +234,11 @@ class TestBackward(unittest.TestCase):
         torch.manual_seed(0)
         d = 4
         w = torch.randn(d, d, requires_grad=True)
-        w.grad = torch.zeros_like(w)
         x = torch.randn(3, d, requires_grad=True)
-        x.grad = torch.zeros_like(x)
+
+        # Warmup.
+        (x @ w).sum().backward()
+        x.grad.zero_(); w.grad.zero_()
 
         with tdc.capture(allow_grad=True) as trace:
             (x @ w).sum().backward()   # sum reduces -> backward expand

@@ -121,18 +121,27 @@ backward aten ops through the dispatcher, and our fallback records
 them just like forward ops. A single trace can therefore contain the
 entire forward + backward of one training-style step.
 
+**Recommended pattern — warmup, then capture, then replay** (same idiom
+as CUDA Graph):
+
 ```python
 x = torch.randn(8, requires_grad=True)
-x.grad = torch.zeros_like(x)           # MUST pre-allocate (see below)
 grad_out = torch.ones(8)
 
+# 1. Warmup: run the forward + backward once eagerly. This brings
+#    everything into steady state — most importantly, it allocates
+#    `x.grad`. Subsequent .backward() calls go through the in-place
+#    AccumulateGrad.add_ path (a dispatched op we can record).
+(x * x * 2).backward(grad_out)
+x.grad.zero_()                       # zero before capture (optional)
+
+# 2. Capture
 with tdc.capture(allow_grad=True) as trace:
     y = x * x * 2
-    y.backward(grad_out)               # forward + backward both recorded
+    y.backward(grad_out)
 
-# Replay reproduces the gradient.
-x.grad.zero_()
-trace.replay()
+# 3. Replay — reproduces the gradient on demand.
+x.grad.zero_(); trace.replay()
 # x.grad now contains 4*x (dy/dx for y = 2x^2 with grad seed 1)
 ```
 
@@ -143,19 +152,24 @@ replay time. This avoids:
   - attaching `grad_fn` to `.grad` (which would prevent subsequent
     `resize_` between replays)
 
-**Caveats with `allow_grad=True`**:
+**Caveats**:
 
-1. **Pre-allocate `.grad`** before entering the capture block:
+1. **Warmup is the canonical way to set up `.grad`**. AccumulateGrad's
+   first-time path is a direct C++ assignment (`x.grad = grad_var`)
+   that is NOT dispatched and cannot be recorded; replay would silently
+   fail to update `.grad`. Any of these makes the warmup happen:
 
    ```python
-   x.grad = torch.zeros_like(x)
+   (x * x).sum().backward()              # easiest: just run it once
+   # — or —
+   x.grad = torch.zeros_like(x)          # manual pre-alloc also works
+   # — or, for a model —
+   compute_loss(model, x).backward()     # warmup forward+backward step
+   optimizer.zero_grad()
    ```
 
-   `AccumulateGrad` takes a direct C++ assignment path when `.grad`
-   is `None`, which is NOT a dispatched op — it would be silently
-   missed and replay would not update `.grad`. After pre-allocation
-   the `add_` accumulate path is taken, which IS dispatched and
-   recorded.
+   Once `.grad` exists as a real tensor, every subsequent backward
+   uses the dispatched `add_` accumulate path that we record.
 
 2. **`.grad` accumulates across replays** (same semantics as calling
    `.backward()` repeatedly in eager). Zero it manually for one-shot

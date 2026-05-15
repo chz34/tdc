@@ -81,27 +81,36 @@ Quick start (forward + backward, experimental):
 
 The dispatcher fallback sits above AutogradFunctionality in priority,
 so backward aten ops dispatched by the autograd engine are also
-visible. Opt in with `allow_grad=True`:
+visible. Opt in with `allow_grad=True`. Use the warmup-then-capture
+idiom (same shape as CUDA Graph):
 
     x = torch.randn(8, requires_grad=True)
-    x.grad = torch.zeros_like(x)         # MUST pre-allocate
     grad_out = torch.ones(8)
 
+    # 1. Warmup — runs the workload eagerly once so .grad is allocated
+    #    and AccumulateGrad will take the dispatched in-place add_ path
+    #    for all subsequent backwards.
+    (x * x * 2).backward(grad_out)
+    x.grad.zero_()
+
+    # 2. Capture — both forward and backward aten ops are recorded.
     with tdc.capture(allow_grad=True) as trace:
         y = x * x * 2
-        y.backward(grad_out)             # forward + backward both recorded
+        y.backward(grad_out)
 
-    x.grad.zero_(); trace.replay()       # x.grad reflects the new gradient
+    # 3. Replay — zero grads if non-accumulating semantics is desired.
+    x.grad.zero_(); trace.replay()
 
 Replay internally pushes `at::AutoDispatchBelowAutograd` so autograd
 wrappers are skipped — replay is pure aten-op execution, no second
 backward graph is built.
 
 Caveats:
-  - `x.grad` must be pre-allocated BEFORE the capture block.
-    AccumulateGrad's first-time branch is a direct C++ assignment
-    that is NOT dispatched and cannot be recorded; pre-allocating
-    forces the `add_` accumulating branch, which IS dispatched.
+  - The warmup pass is essential for AccumulateGrad: its first-time
+    branch is a direct C++ assignment (NOT dispatched), so without
+    warmup the first replay's gradient write would be missed. After
+    one eager backward, all subsequent .backward() calls go through
+    the dispatched add_ accumulate path that we record.
   - `.grad` accumulates across replays. Zero it manually for one-shot
     semantics.
   - For leaf tensors with `requires_grad=True`, `resize_()` is
@@ -152,12 +161,34 @@ def capture(allow_grad: bool = False):
     records all backward aten ops too. Replay re-runs the full op
     sequence, updating ``.grad`` on the captured leaf tensors.
 
+    Recommended usage — warmup, capture, replay (CUDA-Graph idiom):
+
+    .. code-block:: python
+
+        # warmup
+        loss = compute_loss(model, x)
+        loss.backward()
+        optimizer.zero_grad()
+
+        # capture
+        with tdc.capture(allow_grad=True) as trace:
+            loss = compute_loss(model, x)
+            loss.backward()
+
+        # replay per training step
+        for step in steps:
+            optimizer.zero_grad()
+            trace.replay()
+            optimizer.step()
+
     Caveats with ``allow_grad=True``:
-      - Leaf tensor's ``.grad`` must be allocated BEFORE capture
-        (e.g., ``x.grad = torch.zeros_like(x)``). Otherwise
-        ``AccumulateGrad`` takes the assignment branch on the first
-        backward, which is a C++ direct assignment NOT visible to the
-        dispatcher; replay would silently fail to update ``.grad``.
+      - The warmup pass is the canonical way to ensure ``.grad`` is
+        allocated for every parameter / leaf input. AccumulateGrad's
+        first-time branch is a direct C++ assignment NOT visible to
+        the dispatcher; after one eager backward, AccumulateGrad takes
+        the in-place ``add_`` accumulate path which IS dispatched and
+        recorded. (You can also manually pre-allocate via
+        ``x.grad = torch.zeros_like(x)`` if you have a reason to.)
       - ``.grad`` accumulates on every replay (just like calling
         ``.backward()`` repeatedly in eager). Zero it manually between
         replays if you want non-accumulating semantics.
