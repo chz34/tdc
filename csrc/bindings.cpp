@@ -50,12 +50,19 @@ PYBIND11_MODULE(_C, m) {
         .def("__repr__", &tdc::Trace::dump);
 
     m.def("begin_capture", []() -> std::shared_ptr<tdc::Trace> {
+        // Check for nested capture BEFORE touching g_include_guard. If we
+        // pushed the new guard first and then CaptureContext::begin threw,
+        // the unique_ptr assignment would have already destroyed the outer
+        // capture's IncludeDispatchKeyGuard — leaving TLS include in an
+        // inconsistent state that survives across tests.
+        TORCH_CHECK(
+            !tdc::CaptureContext::is_active(),
+            "torch_dispatch_capture: a capture is already active on this thread");
+
         // Push our capture key into TLS include set so the boxed fallback
         // fires on every dispatcher call.
         g_include_guard = std::make_unique<c10::impl::IncludeDispatchKeyGuard>(
             c10::DispatchKeySet(tdc::kCaptureKey));
-        // CaptureContext::begin returns unique_ptr<Trace>; wrap in shared_ptr
-        // for Python ref-counting semantics.
         auto t = tdc::CaptureContext::begin();
         return std::shared_ptr<tdc::Trace>(t.release());
     }, "Begin a capture on the current thread. Returns a Trace.");
