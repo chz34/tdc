@@ -295,7 +295,38 @@ test/
   test_benchmark.py         5 benchmarks, eager vs replay timings
 ```
 
-## Known v1 limitations (intentional)
+## What this PoC is **for**
+
+| Scenario | v1 verdict |
+|---|---|
+| Inference with host-overhead-dominated small ops | ✓ sweet spot |
+| LLM decode (batch=1, seq=1) repeated calls | ✓ |
+| KV cache writes / in-place mutation patterns | ✓ |
+| `view(-1, N)` / `transpose` / `permute` / `squeeze` (dim-index ops) | ✓ |
+| Fixed-shape training loop with warmup-then-capture | ✓ |
+| Cross-shape replay where shape changes are along dim-index ops | ✓ |
+
+## What this PoC is **not** for
+
+| Scenario | v1 verdict | Use this instead |
+|---|---|---|
+| `x.view(x.shape[0]//2, 2, -1)` (shape-derived literal) | ✗ | `torch.compile` (see v2 below) |
+| Heavy reductions like `.sum().backward()` with dynamic shape | ✗ | `torch.compile` |
+| `as_strided(size, stride)` with shape-following stride | ✗ | rewrite or `torch.compile` |
+| Models whose forward has data-dependent control flow | ✗ | `torch.compile(dynamic=True)` |
+
+**Why these limits exist**: our fallback intercepts at the dispatcher,
+which sees args **after Python has already evaluated them**. When user
+code writes `x.view(x.shape[0]//2, ...)`, the `//2` is a Python int
+operation that runs before the `view` call, so the dispatcher gets a
+literal int — we have no way to recover the lineage back to `x.shape`.
+Solving this requires SymInt-level symbolic tracing, which lives at
+the Python bytecode layer (Dynamo / FX), not at the dispatcher.
+
+See the design doc (`cpp_dispatch_capture_design.md`) §8.1–8.3 for the
+full discussion.
+
+## Known constraints (within the supported scope)
 
 - **Forward + autograd default**: `capture()` defaults to
   `allow_grad=False` and requires `torch.no_grad()`. Backward support
@@ -307,16 +338,41 @@ test/
   that returns new tensors.
 - Changing dtype / device / layout between capture and replay is not
   supported (would change the dispatch keyset; cached lookups would be
-  wrong). Shape changes are fine.
-- `as_strided` and similar ops whose `size`/`stride` args are baked as
-  Python ints are frozen at capture-time values. Use shape-derived
-  parameters (e.g., `view(-1, 8)`) if you need shape-following views.
-  The same limitation hits backward ops whose schemas include shape
-  literals — most notably reductions' backward (`sum_backward` calls
-  `expand(saved_shape)`). Pattern C documents this.
+  wrong). Shape changes are fine **when they fall under the supported
+  patterns above**.
 - TensorList args (e.g., `aten::cat([t1, t2, ...])`) are recorded as
   literal IValues; in-place mutation of list elements may not
   propagate. Common patterns work fine; corner-case workloads might.
+
+## v2 direction (if needed): compose with `torch.compile`, don't compete
+
+Full dynamic-shape support (handling shape-derived literals like
+`x.view(x.shape[0]//2, ...)`) is **out of scope for v1 by design**. The
+right place to add it is not to evolve v1 with self-written FX graph
+parsing — that would replicate a large part of Dynamo and Inductor.
+Instead, the proposed v2 is a thin **custom backend for `torch.compile`**:
+
+```python
+@torch.compile(backend=tdc_backend, dynamic=True)
+def fn(x):
+    return x.view(x.shape[0] // 2, 2, -1)
+```
+
+In this form:
+- `torch.compile` (Dynamo + AOTAutograd) does all the symbolic tracing,
+  functionalization, and decomposition for us — handing our backend a
+  clean SymInt-bearing functional aten FX graph.
+- Our backend translates the graph into an extended trace where size
+  computations are explicit Steps (rather than baked literals), then
+  uses the existing dispatcher-fallback capture for the Tensor-op
+  steps.
+- Estimated work: ~1000 LoC of additional graph-translation code,
+  vs ~3000+ if we tried to build our own FX parser.
+
+This isn't currently planned — v1 is shipped as a focused PoC for the
+host-overhead-bound workloads above. v2 is documented as the natural
+next step if production needs full dynamic shape with our dispatcher
+acceleration. See design doc §17.6 for the detailed v2 layout.
 
 ## How it works (3-line summary)
 
