@@ -263,13 +263,19 @@ python -m unittest test.test_backward      # 8 backward tests
 python test/test_benchmark.py              # 5 benchmarks with numbers
 ```
 
-Benchmarks accept `TDC_DEVICE` for cross-device runs:
+All test files (not just the benchmark) honor the `TDC_DEVICE` env
+var. Default is `cpu`; set to any of `cuda` / `xpu` / `mps` / `npu` /
+`privateuseone` to run the whole suite on an accelerator:
 
 ```bash
-TDC_DEVICE=cuda  python -m unittest test.test_benchmark
-TDC_DEVICE=npu   python -m unittest test.test_benchmark
-TDC_DEVICE=mps   python -m unittest test.test_benchmark
+TDC_DEVICE=cuda  python -m unittest discover test
+TDC_DEVICE=npu   python -m unittest discover test
+TDC_DEVICE=mps   python -m unittest discover test
 ```
+
+Each test class prints a one-line `>>> TDC_DEVICE = ...` banner at
+setUp so it's clear what device the run is on. The device-resolution
+and synchronize helpers live in `test/_device.py`.
 
 ## Layout
 
@@ -282,11 +288,11 @@ csrc/
 python/__init__.py          capture() context manager + usage docs
 setup.py                    CppExtension config (MAX_JOBS<=4)
 test/
-  test_correctness.py       7 tests, no_grad guard, nested rejection
+  _device.py                shared DEVICE / SYNC helper (reads TDC_DEVICE)
+  test_correctness.py       15 tests, no_grad guard, view family
   test_dynamic_shape.py     4 tests, varied batch / resize / mutation
   test_backward.py          8 tests, allow_grad capture + replay
-  test_benchmark.py         5 benchmarks, eager vs replay timings;
-                             reads TDC_DEVICE for cross-device runs
+  test_benchmark.py         5 benchmarks, eager vs replay timings
 ```
 
 ## Known v1 limitations (intentional)

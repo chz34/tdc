@@ -13,7 +13,6 @@ The accelerator path adds a device-synchronize call after every benched
 fn() so the wall-clock time accurately captures kernel completion (not
 just the dispatch-queue submission). For CPU the sync is a no-op.
 """
-import os
 import statistics
 import time
 import unittest
@@ -21,58 +20,7 @@ import unittest
 import torch
 import torch_dispatch_capture as tdc
 
-
-# ---------------------------------------------------------------------------
-# Device selection + sync
-# ---------------------------------------------------------------------------
-
-def _resolve_device() -> torch.device:
-    raw = os.environ.get("TDC_DEVICE", "cpu").lower()
-    # Aliases so users don't need to know whether the backend is registered
-    # as PrivateUse1 or by its own name.
-    aliases = {"npu": "privateuseone"}
-    raw = aliases.get(raw, raw)
-    dev = torch.device(raw)
-    if dev.type == "cuda":
-        assert torch.cuda.is_available(), "TDC_DEVICE=cuda but no CUDA"
-    elif dev.type == "xpu":
-        assert hasattr(torch, "xpu") and torch.xpu.is_available(), \
-            "TDC_DEVICE=xpu but no XPU"
-    elif dev.type == "mps":
-        assert torch.backends.mps.is_available(), "TDC_DEVICE=mps but no MPS"
-    elif dev.type == "privateuseone":
-        # The actual backend module (torch_npu, etc.) must already have
-        # registered PrivateUse1 at import time.
-        pass
-    return dev
-
-
-DEVICE = _resolve_device()
-
-
-def _make_sync() -> "callable":
-    """Return a 0-arg synchronize callable matching DEVICE.type."""
-    if DEVICE.type == "cuda":
-        return torch.cuda.synchronize
-    if DEVICE.type == "xpu":
-        return torch.xpu.synchronize
-    if DEVICE.type == "mps":
-        return torch.mps.synchronize
-    if DEVICE.type == "privateuseone":
-        # NPU is the most common consumer; fall back to a no-op if neither
-        # of these are loaded.
-        if hasattr(torch, "npu"):
-            return torch.npu.synchronize
-        try:
-            import torch_npu  # type: ignore
-            return torch_npu.npu.synchronize
-        except ImportError:
-            return lambda: None
-    # CPU and any unknown type: nothing to wait for.
-    return lambda: None
-
-
-SYNC = _make_sync()
+from _device import DEVICE, SYNC, print_device_banner
 
 
 # ---------------------------------------------------------------------------
@@ -97,18 +45,10 @@ def bench(fn, iters=400, warmup=50):
     }
 
 
-def _print_device_banner():
-    print(f"\n>>> TDC_DEVICE = {DEVICE} (sync = {SYNC.__name__ if hasattr(SYNC, '__name__') else SYNC})")
-
-
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
-
 class TestBenchmark(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        _print_device_banner()
+        print_device_banner()
 
     def test_elementwise(self):
         n_ops = 64

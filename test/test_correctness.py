@@ -4,8 +4,14 @@ import unittest
 import torch
 import torch_dispatch_capture as tdc
 
+from _device import DEVICE, SYNC, print_device_banner
+
 
 class TestCorrectness(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        print_device_banner()
+
     def test_no_grad_required(self):
         with self.assertRaisesRegex(RuntimeError, "no_grad"):
             with tdc.capture():
@@ -27,10 +33,10 @@ class TestCorrectness(unittest.TestCase):
 
     def test_elementwise_chain(self):
         # Use out= overloads so the result tensor is observable across replays.
-        a = torch.randn(8, 8)
-        b = torch.randn(8, 8)
-        out1 = torch.empty(8, 8)
-        out2 = torch.empty(8, 8)
+        a = torch.randn(8, 8, device=DEVICE)
+        b = torch.randn(8, 8, device=DEVICE)
+        out1 = torch.empty(8, 8, device=DEVICE)
+        out2 = torch.empty(8, 8, device=DEVICE)
         with torch.no_grad():
             with tdc.capture() as trace:
                 torch.add(a, b, out=out1)
@@ -48,8 +54,8 @@ class TestCorrectness(unittest.TestCase):
         # `t + addmm` form. Both behaviors are valid; the goal is replay
         # working with the captured ops.
         torch.manual_seed(0)
-        model = torch.nn.Linear(8, 8)
-        x = torch.randn(4, 8)
+        model = torch.nn.Linear(8, 8).to(DEVICE)
+        x = torch.randn(4, 8, device=DEVICE)
         with torch.no_grad():
             with tdc.capture() as trace:
                 _ = model(x)
@@ -57,7 +63,7 @@ class TestCorrectness(unittest.TestCase):
             trace.replay()
 
     def test_relu_zeros(self):
-        x = torch.tensor([1.0, -1.0, 0.5])
+        x = torch.tensor([1.0, -1.0, 0.5], device=DEVICE)
         with torch.no_grad():
             with tdc.capture() as trace:
                 _ = x.relu()
@@ -68,7 +74,7 @@ class TestCorrectness(unittest.TestCase):
             trace.replay()
 
     def test_dump_works(self):
-        a = torch.randn(2, 2)
+        a = torch.randn(2, 2, device=DEVICE)
         with torch.no_grad():
             with tdc.capture() as trace:
                 _ = a + a
@@ -87,20 +93,20 @@ class TestCorrectness(unittest.TestCase):
 
     def test_view_then_compute(self):
         torch.manual_seed(0)
-        a = torch.randn(6, 4)
-        w = torch.randn(8, 3)
-        obs = torch.empty(6, 8)
+        a = torch.randn(6, 4, device=DEVICE)
+        w = torch.randn(8, 3, device=DEVICE)
+        obs = torch.empty(6, 8, device=DEVICE)
         with torch.no_grad():
             with tdc.capture() as trace:
                 # view to [6, 8] then matmul with [8, 3]... wait no, view
                 # to [6, 8] requires 48 elements; a has 24. Use compatible
                 # shapes: [6, 4] -> [4, 6] -> matmul with [6, ...].
                 v = a.view(4, 6)        # 24 elements, share storage with a
-                r = v @ torch.randn(6, 8)
+                r = v @ torch.randn(6, 8, device=DEVICE)
                 obs.resize_as_(r); obs.copy_(r)
 
             # mutate a in-place, replay, verify
-            a_new = torch.randn(6, 4)
+            a_new = torch.randn(6, 4, device=DEVICE)
             a.copy_(a_new)
             trace.replay()
             # We can't easily reconstruct the eager ref because we used a
@@ -110,8 +116,8 @@ class TestCorrectness(unittest.TestCase):
 
     def test_view_correctness(self):
         torch.manual_seed(0)
-        a = torch.randn(2, 3, 4)
-        obs = torch.empty(6, 4)
+        a = torch.randn(2, 3, 4, device=DEVICE)
+        obs = torch.empty(6, 4, device=DEVICE)
         with torch.no_grad():
             ref_v = a.view(6, 4)
             ref = ref_v * 2 + 1
@@ -129,8 +135,8 @@ class TestCorrectness(unittest.TestCase):
 
     def test_reshape_correctness(self):
         torch.manual_seed(0)
-        a = torch.randn(12)
-        obs = torch.empty(3, 4)
+        a = torch.randn(12, device=DEVICE)
+        obs = torch.empty(3, 4, device=DEVICE)
         with torch.no_grad():
             ref = a.reshape(3, 4) + 100.0
             with tdc.capture() as trace:
@@ -140,13 +146,13 @@ class TestCorrectness(unittest.TestCase):
 
             a.fill_(7.0)
             trace.replay()
-            torch.testing.assert_close(obs, torch.full((3, 4), 107.0))
+            torch.testing.assert_close(obs, torch.full((3, 4), 107.0, device=DEVICE))
 
     def test_transpose_correctness(self):
         torch.manual_seed(0)
-        a = torch.randn(3, 5)
-        b = torch.randn(3, 4)
-        obs = torch.empty(5, 4)
+        a = torch.randn(3, 5, device=DEVICE)
+        b = torch.randn(3, 4, device=DEVICE)
+        obs = torch.empty(5, 4, device=DEVICE)
         with torch.no_grad():
             ref = a.t() @ b                 # (5, 3) @ (3, 4) = (5, 4)
             with tdc.capture() as trace:
@@ -163,9 +169,9 @@ class TestCorrectness(unittest.TestCase):
 
     def test_squeeze_unsqueeze(self):
         torch.manual_seed(0)
-        a = torch.randn(1, 4, 1, 3)        # has two squeezable dims
-        obs_squeezed = torch.empty(4, 3)
-        obs_unsqueezed = torch.empty(1, 1, 4, 3)
+        a = torch.randn(1, 4, 1, 3, device=DEVICE)        # has two squeezable dims
+        obs_squeezed = torch.empty(4, 3, device=DEVICE)
+        obs_unsqueezed = torch.empty(1, 1, 4, 3, device=DEVICE)
         with torch.no_grad():
             with tdc.capture() as trace:
                 sq = a.squeeze()           # -> [4, 3]
@@ -179,14 +185,15 @@ class TestCorrectness(unittest.TestCase):
             # Replay still works and updates obs from new a.
             a.fill_(3.0)
             trace.replay()
-            torch.testing.assert_close(obs_squeezed, torch.full((4, 3), 3.0))
+            torch.testing.assert_close(obs_squeezed,
+                                       torch.full((4, 3), 3.0, device=DEVICE))
             torch.testing.assert_close(obs_unsqueezed,
-                                       torch.full((1, 1, 4, 3), 3.0))
+                                       torch.full((1, 1, 4, 3), 3.0, device=DEVICE))
 
     def test_permute(self):
         torch.manual_seed(0)
-        a = torch.randn(2, 3, 4)
-        obs = torch.empty(4, 2, 3)
+        a = torch.randn(2, 3, 4, device=DEVICE)
+        obs = torch.empty(4, 2, 3, device=DEVICE)
         with torch.no_grad():
             ref = a.permute(2, 0, 1).contiguous()
             with tdc.capture() as trace:
@@ -202,8 +209,8 @@ class TestCorrectness(unittest.TestCase):
         """View shares storage; mutating the view should affect the
         original tensor on every replay too."""
         torch.manual_seed(0)
-        a = torch.zeros(2, 3)
-        obs = torch.empty(2, 3)
+        a = torch.zeros(2, 3, device=DEVICE)
+        obs = torch.empty(2, 3, device=DEVICE)
         with torch.no_grad():
             with tdc.capture() as trace:
                 v = a.view(6)                # shares storage with a
@@ -215,20 +222,20 @@ class TestCorrectness(unittest.TestCase):
             # But the capture itself already ran once (it's the eager
             # execution path of the with-block), so a is already 1 after
             # capture exits. obs reflects that.
-            torch.testing.assert_close(obs, torch.ones(2, 3))
+            torch.testing.assert_close(obs, torch.ones(2, 3, device=DEVICE))
 
             trace.replay()
-            torch.testing.assert_close(obs, torch.full((2, 3), 2.0))
+            torch.testing.assert_close(obs, torch.full((2, 3), 2.0, device=DEVICE))
             trace.replay()
-            torch.testing.assert_close(obs, torch.full((2, 3), 3.0))
+            torch.testing.assert_close(obs, torch.full((2, 3), 3.0, device=DEVICE))
 
     def test_view_with_inferred_dim(self):
         """view(-1, N) — the -1 is computed at kernel time, so it follows
         whatever size the input currently has. This is the dynamic-shape
         friendly variant of view."""
         torch.manual_seed(0)
-        a = torch.randn(12)
-        obs = torch.empty(0)   # will be resized
+        a = torch.randn(12, device=DEVICE)
+        obs = torch.empty(0, device=DEVICE)   # will be resized
         with torch.no_grad():
             with tdc.capture() as trace:
                 v = a.view(-1, 4)        # captured: view(-1, 4) literal
@@ -239,7 +246,7 @@ class TestCorrectness(unittest.TestCase):
 
             # Change a's numel; view(-1, 4) still works because -1 is
             # recomputed by the kernel from current a.numel().
-            a.data = torch.randn(20)
+            a.data = torch.randn(20, device=DEVICE)
             trace.replay()
             self.assertEqual(tuple(obs.shape), (5, 4))   # 20 / 4 = 5
             torch.testing.assert_close(obs, a.view(-1, 4) * 10)

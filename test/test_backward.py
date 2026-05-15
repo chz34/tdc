@@ -34,21 +34,27 @@ import unittest
 import torch
 import torch_dispatch_capture as tdc
 
+from _device import DEVICE, print_device_banner
+
 
 class TestBackward(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        print_device_banner()
+
     # ------------------------------------------------------------------
     # Sanity
     # ------------------------------------------------------------------
 
     def test_allow_grad_required(self):
-        x = torch.randn(3, requires_grad=True)
+        x = torch.randn(3, requires_grad=True, device=DEVICE)
         # Default (allow_grad=False) still rejects grad-enabled capture.
         with self.assertRaisesRegex(RuntimeError, "allow_grad=True"):
             with tdc.capture():
                 _ = x * x
 
     def test_allow_grad_lets_capture_proceed(self):
-        x = torch.randn(3, requires_grad=True)
+        x = torch.randn(3, requires_grad=True, device=DEVICE)
         (x * x).sum().backward()             # warmup: allocates x.grad
         x.grad.zero_()
         with tdc.capture(allow_grad=True) as trace:
@@ -64,7 +70,7 @@ class TestBackward(unittest.TestCase):
     def test_basic_backward_replay(self):
         """y = sum(x*x); dy/dx = 2x. Replay should reproduce."""
         torch.manual_seed(0)
-        x = torch.randn(3, requires_grad=True)
+        x = torch.randn(3, requires_grad=True, device=DEVICE)
 
         # Warmup pass — x.grad gets allocated here, NOT inside capture.
         (x * x).sum().backward()
@@ -86,14 +92,14 @@ class TestBackward(unittest.TestCase):
         torch.testing.assert_close(x.grad, ref)
 
         # Change x value, replay, verify the new gradient.
-        x.detach().copy_(torch.arange(3, dtype=torch.float32))
+        x.detach().copy_(torch.arange(3, dtype=torch.float32, device=DEVICE))
         x.grad.zero_()
         trace.replay()
         torch.testing.assert_close(x.grad, 2 * x.detach())
 
     def test_grad_accumulates_on_repeated_replay(self):
         """Repeated replay without zero_ accumulates — matches eager."""
-        x = torch.ones(4, requires_grad=True)
+        x = torch.ones(4, requires_grad=True, device=DEVICE)
         (x * 2).sum().backward()             # warmup
         x.grad.zero_()
 
@@ -101,19 +107,19 @@ class TestBackward(unittest.TestCase):
             (x * 2).sum().backward()
 
         # After capture: grad should be all 2s.
-        torch.testing.assert_close(x.grad, torch.full((4,), 2.0))
+        torch.testing.assert_close(x.grad, torch.full((4,), 2.0, device=DEVICE))
 
         trace.replay()
-        torch.testing.assert_close(x.grad, torch.full((4,), 4.0))  # +2
+        torch.testing.assert_close(x.grad, torch.full((4,), 4.0, device=DEVICE))
 
         trace.replay()
-        torch.testing.assert_close(x.grad, torch.full((4,), 6.0))  # +2
+        torch.testing.assert_close(x.grad, torch.full((4,), 6.0, device=DEVICE))
 
     def test_linear_backward_replay(self):
         """Single nn.Linear forward + backward, all on the captured trace."""
         torch.manual_seed(0)
-        model = torch.nn.Linear(4, 4, bias=False).eval()
-        x = torch.randn(2, 4, requires_grad=True)
+        model = torch.nn.Linear(4, 4, bias=False).eval().to(DEVICE)
+        x = torch.randn(2, 4, requires_grad=True, device=DEVICE)
 
         # Warmup pass — allocates grads for x AND model.weight.
         model(x).sum().backward()
@@ -164,8 +170,8 @@ class TestBackward(unittest.TestCase):
     def test_backward_dynamic_shape_elementwise(self):
         """Element-wise forward+backward, dynamic shape via x.data assign."""
         torch.manual_seed(0)
-        x = torch.randn(4, requires_grad=True)
-        grad_out = torch.ones(4)
+        x = torch.randn(4, requires_grad=True, device=DEVICE)
+        grad_out = torch.ones(4, device=DEVICE)
 
         # Warmup pass — allocates x.grad.
         (x * x * 2).backward(grad_out)
@@ -176,7 +182,7 @@ class TestBackward(unittest.TestCase):
             y.backward(grad_out)         # no .sum() / reductions
 
         for n in (1, 3, 8, 16, 32):
-            x.data = torch.randn(n)      # rebind x's data; same TensorImpl
+            x.data = torch.randn(n, device=DEVICE)      # rebind x's data; same TensorImpl
             grad_out.resize_(n); grad_out.fill_(1.0)
             x.grad.resize_as_(x).zero_()
 
@@ -188,8 +194,8 @@ class TestBackward(unittest.TestCase):
     def test_backward_dynamic_shape_relu_chain(self):
         """ReLU + multiply + add backward across varying shape."""
         torch.manual_seed(0)
-        x = torch.randn(5, requires_grad=True)
-        grad_out = torch.ones(5)
+        x = torch.randn(5, requires_grad=True, device=DEVICE)
+        grad_out = torch.ones(5, device=DEVICE)
 
         # Warmup pass.
         (torch.relu(x * 3) + x).backward(grad_out)
@@ -200,14 +206,14 @@ class TestBackward(unittest.TestCase):
             y.backward(grad_out)
 
         for n in (1, 4, 12, 25):
-            x.data = torch.randn(n)
+            x.data = torch.randn(n, device=DEVICE)
             grad_out.resize_(n); grad_out.fill_(1.0)
             x.grad.resize_as_(x).zero_()
 
             trace.replay()
             x_eager = x.detach().clone().requires_grad_(True)
             x_eager.grad = torch.zeros_like(x_eager)
-            (torch.relu(x_eager * 3) + x_eager).backward(torch.ones(n))
+            (torch.relu(x_eager * 3) + x_eager).backward(torch.ones(n, device=DEVICE))
             torch.testing.assert_close(
                 x.grad, x_eager.grad,
                 msg=lambda m: f"grad mismatch at n={n}: {m}")
@@ -233,8 +239,8 @@ class TestBackward(unittest.TestCase):
         adapt to new input shapes on replay. Expected failure."""
         torch.manual_seed(0)
         d = 4
-        w = torch.randn(d, d, requires_grad=True)
-        x = torch.randn(3, d, requires_grad=True)
+        w = torch.randn(d, d, requires_grad=True, device=DEVICE)
+        x = torch.randn(3, d, requires_grad=True, device=DEVICE)
 
         # Warmup.
         (x @ w).sum().backward()
