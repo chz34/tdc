@@ -1,0 +1,805 @@
+# C++ Dispatcher-Level Capture/Replay — Design
+
+## 1. 目的
+
+把 `agent_space/dispatch_capture_replay.py` 的 Python 层 PoC 下沉到 C++,
+真正消除 dispatcher 在 replay 期的开销,且**原生支持动态 shape**——同一份
+trace 可在不同 input shape 下反复 replay,无须重 capture。
+
+## 2. 核心观察
+
+`Dispatcher::call` 每次 op 调用都重做下列工作:
+1. 从 input tensors 的 `key_set()` ∪ TLS include 中提取 dispatch keyset
+2. `OperatorEntry::lookup(keyset)` 在表里查 `KernelFunction*`
+3. alias key 展开(`Autograd` → `AutogradCPU`,`CompositeImplicitAutograd`
+   → 具体后端)
+4. 沿 dispatch 链 redispatch:AutogradCPU → ADInplaceOrView → CPU/CUDA...
+
+关键事实:**第 1–3 步的输出只依赖 `(device, dtype, layout, requires_grad)`,
+不依赖 shape / strides / data_ptr**。也就是说,只要这四个属性不变,resolved
+`KernelFunction*` 就是不变的。
+
+shape 不参与 dispatch 决策,只在 kernel **内部** 被读取(算 output sizes、
+broadcast、分配 workspace 等)。kernel 是 boxed 接口,每次调用时从 stack
+上的 `Tensor` 实时读 `sizes()`/`strides()`/`data_ptr()`。
+
+**结论**:capture 一次拿到 `KernelFunction*` 缓存住,replay 时绕过
+`Dispatcher::call` 直调 `KernelFunction::callBoxed`,每次都把 input tensor
+现读现 box。shape / data 动态变化自动反映到 kernel,无任何额外机制。
+
+## 3. 非目标
+
+- **不**消除 backend kernel 本身的耗时(`at::native::add` 还得跑一次)。
+- **不**合并 launch 或做 graph 级优化(那是 inductor/cudagraph 的事)。
+- **不**支持 input tensor 对象被换掉。trace 持有 capture 时输入 tensor 的
+  强引用;replay 用的是同一个 Python `Tensor` 对象——其 metadata 可以变,
+  对象身份不能变。详见 §5 关于 placeholder 机制的讨论。
+- **不**支持 `(device, dtype, layout, requires_grad)` 在 capture 与 replay
+  之间发生变化。这些变化改 dispatch keyset,cached `KernelFunction*` 不再
+  正确。replay 入口 validate,不匹配 raise(或 fallback 到 eager-recapture,
+  视未来扩展决定)。
+- **v1 不**做 autograd capture——capture 区域必须 `torch.no_grad()`,否则
+  raise(详见 §7;不是物理限制,是速度/复杂度取舍,backward 支持作为 v2
+  扩展,见 §17.1,触发条件:v1 收益验证达预期)。
+- **v1 不**支持 "shape-derived literal"(任何由 Python 整数运算从 `x.shape[i]`
+  推算出的 size 参数,如 `x.view(x.shape[0]//2, 2, -1)` 中的第一维)。Python
+  在调用 view 之前已经把 `x.shape[0]//2` 求值成具体 int,dispatcher 看到的就
+  是字面值,我们也只能按字面值录入 trace。详见 §8。要解决这个需要 SymInt 级
+  别的符号化跟踪——但那条路最合理的落地形态不是自研 FX graph 解析,而是把
+  PoC 包装成 `torch.compile` 的 backend(见 §17.6)。
+- **不**改 PyTorch 核心,作为 out-of-tree C++ 扩展实现(`torch.utils.cpp_extension`
+  风格)。
+
+## 4. 与已有机制对比
+
+| 方案 | dispatcher 开销 | Python 入口 | 真正 kernel | dynamic shape | 多次 replay |
+|---|---|---|---|---|---|
+| eager | 全付 | 全付 | 全付 | ✓ | n/a |
+| Python `__torch_dispatch__` PoC | 全付 | 全付 + loop 开销 | 全付 | ✓ | ✓ |
+| **本方案** | **几乎 0** | **0** (C++ 内闭环) | 全付 | **✓ in-place + shape 自由** | ✓ |
+| cudagraph / aclgraph | 几乎 0 | 0 | 合并打包 | ✗ (按 shape 分桶重建) | ✓ |
+| AOTInductor | 几乎 0 | 0 | 部分融合 | ✓ (SymInt) | ✓ |
+
+定位:**与 cudagraph 类似的"replay 期 host 几乎 0 开销"档,但保留逐 op
+launch、对 dynamic shape 零成本**。适合 cudagraph 不能用的 data-dependent
+控制流 / 动态 shape 场景。
+
+## 5. 输入 metadata 的动态读取
+
+trace 内每个 step 用一个 `StepInputRef` 描述 input 来源:
+
+```cpp
+struct StepInputRef {
+    enum class Kind { kCapturedTensor, kPrevStepOutput, kLiteral };
+    Kind kind;
+    union {
+        size_t captured_tensor_idx;   // index into Trace::captured_tensors_
+        struct { size_t step; size_t output_slot; } prev;
+        c10::IValue literal;          // int/float/Scalar/bool/...
+    };
+};
+```
+
+- `kCapturedTensor`:外部输入(用户传入 / 模型参数)。**trace 持有这个
+  `Tensor` 的强引用**;每次 replay 时从这个 `Tensor` 当场读 sizes/strides/
+  data_ptr。如果用户 `a.fill_(...)` 或 `a.resize_(...)` 改了它,replay 看到
+  新值。
+- `kPrevStepOutput`:前面某个 step 在本次 replay 产生的输出。维护一个
+  `outputs[step]` 表,每个 step 把 boxed kernel 的输出存进去,后续 step
+  按 `(step, output_slot)` 索引取出。
+- `kLiteral`:常量参数(reduction 的 `dim`、`alpha` Scalar 等)。capture 时
+  从 stack 拷一份 IValue 即可。
+
+replay 一次的执行循环:
+
+```cpp
+void Trace::replay() {
+    validate_capture_keys_still_valid();   // §10 风险 1/2
+    c10::impl::ExcludeDispatchKeyGuard guard(DispatchKeySet(kCaptureKey));
+
+    std::vector<std::vector<c10::IValue>> outputs(steps_.size());
+    torch::jit::Stack stack;
+    stack.reserve(MAX_ARITY);
+
+    for (size_t i = 0; i < steps_.size(); ++i) {
+        auto& step = steps_[i];
+        stack.clear();
+        // 重建 stack:tensor 输入按引用实时读 metadata
+        for (auto& ref : step.inputs) {
+            switch (ref.kind) {
+                case Kind::kCapturedTensor:
+                    stack.push_back(captured_tensors_[ref.captured_tensor_idx]);
+                    break;
+                case Kind::kPrevStepOutput:
+                    stack.push_back(outputs[ref.prev.step][ref.prev.output_slot]);
+                    break;
+                case Kind::kLiteral:
+                    stack.push_back(ref.literal);
+                    break;
+            }
+        }
+        // 直调 cached KernelFunction,完全跳过 Dispatcher::call
+        step.kernel->callBoxed(
+            c10::OperatorHandle(step.op_def),
+            step.effective_ks,
+            &stack);
+        // 收输出
+        outputs[i].assign(stack.begin(), stack.end());
+    }
+}
+```
+
+**动态 shape 全部由 `stack.push_back(tensor)` 这一步处理**——`Tensor` 是
+`TensorImpl*` 智能指针,push 时只增加引用计数,kernel 在 stack 上读到的是
+当下最新的 metadata。**不需要任何额外机制。**
+
+### 5.1 支持的动态变化
+
+| 变化类型 | 是否支持 | 备注 |
+|---|---|---|
+| `a.fill_(x)` / in-place value mutation | ✓ | 自动 |
+| `a.copy_(b)` | ✓ | 自动 |
+| `a.resize_(new_shape)` (storage cap 内) | ✓ | kernel 读 new sizes |
+| `a.resize_(new_shape)` (超过 storage cap) | ✓ | PyTorch 自动 reallocate,新 data_ptr,但同一个 Tensor 对象——replay 自动用新指针 |
+| 完全换对象 `a = torch.empty(...)` | ✗ | trace 持有的是旧对象;需用 §5.2 的 placeholder |
+| 改 dtype/device/layout | ✗ | 改 dispatch key,cached KernelFunction* 失效;raise |
+| 改 requires_grad | ✗ | 同上(影响 Autograd key) |
+
+### 5.2 Placeholder(可选扩展)
+
+如果业务场景是"每次循环重新分配 `out = torch.empty(new_shape)`",需要在
+capture 入口显式声明 placeholder:
+
+```python
+with tdc.capture() as trace:
+    placeholder_a = tdc.placeholder("a")
+    placeholder_b = tdc.placeholder("b")
+    out = my_function(placeholder_a, placeholder_b)
+
+# replay 时绑定真实 tensor
+trace.bind(a=real_a_v1, b=real_b_v1); trace.replay()
+trace.bind(a=real_a_v2, b=real_b_v2); trace.replay()   # 完全不同的对象
+```
+
+placeholder 是一个特殊 Tensor 子类(空 storage,Python 端用 `_make_wrapper_subclass`
+做),在 capture fallback 里被识别并存为 `StepInputRef::kPlaceholder("a")`;
+`trace.bind()` 时把名字映射到真实 tensor,replay 用映射后的对象 push 入 stack。
+
+placeholder 机制属于 v2,初版不包含。初版的约束就是"原对象不变,metadata
+可变"。
+
+## 6. 架构
+
+### 6.1 Capture 点的选择
+
+权衡过的几个 hook 位置:
+
+| 位置 | 优点 | 缺点 | 选 |
+|---|---|---|---|
+| `c10::Dispatcher::call` 内 patch | 抓得最全 | 改核心,版本绑定 | ✗ |
+| 自定义 DispatchKey + fallback | 标准外部扩展 | 仍要被 dispatcher 调一次(capture 期,正是我们要的) | **✓** |
+| Python key 的 `__torch_dispatch__` hook | Python 实现简单 | 已被 PoC 证伪——位置在 dispatcher 外,省不到 dispatcher | ✗ |
+
+**选**:用 `PrivateUse2` 作为 capture key,配合 TLS `IncludeDispatchKeyGuard`
+启用。capture 期 fallback 每个 op 都进一次,之后 replay 期把它从 TLS 里排
+除,直调 cached kernel。
+
+### 6.2 capture fallback 内部逻辑
+
+```cpp
+void capture_fallback(const c10::OperatorHandle& op,
+                      c10::DispatchKeySet ks,
+                      torch::jit::Stack* stack) {
+    auto& ctx = CaptureContext::current();
+
+    // 算"如果 capture key 不在 TLS 里,这次 op 实际会走的 keyset"
+    auto effective_ks = ks - DispatchKeySet(kCaptureKey);
+
+    // 关键:从 OperatorEntry 拿到该 keyset 对应的 KernelFunction
+    // 这一步就是 Dispatcher::call 每次都做的 routing 工作 —— capture
+    // 只做一次,replay 复用
+    const auto& kernel = op.operatorDef().op.lookup(effective_ks);
+
+    // 录每个 input 的来源:captured / prev_step / literal
+    auto input_refs = classify_inputs(*stack, ctx);
+
+    // 在 capture 期 eager 跑一次,产生真实输出供后续 step 链接
+    op.callBoxed(stack);
+    auto output_ivalues = collect_outputs(*stack, ctx);
+
+    ctx.record({
+        .kernel        = &kernel,         // 已 resolved
+        .effective_ks  = effective_ks,
+        .op_def        = &op.operatorDef(),
+        .inputs        = std::move(input_refs),
+        .n_outputs     = output_ivalues.size(),
+    });
+    // op.callBoxed 已经把输出 push 回 stack,fallback 自然返回
+}
+```
+
+`OperatorEntry::lookup(keyset)` 这一行是整个设计的核心——dispatcher 每次都
+做、replay 时跳过、capture 一次就够。
+
+## 7. 与 autograd 的关系
+
+capture key 位于 backend 层(`PrivateUse2`),优先级低于 `AutogradCPU`(enum
+333)和 `ADInplaceOrView`(304)。capture 时 dispatcher 链如下:
+
+```
+AutogradCPU wrapper             ← 跑 collect_next_edges / save_for_backward /
+                                  构造 backward node;挂到 capture-time 的 output
+  ↓ AutoDispatchBelowADInplaceOrView, redispatch
+ADInplaceOrView                 ← 跑 view 元信息 / in-place version bump
+  ↓ redispatch
+CaptureFallback (PrivateUse2)   ← 我们在这里:lookup 拿到 CPU kernel,record
+  ↓
+CPU kernel                       ← 真实计算
+```
+
+即:**capture 期间 autograd 是真的跑了的**,只是 capture 看到的是 autograd
+"展开"之后的低层 op。replay 时为了拿满 dispatcher 节省,我们 exclude
+PrivateUse2 **和 Autograd**,直调 cached CPU kernel —— 此时 autograd wrapper
+**不再** 跑,产生的新 output tensor **没有** grad_fn。
+
+这就是 autograd 不被支持的真正原因:**capture-time 建好的 backward graph
+绑定到了 capture-time 的 input/output 对象,replay 产生的新 output 没有
+grad_fn,且用户即便持有 capture-time output 调 backward,`save_for_backward`
+存的也是 capture-time 的 input snapshot,与 replay 期变化过的 input 无关 ——
+任何方向都得到错误梯度或抛错**。
+
+**结论 (v1)**:capture 必须 `torch.no_grad()`。Python API 强制:
+
+```python
+with tdc.capture() as trace:
+    if torch.is_grad_enabled():
+        raise RuntimeError("capture() must be inside torch.no_grad()")
+    ...
+```
+
+这是**速度 vs 复杂度**的取舍,不是物理限制——支持 autograd 的方案(让
+replay 跑 autograd wrapper 或把 fw+bw 一起 capture)记入 §17 后续扩展,
+等 v1 收益验证后再决定是否做。
+
+## 8. View ops 与动态 shape 的相互作用
+
+view ops(`t`, `view`, `reshape`, `as_strided`, ...)的 boxed kernel 不分配
+新 storage,返回共享 storage 的新 `TensorImpl`。**每次 replay 都会产生新
+的 TensorImpl**,因为它是基于当前 input 的 metadata 现算的。
+
+我们的 `outputs[step][slot]` 表正好 handle:后续 step 通过 `kPrevStepOutput`
+索引拿到的是**这次 replay 的 new view**,不是 capture 时的 old view。
+
+动态 shape 下的特殊情形:
+
+- `view(...)` 的目标 shape 在 capture 时是常量(literal IValue 存进 args),
+  replay 时这个常量不变。如果原 tensor 在两次 replay 间从 `[4,8]` 变
+  `[8,8]`,而 view 的目标是 `[-1, 8]`,kernel 会算出新的实际 shape——OK。
+- 但如果 view 目标是 `[2,4,4]` 硬编码,replay 时 input 变 `[8,8]`(32
+  elements 不等于 32... 这里假设一致),view 仍按 `[2,4,4]` reshape——OK,
+  数值是用户责任。
+- `reshape` 在某些情况下会触发 copy,某些情况下纯 view。kernel 内部依旧
+  依赖当时 metadata 决定;cached `KernelFunction*` 还是同一个(reshape 的
+  CompositeImplicitAutograd kernel),没问题。
+
+特殊情形——`as_strided` 的 size/stride 参数:这两个参数是 args 里的
+literal `IntArrayRef`,**在 capture 时被冻结**。如果用户期望 stride 跟着
+input shape 变,他必须在每次 replay 之间手动调整 input,然后 trace 内
+`as_strided` 还是用 capture 时的 stride 常量。这是真正的限制,**文档列入
+**:不要在 capture 区域出现 size/stride 依赖动态 shape 的 view ops。如果
+非要支持,需要在 Python 侧把 size/stride 也做成 placeholder。
+
+### 8.1 shape-derived literal:dispatcher capture 的根本盲点
+
+`as_strided(size, stride)` 是这类问题的一个特例。更普遍的形式是 **size 参数
+由 Python 端从 `tensor.shape[i]` 派生出来**:
+
+```python
+y = x.view(x.shape[0] // 2, 2, -1)    # 第一维由 x.shape[0]//2 推出
+z = w.reshape(batch * seq_len, hidden)  # 由两个维度乘积推出
+```
+
+Python 在调用 `view` / `reshape` 之前,**已经把 `x.shape[0]//2` 求值成具体 int**:
+
+```
+x.shape          → tensor.sizes() 直读 TensorImpl 字段,不经 dispatcher
+x.shape[0]       → Python int,不经 dispatcher
+... // 2         → Python int 运算,不经 dispatcher
+x.view(<int>, 2, -1)  → 经 dispatcher,但 size 参数已是字面值
+```
+
+我们的 fallback 在 dispatcher 层接到的 size 参数是 `IntArrayRef([4, 2, -1])`,
+**完全没有"从 x.shape 来的"这条 lineage 信息**。trace 把它存为 `kLiteral`
+冻结到 capture-time shape。
+
+这是 v1 的**根本盲点**,不是一个能用更聪明的 capture 逻辑修复的 bug —— Python
+端的求值发生在我们能介入的最低点之前。
+
+### 8.2 为什么 torch.compile 没这个问题
+
+`torch.compile` 通过 **Dynamo 在 Python 字节码层接管执行**,实现"延迟整数求
+值":
+
+1. `x.shape[0]` 在 Dynamo trace 时返回 `SymInt(s0)`,不是 `int(4)`
+2. `s0 // 2` 不计算,返回新的 `SymInt(s0 // 2)`
+3. 生成的 FX graph 节点里 `view` 的 size 参数**是 SymInt 表达式**,不是字面值
+4. 运行时按 input 当下的 size 实例化 SymInt,再喂给 aten 内核
+
+这条机制无法在 dispatcher 层重建——dispatcher **看不到** Python 字节码,看不到
+`//`,看不到 `x.shape` 的属性读取。要拿到 lineage,**必须从 FX graph 读**,而 FX
+graph 只能由 Dynamo 这样的字节码级 trace 框架产生。
+
+### 8.3 v1 PoC 的有意识取舍
+
+下面这些场景在 v1 是**明确不支持**的(归入 §3 非目标):
+
+| 用户写法 | v1 行为 |
+|---|---|
+| `x.view(M, N)` 中 `M`、`N` 都是 Python 字面常量 | ✓ shape 不变就 OK,变就要重 capture |
+| `x.view(-1, N)` | ✓ kernel 内 `-1` 自动算,动态 OK |
+| `x.transpose(0, 1)` / `permute([1,0,2])` / `squeeze()` / `unsqueeze(d)` | ✓ dim 索引与 shape 大小无关,完全动态 |
+| `x.view(x.shape[0]//2, 2, -1)` | ✗ 第一维烘焙在 trace,shape 变即错 |
+| `x.reshape(b*s, h)` 其中 b/s 由 shape 派生 | ✗ 同上 |
+| `as_strided(size=..., stride=...)` | ✗ 全部烘焙 |
+| `.sum().backward()` 中 backward 的 `expand` | ✗ 同样烘焙了 forward 的 shape |
+
+**用户应对**:
+1. 优先用 `-1` marker(`view(-1, N)`、`reshape(-1, ...)`)避开 shape-derived literal
+2. 用 dim-index 类操作(transpose/permute/squeeze)替代 size-list 类操作
+3. 必须用 shape-derived literal 的代码,**按 shape 桶分别 capture**(类似 cudagraph)
+4. 真要完整 dynamic shape,**用 `torch.compile`,不要用 v1 PoC**
+
+v1 PoC 的价值定位:**"dispatcher overhead 是瓶颈,且 shape pattern 简单"** 的场景。
+重叠完全 dynamic shape 不是 v1 的目标。
+
+## 9. Python API
+
+```python
+import torch_dispatch_capture as tdc
+
+# 唯一形态:context manager,默认 dynamic 语义
+with tdc.capture() as trace:
+    out = my_function(a, b)
+
+trace.replay()                                # 用 a, b 的当前 metadata
+a.fill_(3.0); trace.replay()                  # 自动反映新 value
+a.resize_(16, 16); b.resize_(16, 16)          # 自动反映新 shape
+trace.replay()                                # 不用重 capture
+
+# 显式 begin/end
+handle = tdc.begin()
+my_function(a, b)
+trace = tdc.end(handle)
+
+# 内省
+trace.size()                # int,op 数量
+trace.entries               # list[dict] of (op_name, dispatch_keys, input_kinds)
+trace.discard()             # 主动释放
+print(trace)                # 打印 op 序列
+```
+
+## 10. C++ API
+
+```cpp
+namespace torch_dispatch_capture {
+
+class Trace {
+public:
+    void replay();
+    size_t size() const;
+    std::string dump() const;
+    ~Trace();      // 释放所有 captured Tensor 强引用
+private:
+    struct Step {
+        const c10::KernelFunction* kernel;
+        c10::DispatchKeySet effective_ks;
+        c10::impl::OperatorEntry* op_def;
+        std::vector<StepInputRef> inputs;
+        size_t n_outputs;
+    };
+    std::vector<Step> steps_;
+    std::vector<at::Tensor> captured_tensors_;
+};
+
+class CaptureContext {
+public:
+    static CaptureContext& current();
+    static void begin();
+    static std::unique_ptr<Trace> end();
+    static bool is_active();
+    void record(Step&&);
+};
+
+}
+```
+
+## 11. 实现文件清单
+
+```
+torch_dispatch_capture/
+├── csrc/
+│   ├── capture_context.h         # CaptureContext + Trace 声明
+│   ├── capture_context.cpp       # TLS context 实现
+│   ├── capture_fallback.cpp      # boxed fallback,注册到 PrivateUse2
+│   ├── trace.cpp                 # Trace::replay 实现
+│   └── bindings.cpp              # pybind11 → Python
+├── python/
+│   └── __init__.py               # capture() context manager
+├── test/
+│   ├── test_correctness.py       # 与 eager 数值对齐
+│   ├── test_dynamic_shape.py     # 不同 shape 反复 replay
+│   ├── test_mutation.py          # in-place 传播
+│   ├── test_view_ops.py          # view 在动态 shape 下正确
+│   └── test_benchmark.py         # eager vs replay
+├── setup.py                      # torch.utils.cpp_extension
+└── README.md
+```
+
+构建用 `torch.utils.cpp_extension.CppExtension`,不需要改 PyTorch 源码。
+
+## 12. 验证用例
+
+### 12.1 正确性
+
+- `test_arithmetic` — 元素级 op 链 replay 与 eager 数值完全一致。
+- `test_view_ops_static_shape` — `t/view/reshape/transpose` chain,replay
+  期间 input shape 不变,数值正确。
+- `test_inplace_propagation` — `a.fill_(10); trace.replay()` 用新 a 算
+  (对齐 Python PoC EXP 4)。
+- `test_no_grad_required` — `grad_enabled=True` 下 capture 抛 RuntimeError。
+- `test_dtype_change_rejected` — capture 时 float32 → replay 时 a 变 float64,
+  raise(因为 dispatch key 变了)。
+
+### 12.2 动态 shape 专项
+
+- `test_resize_same_storage` — capture `(4,8) → (8,8)` add。replay 时
+  `a.resize_(2, 8); b.resize_(2, 8)`,replay 应得 `(2,8)` 输出,数值与
+  在新 shape 下 eager 跑的一致。
+- `test_resize_realloc` — `a.resize_(1024, 1024)` 超过原 storage,PyTorch
+  重新 allocate,data_ptr 变。replay 自动拿新 ptr,数值正确。
+- `test_varied_batch` — capture 时 batch=4,replay 时 batch ∈ {1,2,4,8,16}
+  各跑一遍,与对应 eager 一致。模拟 KV cache 滑动 / variable seq len。
+- `test_view_with_shape_dep` — 如果 trace 包含 `tensor.view(-1, 8)` 这种
+  shape 自适应 op,replay 在不同 input shape 下正确。
+- `test_view_with_shape_literal` — 如果 trace 包含 `view(2,4,4)` 硬编码,
+  replay 时 input shape 变得不兼容,raise(kernel 自然 raise)。文档明确。
+- `test_as_strided_frozen` — `as_strided(size=[4,4], stride=[8,1])` 这种
+  stride 硬编码,文档明确不支持动态 shape;测试断言行为符合"shape 变了
+  就出错"的预期。
+
+### 12.3 Benchmark
+
+工作负载:
+- 8×8 elementwise add × 64(纯 dispatch overhead)
+- DeepSequential(32 × `Linear(8,8)`)
+- variable seq len:capture 一次,replay 在 batch ∈ {1,4,16,64} 各 100 次
+
+```
+[cpp_dispatch_capture benchmark]
+n_ops=128 workload=elementwise
+  eager_med    = X.X µs/call    (Y.Y ns/op)
+  replay_med   = A.A µs/call    (B.B ns/op)
+  speedup      = N.NN×
+  per_op_save  = (Y.Y - B.B) ns
+
+[dynamic shape]
+n_ops=128 workload=elementwise(batch=B)
+  B=1:   eager=X1 us  replay=A1 us  speedup=N1×
+  B=4:   ...
+  B=16:  ...
+  B=64:  ...
+  (一次 capture,N 次 replay,无重 capture)
+```
+
+预期(基于 Python PoC 推算):
+- elementwise per-op 节省 0.9–1.2 µs:基线 1.8 µs/op → 0.6–0.9 µs/op (2–3×)
+- DeepSequential per-op 节省 1.2–1.5 µs
+
+硬性 assert:**任何 batch size 下,replay 不能慢于 eager**。**replay 在不
+同 batch 间共用同一份 trace,不允许触发重 capture**。
+
+## 13. 风险与已知限制
+
+1. **`OperatorEntry*` / `KernelFunction*` 的生命周期**。op (re-)registration
+   会更新 `OperatorEntry::dispatchTable_` 里的 slot。存裸指针不安全:存
+   **(OperatorEntry*, dispatch_key, version)**;replay 入口 `version ==
+   entry.version()` 检查,不匹配则 fallback 到一次 lookup 并刷新缓存(O(1),
+   不影响热路径)。
+
+2. **alias key 展开**。`OperatorEntry::lookup` 已 handle,我们拿到的
+   `KernelFunction&` 是最终具体 kernel 的引用,**不**是 alias key 的 stub。
+
+3. **fallthrough kernel**。`BackendSelect` 等 key 的 kernel 是 fallthrough,
+   `lookup` 自动跳过,返回下一层。OK。
+
+4. **跨 stream 一致性**。CPU 无问题;CUDA / XPU 需要 capture 时 stream 与
+   replay 时 stream 关系明确(可用当前 `getCurrentStream`)。与 cudagraph
+   同样限制,文档说明。
+
+5. **Custom autograd Function / hook**。capture 区域 `no_grad`,
+   `torch.autograd.Function.forward` 内部的 dispatcher 调用会被 capture,
+   backward 不会(因为根本没建)。预期行为。
+
+6. **TorchDispatchMode 与 capture 共存**。如用户在 capture 时压了一个
+   `TorchDispatchMode`(`Python` key,enum 229),由于 `PrivateUse2` 是
+   backend bit(低优先级)< `Python`,用户 mode 先 fire、redispatch 后我
+   们的 capture fallback 才 fire——我们看到的是 mode 处理过的结果。OK,
+   符合大多数预期(用户的 mode 是想要 capture 的)。
+
+7. **`as_strided` 类硬编码 size/stride 的 view ops**。capture 时 size/stride
+   作为 literal IValue 冻结,replay 时不跟随 input shape 变化。文档明确
+   不在动态 shape 支持范围。如有必要可加 placeholder 扩展(§5.2)。
+
+8. **shape 不兼容时 kernel 抛错**。如果 capture 时 `a:[4,8] @ b:[8,4]`,
+   replay 时改成 `a:[4,7]`,`addmm` kernel 自己会 raise。我们不预先校验
+   shape——这是 kernel 的责任。**好处**:对合法变化零开销;**代价**:错误
+   信息来自 kernel,不是我们。文档建议用户对 trace 的 shape 兼容性自己负责。
+
+9. **多次 replay 间的中间 tensor 内存**。trace 在 capture 期会产生中间
+   output;只要后续 step 引用这些 output(`kPrevStepOutput`),它们就会被
+   引用计数维持。但**每次 replay** 时这些中间 output 是新分配的;PyTorch
+   caching allocator 会复用。整体行为与 eager 一致,不"钉死"内存。
+
+10. **不与 `torch.compile` 嵌套**。`torch.compile` 内 FunctionalTensor /
+    ProxyTensor mode 与我们的 capture key 共存关系复杂。detect 到
+    `torch._dynamo.is_compiling()` 时拒绝 capture,raise。
+
+## 14. 与 Mode / Subclass 的优先级关系
+
+`torch/csrc/utils/python_arg_parser.cpp:588` 的
+"Note [__torch_dispatch__ dispatching order]":
+**user mode → user subclass → infra mode → infra subclass**。`Python` key
+(enum 229)的处理位于 dispatcher 中游,我们的 `PrivateUse2`(backend bit)
+位置更低。
+
+实际触发顺序:
+```
+TorchDispatchMode (if any)             ← Python key 在前 (#28)
+  ↓ redispatch
+AutogradCPU / ADInplaceOrView / ...
+  ↓ redispatch
+CaptureFallback (PrivateUse2)          ← 我们在这里 (#40 backend tier)
+  ↓ effective_ks 不含 PrivateUse2,直接 lookup
+真实 backend kernel (CPU/CUDA/...)
+```
+
+意义:capture 看到的就是真正会跑的 backend kernel 形态,**已经被** mode、
+autograd、view-meta 都处理过了。这是想要的——replay 不需要再过这些层。
+
+## 15. 实施分阶段
+
+| 阶段 | 内容 | 风险 | 输出 |
+|---|---|---|---|
+| 1 | C++ 扩展骨架 + capture fallback + 仅录 op 名 + Python `capture()` 上下文 | 低 | smoke test |
+| 2 | replay 实现:cached KernelFunction 直调,outputs rewire | 中 (view 处理) | 正确性测试全过 |
+| 3 | 动态 shape 测试 (resize / varied batch) | 低 | dynamic 测试全过 |
+| 4 | benchmark + 报告 | 低 | 数值表,确认 ≥ 2× per-op |
+| 5 | 边角:reset hook、no_grad 强制、dtype change rejection | 低 | 测试套件 GA |
+| 6 | 文档 + setup.py packaging | 低 | pip install 可用 |
+
+## 16. 验证通过标准
+
+- [ ] `pip install -e torch_dispatch_capture` 在 PyTorch 2.x 上构建通过。
+- [ ] `import torch_dispatch_capture` 不报错,`capture()` 可用。
+- [ ] 所有 `test/test_*.py` 通过,**尤其 `test_dynamic_shape.py` 全套**。
+- [ ] elementwise benchmark:**replay per-op < 0.5 × eager per-op**。
+- [ ] DeepSequential benchmark:**replay per-op < 0.6 × eager per-op**。
+- [ ] dynamic shape:**capture 1 次,4 个不同 batch 各 100 次 replay,
+      累计耗时 < 同 workload eager 累计耗时 × 0.6**。
+- [ ] 内存:`trace = None; gc.collect()` 后,capture 时分配的 storage
+      被全部释放。
+
+## 17. 后续扩展
+
+按预期收益与改动量排序,**触发条件:v1 验证 elementwise / DeepSequential
+benchmark 至少 ≥ 1.5× per-op 节省**。如果 v1 收益不达预期,以下都不做。
+
+### 17.1 Backward capture(优先级最高,前提条件:v1 收益足够)
+
+支持 `requires_grad=True` 下 capture。两条可选路线,各有取舍:
+
+**路线 B1:replay 期重跑 autograd wrapper**
+
+- capture 时把 `lookup` 用的 keyset **保留** Autograd 系列,cached 的
+  `KernelFunction*` 是 `AutogradCPU wrapper`,不是底层 CPU kernel。
+- replay 时不 exclude Autograd,直调 wrapper —— wrapper 内部 `save_for_backward`
+  / `collect_next_edges` / 构造新 backward node 都正常发生,**snapshot 是
+  replay 期当下的 input 值**,grad_fn 挂在 replay-time 的 new output 上。
+- 节省幅度:只剩 `OperatorEntry::lookup` 那一层(≈ 15% per-op,基于 Python
+  PoC `_op_dk` 实测)。autograd wrapper 内部仍要 redispatch 一次,那次走
+  完整 dispatcher。
+- 实现改动:capture_fallback 把 `effective_ks` 从"减掉 Autograd 后"改成
+  "完整 ks"。其余几乎不变。
+
+**路线 B2:capture forward + backward(AOT 式)**
+
+- capture API 扩展:
+  ```python
+  with tdc.capture() as trace:
+      out = fn(a, b)
+      trace.mark_backward(out, grad_outputs=[grad_out])
+  ```
+- capture 期 `mark_backward` 触发 `torch.autograd.grad(out, [a, b], grad_out)`,
+  让 autograd 真的跑一遍 backward —— 所有 backward kernel 也通过 dispatcher,
+  也被我们的 capture_fallback 录进 trace。
+- replay 一次 = forward 算子序列 + backward 算子序列连跑,**完全不需要
+  autograd**。等价于 AOTAutograd 的轻量版。
+- 节省幅度:同 v1(几乎全部 dispatcher),且覆盖 backward。
+- 实现改动:中等。需要在 trace 内部区分 fw step 与 bw step,replay 时如果
+  用户只要 forward 就停在 fw 终点。需要把 grad input/output 也作为
+  placeholder 处理(参考 §5.2)。
+- 限制:capture 时 loss 形状要与 replay 时一致(实际上由 §3 的
+  `(device, dtype, layout)` 一致性约束自然保证)。
+
+**v2 倾向选 B1 先做**,因为改动最小且支持原生 PyTorch autograd 语义;B2
+做为更激进的优化路线,等 B1 也有数据后再考虑。
+
+### 17.2 Placeholder + bind(§5.2)
+
+支持 capture 后绑定不同 tensor 对象。等价于一个简化版 LazyTensor。优先
+级中等——大部分场景靠 in-place mutation 已够,只在"每次循环重新分配
+output buffer"这种特定 pattern 下需要。
+
+### 17.3 跨 trace 复用 KernelFunction cache
+
+全局 `(op_name, effective_ks) → KernelFunction*` cache,后续 capture 跳过
+lookup,capture 期也加速。降低 capture cost,与 replay 性能无关。低优先级。
+
+### 17.4 与 NPU OpDispatchCapture 串联
+
+本设计抓 PyTorch dispatcher 层,NPU 的 `OpDispatchCapture`
+(`pytorch_npu/docs/dynamic_capture_demo_design.md`)抓 `EXEC_NPU_CMD` 层。
+两者正交,可以同时启用让 dispatcher overhead + ACL host prep 一起省;需
+要在 NPU OpCommand hook 里识别我们的 capture key 并跳过自己的 capture
+路径。NPU 团队完成 v1 后再对接。
+
+### 17.5 序列化 trace
+
+把 trace 落盘(op 名 + dispatch keyset + literal args),下次 load 时按 op
+名重新 `findOp + lookup`,等价于一种轻量 AOT 格式。低优先级,与 AOTI 重叠。
+
+### 17.6 完整动态 shape:作为 `torch.compile` 的 backend(v2 推荐方向)
+
+要解决 §8.1 描述的 shape-derived literal 问题,**没有可行的 dispatcher-only
+路径**。但有一个 PyTorch 早已铺好的工业路径:把 PoC 包装成 `torch.compile`
+的自定义 backend,**借力 Dynamo + AOTAutograd 已经做完的符号化工作**。
+
+#### 17.6.1 接入点选择
+
+`torch.compile` 的 backend 钩子有三档可选:
+
+| 接入点 | graph 形态 | 我们需要处理的复杂度 |
+|---|---|---|
+| 直接接 `backend=fn`(Dynamo 原始 graph) | call_method / call_function / operator.* / aten 混杂 | **高**(节点类型十几种,Python op 语义全集) |
+| **接 `aot_autograd(fw_compiler=...)`** | functionalized + decomposed 的 core aten graph,SymInt 表达式显式 | **中**(基本只剩 `call_function` + 大约 150 个 core aten op + 一打 `operator.*`) |
+| 接 inductor 之后 | 已 codegen,失去 graph 结构 | **不可能** |
+
+**v2 选第二档**:`torch._dynamo.backends.common.aot_autograd` 已经把 graph
+处理到"几乎全是 functional aten + 少量 Python operator"的程度。我们写一个
+shim 把这个 graph 翻译成扩展版的 trace。
+
+#### 17.6.2 扩展后的 trace 结构
+
+```cpp
+struct Step {
+    enum Kind { TensorOp, SymExpr };           // 新增 SymExpr
+    Kind kind;
+
+    // TensorOp 字段(同 v1)
+    c10::OperatorHandle op;
+    c10::DispatchKey target_dk;
+
+    // SymExpr 字段(新)
+    py::object fn;                              // 来自 FX 节点的 Python lambda
+                                                // (operator.floordiv / mul / ...)
+
+    std::vector<StepInputRef> inputs;
+    size_t n_outputs;
+};
+
+struct StepInputRef {
+    enum Kind {
+        kCapturedTensor,
+        kPrevStepOutput,
+        kLiteral,
+        kIntList,                               // 新增:可含动态条目的 IntList
+    };
+    // 仅 kIntList:
+    std::vector<StepInputRef> list_elements;    // 每个元素是 sub-Ref
+};
+```
+
+#### 17.6.3 翻译规则(从 aot graph FX 节点到 trace step)
+
+| FX node | 翻译为 |
+|---|---|
+| `placeholder` | 加入 captured_tensors,assigned `kCapturedTensor(idx)` |
+| `call_function(<aten op>)` | `TensorOp` Step,inputs 按 args 类型分类 |
+| `call_function(operator.floordiv / mul / add / ...)` | `SymExpr` Step,fn = 该 Python operator |
+| size 参数是 list-of-mixed | 翻译成 `kIntList`,每个元素递归是 `kLiteral` 或 `kPrevStepOutput` |
+| `get_attr`(模型参数) | 加入 captured_tensors,assigned `kCapturedTensor(idx)` |
+| `output` | 标记最终 user-visible 输出 |
+
+#### 17.6.4 Replay 算法(扩展自 v1)
+
+```python
+def replay(trace, fresh_inputs):
+    outputs = [None] * len(trace.steps)
+    for i, step in enumerate(trace.steps):
+        if step.kind == SymExpr:
+            args = [resolve(r, outputs).toInt() for r in step.inputs]
+            outputs[i] = IValue(int=step.fn(*args))   # Python int 计算
+        else:  # TensorOp
+            stack = build_stack(step.inputs, outputs)
+            step.op.callBoxed(&stack)
+            outputs[i] = stack[0]
+
+def build_stack(refs, outputs):
+    """对每个 ref,生成对应的 IValue 并 push。kIntList 当场拼装。"""
+    stack = []
+    for r in refs:
+        if r.kind == kIntList:
+            ints = [resolve(sub, outputs).toInt() for sub in r.list_elements]
+            stack.push(IValue(IntArrayRef(ints)))
+        else:
+            stack.push(resolve(r, outputs))
+    return stack
+```
+
+每次 replay 都重新跑 SymExpr step,每次 replay 都现场拼 IntList。**SymInt 信息
+通过 step 之间的 `kPrevStepOutput` 边显式保留在 trace 里**,而不是被字面化。
+
+#### 17.6.5 用户 API
+
+```python
+import torch_dispatch_capture as tdc
+from torch._dynamo.backends.common import aot_autograd
+
+@torch.compile(backend=aot_autograd(fw_compiler=tdc.tdc_compiler), dynamic=True)
+def fn(x):
+    return x.view(x.shape[0] // 2, 2, -1)    # ← v1 不支持,v2 支持
+```
+
+或者更简洁的封装:
+
+```python
+@tdc.compile(dynamic=True)
+def fn(x): ...
+```
+
+内部就是 `torch.compile + aot_autograd + tdc_compiler` 的组合。
+
+#### 17.6.6 工程量估计
+
+| 子任务 | LoC | 风险 |
+|---|---|---|
+| `tdc_compiler(gm, sample_inputs)` 主框架 | ~150 行 Python | 低(已有 dynamo 套路) |
+| `Step::SymExpr` + `kIntList` 的 C++ 类型扩展 | ~200 行 C++ | 低 |
+| Replay loop 处理 SymExpr / kIntList | ~80 行 C++ | 低 |
+| Aten op 节点翻译 + 输入分类 | ~300 行 Python | 中(core aten 大约 150 个,但绝大多数 schema 很规整) |
+| operator.* 节点翻译(白名单) | ~50 行 Python | 低 |
+| 输出 / 多输出 op 处理 | ~50 行 Python | 中 |
+| 测试 + LLM-style workload 验证 | ~300 行 | 中 |
+| **合计** | **~1100 行** | 中 |
+
+相比"自研 dynamo + FX graph 解析"的~3000+ 行 + 几乎所有 Python 语义,v2 走
+aot_autograd 接入点是**显著更小的工程**,且与 inductor 共享上游处理逻辑,
+PyTorch 升级时的维护成本也低得多。
+
+#### 17.6.7 v1 与 v2 的定位
+
+| 维度 | v1(当前 PoC) | v2(借 torch.compile) |
+|---|---|---|
+| 触发方式 | `with tdc.capture():` 显式 | `@torch.compile(backend=tdc)` |
+| 动态 shape 支持范围 | dim-index 类 ops + `view(-1, ...)` | **完整动态 shape**(含 shape-derived literal) |
+| 反向支持 | 实验性 `allow_grad=True` | AOTAutograd 已自带,fw/bw graph 都接到 |
+| 工程量 | 已完成,~600 LoC | ~1100 LoC 增量 |
+| 性能边界 | LLM decode / 小算子 / 固定 shape 训练 | 同 v1 + 通用动态 shape 推理 |
+| 与 PyTorch 的耦合 | 低(只用 dispatcher) | 中(依赖 Dynamo/AOT 接口稳定性) |
+
+**v2 不是 v1 的替代,而是叠加**:
+- 简单 / 固定 shape / 极致小 host overhead → 用 v1(没有 compile 开销)
+- 复杂 / 真动态 shape / 训练 → 用 v2(走 compile pipeline)
+
+实施触发条件:v1 在产品场景跑通后,如果 LLM 训练或动态 shape 推理有明确需求,
+再启动 v2。否则 v1 就够了。

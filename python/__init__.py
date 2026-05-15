@@ -134,8 +134,8 @@ Limitations (v1):
 - Captured `out=` arguments are auto-resized to zero on replay so the
   kernel's `resize_output()` can re-allocate to the current shape.
 
-See cpp_dispatch_capture_design.md (in the design discussion repo) for
-the full design rationale.
+See DESIGN.md (next to this file in the repo root) for the full
+design rationale.
 """
 from __future__ import annotations
 

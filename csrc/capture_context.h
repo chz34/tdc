@@ -1,5 +1,5 @@
 // Copyright. PoC for C++ dispatcher-level capture/replay.
-// See agent_space/cpp_dispatch_capture_design.md
+// See DESIGN.md at the repo root for the full design rationale.
 #pragma once
 
 #include <ATen/core/dispatch/Dispatcher.h>

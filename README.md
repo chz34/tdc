@@ -1,7 +1,7 @@
 # torch_dispatch_capture
 
 C++ dispatcher-level capture/replay for PyTorch — PoC of the design
-discussed in `cpp_dispatch_capture_design.md`.
+described in [`DESIGN.md`](DESIGN.md).
 
 ## What it does
 
@@ -323,8 +323,7 @@ literal int — we have no way to recover the lineage back to `x.shape`.
 Solving this requires SymInt-level symbolic tracing, which lives at
 the Python bytecode layer (Dynamo / FX), not at the dispatcher.
 
-See the design doc (`cpp_dispatch_capture_design.md`) §8.1–8.3 for the
-full discussion.
+See `DESIGN.md` §8.1–8.3 for the full discussion.
 
 ## Known constraints (within the supported scope)
 
