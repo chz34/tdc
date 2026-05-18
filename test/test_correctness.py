@@ -205,6 +205,31 @@ class TestCorrectness(unittest.TestCase):
             trace.replay()
             torch.testing.assert_close(obs, a.permute(2, 0, 1).contiguous())
 
+    def test_permute_dynamic_shape(self):
+        """permute(dims) bakes only the dim indices as literals, not the
+        sizes. As long as rank is preserved, replay works with arbitrary
+        per-dim sizes — the kernel reads current sizes from the input."""
+        torch.manual_seed(0)
+        a = torch.randn(2, 3, 4, device=DEVICE)
+        obs = torch.empty(0, device=DEVICE)   # resized at replay
+        with torch.no_grad():
+            with tdc.capture() as trace:
+                p = a.permute(2, 0, 1).contiguous()
+                obs.resize_as_(p); obs.copy_(p)
+            torch.testing.assert_close(obs, a.permute(2, 0, 1).contiguous())
+
+            # Same rank, different per-dim sizes — output shape must follow.
+            a.data = torch.randn(5, 6, 7, device=DEVICE)
+            trace.replay()
+            self.assertEqual(tuple(obs.shape), (7, 5, 6))
+            torch.testing.assert_close(obs, a.permute(2, 0, 1).contiguous())
+
+            # Another shape: guard against accidentally baked size literal.
+            a.data = torch.randn(3, 8, 2, device=DEVICE)
+            trace.replay()
+            self.assertEqual(tuple(obs.shape), (2, 3, 8))
+            torch.testing.assert_close(obs, a.permute(2, 0, 1).contiguous())
+
     def test_view_chained_with_inplace_mutation(self):
         """View shares storage; mutating the view should affect the
         original tensor on every replay too."""
