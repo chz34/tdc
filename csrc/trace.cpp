@@ -85,16 +85,18 @@ void Trace::replay() {
                 case StepInputRef::Kind::kLiteral:
                     stack.emplace_back(ref.literal);
                     break;
+                case StepInputRef::Kind::kCapturedInt:
+                case StepInputRef::Kind::kList:
+                    // v2-only ref kinds — v1 capture never produces these.
+                    TORCH_INTERNAL_ASSERT(false,
+                        "v1 replay encountered a v2-only ref kind; use replay_v2 instead");
+                    break;
             }
         }
 
-        // For v1 we go through the regular dispatcher (with our capture key
-        // excluded). This is less performant than callBoxedForDispatchKey,
-        // but works robustly for ops whose CPU kernels internally redispatch
-        // (e.g., aten::addmm.out → aten::as_strided). Switching to a
-        // pre-resolved kernel pointer is a v1.1 optimization once we have
-        // correctness coverage.
-        step.op.callBoxed(&stack);
+        TORCH_INTERNAL_ASSERT(step.op.has_value(),
+            "v1 step missing OperatorHandle (this is a v2 step?)");
+        step.op->callBoxed(&stack);
 
         TORCH_CHECK(stack.size() == step.n_outputs,
                     "replay stack size mismatch for ", step.op_name,

@@ -1,29 +1,49 @@
-"""Translate an AOT FX GraphModule into a v2 Trace (DESIGN.md §17.6.3).
+"""Translate an AOT FX GraphModule into a C++ Trace (DESIGN.md §17.6.9).
 
-The translator processes each FX node by `node.op`:
-
-  placeholder            -> append to captured_tensors / captured_ints
-  call_function          -> emit one Step (TENSOR_OP or PY_CALL by target type)
-  output                 -> set trace.outputs
-  call_method / call_module / get_attr / HOP -> fail-fast (DESIGN §17.6.8)
-
-list/tuple structures in node.args become kList refs; literals become
-kLiteral; Node references become kPrevStepOutput (one-level slot=0
-because pytree flattens nested outputs at every AOT boundary).
+The translator walks each FX node in `gm.graph.nodes` and emits a Step
+into a C++ Trace via the v2_* methods exposed in csrc/bindings.cpp.
+After the walk, Trace.v2_replay(args) runs the unified C++ replay engine
+(csrc/trace_v2.cpp) — no Python loop over steps at run time.
 """
 from __future__ import annotations
 
+import operator
 from typing import Any, Dict
 
 import torch
 from torch import fx
 
-from .trace import RefKind, Step, StepInputRef, StepKind, Trace
+from torch_dispatch_capture import _C  # type: ignore[attr-defined]
 
 
-def translate_graph(gm: fx.GraphModule) -> Trace:
-    trace = Trace()
-    node_to_ref: Dict[fx.Node, StepInputRef] = {}
+# ---------------------------------------------------------------------------
+# Python target -> BuiltinKind for kPyCall steps
+# ---------------------------------------------------------------------------
+_OP_TO_BUILTIN = {
+    operator.floordiv: _C.BuiltinKind.FLOORDIV,
+    operator.truediv:  _C.BuiltinKind.TRUEDIV,
+    operator.add:      _C.BuiltinKind.ADD,
+    operator.sub:      _C.BuiltinKind.SUB,
+    operator.mul:      _C.BuiltinKind.MUL,
+    operator.mod:      _C.BuiltinKind.MOD,
+    operator.neg:      _C.BuiltinKind.NEG,
+    operator.getitem:  _C.BuiltinKind.GETITEM,
+    operator.eq:       _C.BuiltinKind.EQ,
+    operator.lt:       _C.BuiltinKind.LT,
+    operator.le:       _C.BuiltinKind.LE,
+    operator.gt:       _C.BuiltinKind.GT,
+    operator.ge:       _C.BuiltinKind.GE,
+    operator.ne:       _C.BuiltinKind.NE,
+    torch.sym_max:     _C.BuiltinKind.SYM_MAX,
+    torch.sym_min:     _C.BuiltinKind.SYM_MIN,
+    torch.sym_int:     _C.BuiltinKind.SYM_INT,
+    torch.sym_float:   _C.BuiltinKind.SYM_FLOAT,
+}
+
+
+def translate_graph(gm: fx.GraphModule) -> _C.Trace:
+    trace = _C.Trace()
+    node_to_ref: Dict[fx.Node, Any] = {}    # fx.Node -> _C.StepInputRef
 
     for node in gm.graph.nodes:
         if node.op == "placeholder":
@@ -45,93 +65,129 @@ def translate_graph(gm: fx.GraphModule) -> Trace:
     return trace
 
 
-def _translate_placeholder(node, trace: Trace, node_to_ref):
+def _translate_placeholder(node, trace, node_to_ref):
     val = node.meta.get("val")
     if isinstance(val, torch.Tensor):
-        idx = trace.n_captured_tensors
-        trace.n_captured_tensors += 1
-        ref = StepInputRef(kind=RefKind.CAPTURED_TENSOR, idx=idx)
-        trace.placeholder_routing.append((RefKind.CAPTURED_TENSOR, idx))
+        idx = trace.v2_add_placeholder_tensor()
+        node_to_ref[node] = _C.v2_ref_captured_tensor(idx)
     elif isinstance(val, (torch.SymInt, int)):
-        idx = trace.n_captured_ints
-        trace.n_captured_ints += 1
-        ref = StepInputRef(kind=RefKind.CAPTURED_INT, idx=idx)
-        trace.placeholder_routing.append((RefKind.CAPTURED_INT, idx))
+        idx = trace.v2_add_placeholder_int()
+        node_to_ref[node] = _C.v2_ref_captured_int(idx)
     else:
         raise NotImplementedError(
             f"v2 placeholder val type not supported yet: {type(val).__name__} "
-            f"(node {node.name}). Handles Tensor + SymInt only; "
-            f"SymFloat / SymBool are listed in DESIGN §17.6.8 defensive checks."
+            f"(node {node.name}). Handles Tensor + SymInt only."
         )
-    node_to_ref[node] = ref
 
 
-def _translate_call_function(node, trace: Trace, node_to_ref):
+def _translate_call_function(node, trace, node_to_ref):
     target = node.target
 
     if isinstance(target, torch._ops.HigherOrderOperator):
         raise NotImplementedError(
-            f"v2 does not support HigherOrderOperator {target} (e.g. cond / "
-            f"while_loop / scan). Use torch.compile(backend='inductor') for "
-            f"control-flow workloads. See DESIGN §17.6.8."
+            f"v2 does not support HigherOrderOperator {target}. Use "
+            f"torch.compile(backend='inductor') for control-flow workloads."
         )
 
     inputs = [_node_arg_to_ref(a, node_to_ref) for a in node.args]
-    kwargs = {k: _node_arg_to_ref(v, node_to_ref) for k, v in node.kwargs.items()}
-    step_idx = len(trace.steps)
 
     if isinstance(target, (torch._ops.OpOverload, torch._ops.OpOverloadPacket)):
-        trace.steps.append(Step(
-            kind=StepKind.TENSOR_OP,
-            inputs=inputs,
-            kwargs=kwargs,
-            op=target,
-            name=str(target),
-        ))
+        # Merge kwargs into positional via schema (DESIGN §17.6.9). C++
+        # replay uses positional-only callBoxed, so we expand kwargs here.
+        positional_inputs = _merge_kwargs_into_positional(target, node.args, node.kwargs, node_to_ref)
+        op_name = _qualified_op_name(target)
+        n_out = len(target._schema.returns)
+        step_idx = trace.v2_add_tensor_op_step(op_name, positional_inputs, n_out)
     elif callable(target):
-        # operator.* / torch.sym_* / whitelisted torch APIs — all the same path
-        trace.steps.append(Step(
-            kind=StepKind.PY_CALL,
-            inputs=inputs,
-            kwargs=kwargs,
-            fn=target,
-            name=f"{getattr(target, '__module__', '?')}."
-                 f"{getattr(target, '__name__', repr(target))}",
-        ))
+        builtin = _OP_TO_BUILTIN.get(target)
+        kwargs_refs = [_node_arg_to_ref(v, node_to_ref) for v in node.kwargs.values()]
+        if builtin is not None:
+            # Only positional inputs make sense for C++ builtin dispatch;
+            # the small set of builtins we map (operator.* / torch.sym_*)
+            # don't take kwargs in practice.
+            if kwargs_refs:
+                raise NotImplementedError(
+                    f"v2 builtin {target} unexpectedly has kwargs: {node.kwargs}"
+                )
+            step_idx = trace.v2_add_pycall_step(
+                kind=builtin,
+                inputs=inputs,
+                name=str(target),
+            )
+        else:
+            # Fallback: opaque py::object call. kwargs aren't piped through
+            # for now (rare in AOT graphs).
+            if kwargs_refs:
+                raise NotImplementedError(
+                    f"v2 pyfallback for {target} with kwargs not yet supported"
+                )
+            step_idx = trace.v2_add_pycall_step(
+                kind=_C.BuiltinKind.PY_FALLBACK,
+                inputs=inputs,
+                py_fn=target,
+                name=str(target),
+            )
     else:
         raise NotImplementedError(
             f"v2 cannot translate call_function target of type {type(target)}: "
             f"{target!r}"
         )
 
-    node_to_ref[node] = StepInputRef(
-        kind=RefKind.PREV_STEP_OUTPUT, step=step_idx, slot=0)
+    node_to_ref[node] = _C.v2_ref_prev_step(step_idx, 0)
 
 
-def _translate_output(node, trace: Trace, node_to_ref):
-    # node.args is conventionally a 1-element tuple containing the
-    # return tuple/list, e.g. ((view,),) or ((add, idx),).
+def _translate_output(node, trace, node_to_ref):
     assert len(node.args) == 1, f"unexpected output arity: {node.args}"
     output_value = node.args[0]
     if isinstance(output_value, (tuple, list)):
-        trace.outputs = [_node_arg_to_ref(v, node_to_ref) for v in output_value]
+        out_refs = [_node_arg_to_ref(v, node_to_ref) for v in output_value]
     else:
-        trace.outputs = [_node_arg_to_ref(output_value, node_to_ref)]
+        out_refs = [_node_arg_to_ref(output_value, node_to_ref)]
+    trace.v2_set_outputs(out_refs)
 
 
-def _node_arg_to_ref(value: Any, node_to_ref) -> StepInputRef:
-    """Convert a node.args element into a StepInputRef.
-
-    Cases:
-      - fx.Node      -> look up the ref recorded when that node was visited
-      - list / tuple -> kList wrapping recursive sub-refs
-      - anything else (int, float, bool, None, str, slice, dtype, ...) -> kLiteral
-    """
+def _node_arg_to_ref(value, node_to_ref):
     if isinstance(value, fx.Node):
         return node_to_ref[value]
     if isinstance(value, (list, tuple)):
-        return StepInputRef(
-            kind=RefKind.LIST,
-            list_elements=[_node_arg_to_ref(v, node_to_ref) for v in value],
+        return _C.v2_ref_list([_node_arg_to_ref(v, node_to_ref) for v in value])
+    return _C.v2_ref_literal(value)
+
+
+def _qualified_op_name(op) -> str:
+    """Build 'aten::view.<overload>' style name expected by
+    v2_add_tensor_op_step. Schema's overload_name may be empty string —
+    that's the default overload and C++ findOp wants the empty string."""
+    schema = op._schema
+    return f"{schema.name}.{schema.overload_name}"
+
+
+def _merge_kwargs_into_positional(op, args, kwargs, node_to_ref):
+    """For a kTensorOp step, lift kwargs into the positional slot order
+    dictated by the op's schema (so C++ replay can use callBoxed with a
+    flat positional stack). Missing args get filled with their schema
+    default value as a literal ref."""
+    schema_args = op._schema.arguments
+    n_positional = len(args)
+    refs = [_node_arg_to_ref(a, node_to_ref) for a in args]
+
+    # Walk the remaining schema args in declaration order and pull from
+    # node.kwargs by name; for absent ones, append the default value as a
+    # literal. Stop once we've covered all kwargs.
+    remaining_kwargs = dict(kwargs)
+    for i in range(n_positional, len(schema_args)):
+        sa = schema_args[i]
+        name = sa.name
+        if name in remaining_kwargs:
+            refs.append(_node_arg_to_ref(remaining_kwargs.pop(name), node_to_ref))
+        else:
+            if not sa.has_default_value():
+                break
+            refs.append(_C.v2_ref_literal(sa.default_value))
+    if remaining_kwargs:
+        raise NotImplementedError(
+            f"v2 schema kwarg merge: unconsumed kwargs {list(remaining_kwargs)} "
+            f"for op {_qualified_op_name(op)}; schema args: "
+            f"{[a.name for a in schema_args]}"
         )
-    return StepInputRef(kind=RefKind.LITERAL, literal=value)
+    return refs

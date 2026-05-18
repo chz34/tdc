@@ -10,6 +10,7 @@
 #include <torch/csrc/jit/runtime/operator.h>
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -29,18 +30,23 @@ namespace tdc {
 //     model is simpler and there's no subtraction-corruption issue.
 constexpr c10::DispatchKey kCaptureKey = c10::DispatchKey::TESTING_ONLY_GenericMode;
 
-// Each captured op input is one of three things.
+// Each captured op input is one of these things. v1 capture only uses
+// the first three kinds; v2 translator additionally uses kCapturedInt
+// and kList. DESIGN.md §17.6.2.
 struct StepInputRef {
     enum class Kind {
         kCapturedTensor,  // external Tensor — trace holds a strong ref
-        kPrevStepOutput,  // an output produced by an earlier step in this trace
-        kLiteral,         // any non-tensor IValue (Scalar, int, list of ints, ...)
+        kPrevStepOutput,  // output produced by an earlier step in this trace
+        kLiteral,         // any non-tensor IValue (int, float, scalar, ...)
+        kCapturedInt,     // v2: int placeholder, extracted by Dynamo prelude
+        kList,            // v2: nested list of sub-refs (matches FX immutable_list)
     };
     Kind kind;
-    size_t captured_idx{0};   // valid iff kCapturedTensor
-    size_t prev_step{0};      // valid iff kPrevStepOutput
-    size_t prev_slot{0};      // valid iff kPrevStepOutput
-    c10::IValue literal;      // valid iff kLiteral
+    size_t captured_idx{0};                     // kCapturedTensor / kCapturedInt
+    size_t prev_step{0};                        // kPrevStepOutput
+    size_t prev_slot{0};                        // kPrevStepOutput
+    c10::IValue literal;                        // kLiteral
+    std::vector<StepInputRef> list_elements;    // kList
     // If true, this arg is a schema-declared `out=` tensor (pure write).
     // Replay shrinks it to zero elements before the call so the kernel
     // auto-resizes to whatever shape the current inputs require — this is
@@ -51,31 +57,74 @@ struct StepInputRef {
     static StepInputRef CapturedTensor(size_t idx, bool is_out = false);
     static StepInputRef PrevStepOutput(size_t step, size_t slot, bool is_out = false);
     static StepInputRef Literal(c10::IValue v);
+    static StepInputRef CapturedInt(size_t idx);
+    static StepInputRef List(std::vector<StepInputRef> elements);
+};
+
+// Tag for kPyCall steps. The few Python builtin / torch.sym helpers
+// that v2 can encounter in an AOT graph all have direct C++ equivalents;
+// only kPyFallback truly needs a py::object call. DESIGN §17.6.9.
+enum class BuiltinKind : int32_t {
+    kFloorDiv,    // operator.floordiv
+    kTrueDiv,     // operator.truediv
+    kAdd,         // operator.add (on ints)
+    kSub,         // operator.sub
+    kMul,         // operator.mul
+    kMod,         // operator.mod
+    kNeg,         // operator.neg
+    kGetItem,     // operator.getitem on tuple/list IValue
+    kEq, kLt, kLe, kGt, kGe, kNe,
+    kSymMax,      // torch.sym_max
+    kSymMin,      // torch.sym_min
+    kSymInt,      // torch.sym_int
+    kSymFloat,    // torch.sym_float
+    kPyFallback,  // unrecognised callable, call via py::object
+    kNumBuiltinKinds,
 };
 
 // One captured op.
 struct Step {
-    // The OperatorHandle for this op. Replay uses
-    // Dispatcher::callBoxedForDispatchKey(handle, target_dk, stack) which
-    // bypasses key extraction + alias resolution.
-    c10::OperatorHandle op;
-    // Dispatch key the kernel will be invoked on at replay time. Pre-resolved
-    // at capture, equal to the highest-priority key the dispatcher would have
-    // selected after removing our capture key.
-    c10::DispatchKey target_dk;
+    // Step::Kind {kTensorOp, kPyCall}. v1 capture always emits kTensorOp;
+    // v2 translator emits both kinds depending on FX node target.
+    enum class Kind {
+        kTensorOp,    // op.callBoxed(stack)
+        kPyCall,      // builtin C++ switch or py::object call
+    };
+    Kind step_kind{Kind::kTensorOp};
+
+    // ---- kTensorOp fields ----
+    // The OperatorHandle for this op. std::optional to allow default-
+    // construction (kPyCall steps don't carry an op).
+    std::optional<c10::OperatorHandle> op;
+    // Dispatch key the kernel will be invoked on at replay time. v1 sets
+    // this to the pre-resolved key (after removing kCaptureKey); v2 leaves
+    // it as Undefined and uses callBoxed for full dispatch.
+    c10::DispatchKey target_dk{c10::DispatchKey::Undefined};
+
+    // ---- kPyCall fields ----
+    BuiltinKind builtin_kind{BuiltinKind::kPyFallback};
+    // Only used when builtin_kind == kPyFallback. Held opaquely so the
+    // C++ replay can invoke it via pybind11 without taking a pybind
+    // dependency in capture_context.h.
+    void* py_fn_handle{nullptr};   // actually a PyObject*; managed by Trace
+
     // Description of how to reconstruct each input on replay.
     std::vector<StepInputRef> inputs;
-    // Number of return values (matches schema). Used by replay to slice
-    // the stack after the kernel call.
+    // Number of return values. For kTensorOp matches schema. For kPyCall
+    // always 1 (a single IValue, possibly a tuple/list).
     size_t n_outputs{0};
     // Op name for debugging / dump.
     std::string op_name;
 
+    // v1 constructor (kTensorOp by default).
     Step(c10::OperatorHandle h,
          c10::DispatchKey dk,
          std::vector<StepInputRef> ins,
          size_t n_out,
          std::string name);
+
+    // Default constructor for v2 builder path.
+    Step() = default;
 };
 
 // Owned by the Python side; one per `with capture(): ...` block.
@@ -99,15 +148,24 @@ public:
     // tensors they care about.
     void replay();
 
+    // v2 replay path: returns a vector of IValues (the final outputs as
+    // declared by set_outputs()). `args` is the positional input list in
+    // graph-placeholder order, mixing concrete ints and Tensors per
+    // placeholder_routing_. Used by torch_dispatch_capture.v2.
+    std::vector<c10::IValue> replay_v2(
+        const std::vector<c10::IValue>& args);
+
     size_t size() const { return steps_.size(); }
     std::string dump() const;
 
-    // Used by capture_fallback during capture; not part of public API.
+    // ---- shared mutators (v1 + v2) ----
     void append_step(Step&& step) { steps_.emplace_back(std::move(step)); }
     size_t append_captured_tensor(at::Tensor t) {
         captured_tensors_.emplace_back(std::move(t));
         return captured_tensors_.size() - 1;
     }
+
+    // ---- v1-only: capture-time TensorImpl identity tracking ----
     void register_output_identity(c10::TensorImpl* impl, size_t step, size_t slot) {
         tensor_to_step_[impl] = {step, slot};
     }
@@ -119,15 +177,36 @@ public:
         return true;
     }
 
+    // ---- v2-only: graph-input routing + final outputs ----
+    // Encode "the k-th positional arg goes into captured_tensors_[idx]
+    // or captured_ints_[idx]".
+    enum class PlaceholderTarget { kTensor, kInt };
+    size_t append_placeholder_tensor() {
+        placeholder_routing_.push_back({PlaceholderTarget::kTensor, n_captured_tensors_++});
+        return n_captured_tensors_ - 1;
+    }
+    size_t append_placeholder_int() {
+        placeholder_routing_.push_back({PlaceholderTarget::kInt, n_captured_ints_++});
+        return n_captured_ints_ - 1;
+    }
+    void set_outputs(std::vector<StepInputRef> outs) { outputs_ = std::move(outs); }
+    size_t n_captured_tensors_count() const { return n_captured_tensors_; }
+    size_t n_captured_ints_count() const { return n_captured_ints_; }
+
 private:
     std::vector<Step> steps_;
     // External tensors referenced by Step inputs. Strong refs keep them alive.
     std::vector<at::Tensor> captured_tensors_;
-    // Maps a TensorImpl* observed during capture to (step, output slot) so we
-    // can tell whether a downstream input came from a previous step. The map
-    // only needs to remain valid during the capture phase; after capture it
-    // could be cleared, but we keep it for `dump()` introspection.
+    // v1 capture-time bookkeeping: TensorImpl* -> (step, output slot).
     std::unordered_map<c10::TensorImpl*, std::pair<size_t, size_t>> tensor_to_step_;
+
+    // ---- v2 fields ----
+    // Captured ints come from Dynamo prelude (call_size etc.) at replay
+    // time; nothing populates them during v1 dispatch capture.
+    size_t n_captured_tensors_{0};
+    size_t n_captured_ints_{0};
+    std::vector<std::pair<PlaceholderTarget, size_t>> placeholder_routing_;
+    std::vector<StepInputRef> outputs_;
 };
 
 // Thread-local registry of the currently-active capture.

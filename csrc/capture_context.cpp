@@ -33,6 +33,20 @@ StepInputRef StepInputRef::Literal(c10::IValue v) {
     return r;
 }
 
+StepInputRef StepInputRef::CapturedInt(size_t idx) {
+    StepInputRef r;
+    r.kind = Kind::kCapturedInt;
+    r.captured_idx = idx;
+    return r;
+}
+
+StepInputRef StepInputRef::List(std::vector<StepInputRef> elements) {
+    StepInputRef r;
+    r.kind = Kind::kList;
+    r.list_elements = std::move(elements);
+    return r;
+}
+
 // ---------------- Step ----------------
 
 Step::Step(c10::OperatorHandle h,
@@ -65,11 +79,17 @@ std::string Trace::dump() const {
                 case StepInputRef::Kind::kCapturedTensor:
                     os << "ext#" << ref.captured_idx;
                     break;
+                case StepInputRef::Kind::kCapturedInt:
+                    os << "int#" << ref.captured_idx;
+                    break;
                 case StepInputRef::Kind::kPrevStepOutput:
                     os << "step" << ref.prev_step << ":" << ref.prev_slot;
                     break;
                 case StepInputRef::Kind::kLiteral:
                     os << "lit(" << ref.literal.tagKind() << ")";
+                    break;
+                case StepInputRef::Kind::kList:
+                    os << "list[" << ref.list_elements.size() << "]";
                     break;
             }
         }

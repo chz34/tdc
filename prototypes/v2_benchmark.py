@@ -1,11 +1,6 @@
 """v2 replay performance benchmark.
 
-Honest test of the question: does v2's pure-Python replay actually
-go faster than alternatives? Or does it have the same overhead pattern
-as v1's earlier __torch_dispatch__ pure-Python replay experiment, where
-"capture once, replay in Python" gained nothing over plain eager?
-
-Four modes are compared on the same function with the same inputs:
+Compares wall-clock per call across four modes on the same function:
 
     eager        : plain function call, no compile pipeline
     dynamo       : torch.compile(backend="eager")
@@ -13,18 +8,20 @@ Four modes are compared on the same function with the same inputs:
     aot_eager    : torch.compile(backend="aot_eager")
                    -- Dynamo prelude + AOTAutograd graph + boxed_nop runner
     v2           : torch.compile(backend=aot_autograd(fw_compiler=v2.fw_compiler))
-                   -- Dynamo prelude + AOTAutograd graph + our pure-Python replay
+                   -- Dynamo prelude + AOTAutograd graph + C++ trace replay
 
-Expected outcome (we want to verify, not preassume):
+Post Phase-2a (DESIGN.md §17.6.9), v2 replay runs in C++ via the unified
+Trace::replay_v2 engine that v1 capture also shares. Expected outcome:
 
-  1. v2 is NOT faster than eager. The Python overhead of replaying each
-     Step is comparable to Python calling the op itself. The expectation
-     matches the user's prior __torch_dispatch__ experiment.
-  2. v2 is comparable to aot_eager since both go through the same
-     compile path; the only difference is how the post-compile gm is run.
-  3. The interesting metric is not raw speed but "how much overhead
-     does the v2 translator + replayer add over aot_eager?" — that's
-     the cost of using v2 over just letting aot_eager run the gm.
+  1. v2 still cannot beat eager for tiny workloads — the compile
+     pipeline (Dynamo + AOT) dominates regardless of how the trace
+     runs. This is unavoidable on torch.compile-based paths.
+  2. v2 can match or beat aot_eager because it skips AOTAutograd's
+     runtime_wrapper codegen and goes straight to callBoxed. The
+     post-compile overhead surface is smaller.
+  3. For larger workloads where aten kernels dominate, all four modes
+     converge — Python/C++ overhead is a fixed slab vs. growing kernel
+     time.
 """
 import os
 import time
