@@ -746,72 +746,142 @@ shim 把这个 graph 翻译成扩展版的 trace。
 
 ```cpp
 struct Step {
-    enum Kind { TensorOp, SymExpr };           // 新增 SymExpr
+    enum Kind {
+        kTensorOp,    // op.callBoxed(stack) — 走 dispatcher (aten / prims / 自定义 op)
+        kPyCall,      // step.fn(*resolved_args) — Python 解释器内直接调用
+    };
     Kind kind;
 
-    // TensorOp 字段(同 v1)
+    // kTensorOp 字段
     c10::OperatorHandle op;
     c10::DispatchKey target_dk;
 
-    // SymExpr 字段(新)
-    py::object fn;                              // 来自 FX 节点的 Python lambda
-                                                // (operator.floordiv / mul / ...)
+    // kPyCall 字段:覆盖 _operator.*(含 getitem)、torch.sym_*、白名单 torch API
+    py::object fn;
 
     std::vector<StepInputRef> inputs;
-    size_t n_outputs;
+    size_t n_outputs;        // 几乎所有 step 是 1;
+                             // 静态多元组返回的 op (max.dim 等) 在 schema 上即 >1
 };
 
 struct StepInputRef {
     enum Kind {
-        kCapturedTensor,
-        kPrevStepOutput,
-        kLiteral,
-        kIntList,                               // 新增:可含动态条目的 IntList
+        kCapturedTensor,     // Dynamo prelude 传入的 Tensor
+        kCapturedInt,        // Dynamo prelude 从 .shape/.size 提出来的具体 int
+        kPrevStepOutput,     // (step_idx, slot) — 引用 prev step 的输出
+        kLiteral,            // 字面量 IValue (int / float / bool / None / str)
+        kList,               // 嵌套列表,元素递归是 StepInputRef
     };
-    // 仅 kIntList:
-    std::vector<StepInputRef> list_elements;    // 每个元素是 sub-Ref
+    size_t idx;                                 // kCapturedTensor / kCapturedInt
+    size_t step;                                // kPrevStepOutput
+    size_t slot;                                // kPrevStepOutput;多数 step slot=0
+    c10::IValue literal;                        // kLiteral
+    std::vector<StepInputRef> list_elements;    // kList
 };
 ```
 
+设计原则说明:
+
+**(1) Step 只有 2 种 kind**。早期草案在 Step 上单独区分 `SymExpr` 与可能的 `GetItem`,
+但实测表明 `operator.getitem` 与 `operator.floordiv` 在 Python 层是完全同型的对象
+(`type(...).__name__ == "builtin_function_or_method"`),AOTAutograd 也把它们归入
+同一桶 (`autograd_cache.py:212` 的 `builtin_function_or_method` 分支)。统一到
+`kPyCall` 后,`fn` 字段承载所有 Python callable,翻译器无需特殊路径区分。
+原 `SymExpr` 这个名字也是错的——`operator.getitem` 不是符号运算,是数据访问;
+`kPyCall` 更准确表达"在 Python 层调用,不进 dispatcher"。
+
+**(2) StepInputRef 有 5 种 kind**:
+- `kCapturedTensor` / `kCapturedInt`:graph 入参,运行时从 Dynamo prelude 拿到具体值
+- `kPrevStepOutput(step, slot)`:flat 寻址,不嵌套
+- `kLiteral` / `kList`:graph 中的 Python 数据
+
+**(3) `kList` 不限定元素类型**(原 `kIntList` 改名)。下列三类 args 底层数据结构相同:
+- `view`/`expand` 的 size:list of int/SymInt
+- `cat`/`stack` 的 tensors:list of Tensor
+- `permute` 的 dims:list of pure int literal
+
+trace 层不做静态类型区分,dispatcher 在 push IValue 进栈时按 op schema 自然校验。
+
 #### 17.6.3 翻译规则(从 aot graph FX 节点到 trace step)
 
-| FX node | 翻译为 |
-|---|---|
-| `placeholder` | 加入 captured_tensors,assigned `kCapturedTensor(idx)` |
-| `call_function(<aten op>)` | `TensorOp` Step,inputs 按 args 类型分类 |
-| `call_function(operator.floordiv / mul / add / ...)` | `SymExpr` Step,fn = 该 Python operator |
-| size 参数是 list-of-mixed | 翻译成 `kIntList`,每个元素递归是 `kLiteral` 或 `kPrevStepOutput` |
-| `get_attr`(模型参数) | 加入 captured_tensors,assigned `kCapturedTensor(idx)` |
-| `output` | 标记最终 user-visible 输出 |
+翻译规则按 `node.op` 分派(FX 共 6 种),`call_function` 再按 `target` 的五大类分派。
+五大类的源头是 `autograd_cache.py:202` 的 `is_cacheable_function`,等同于 AOTAutograd
+**允许出现在 graph 里**的 target 完整集合。
+
+| `node.op` | target 类型 | 翻译为 |
+|---|---|---|
+| `placeholder` | `val` is `Tensor` | 加入 `captured_tensors_`, ref = `kCapturedTensor(idx)` |
+| `placeholder` | `val` is `SymInt` | 加入 `captured_ints_`, ref = `kCapturedInt(idx)` |
+| `placeholder` | `val` is `SymFloat` / `SymBool` | **不支持**(v2 范围内未覆盖),翻译时 fail |
+| `call_function` | `OpOverload` (aten.* / prims.* / 自定义) | `kTensorOp` Step, inputs 按 args 递归翻译 |
+| `call_function` | `operator.*` (含 `floordiv`/`add`/`mul`/`sub`/`mod`/`getitem`/`eq`/`lt` 等) | `kPyCall` Step, `fn` = 该 operator |
+| `call_function` | `torch.sym_max` / `sym_min` / `sym_int` / `sym_float` / `sym_ite` / `sym_not` / `sym_sum` 等 | `kPyCall` Step, `fn` = 该 torch.sym 函数 |
+| `call_function` | `HigherOrderOperator` (`cond` / `while_loop` / `scan` / `invoke_subgraph` ...) | **不支持**,fail-fast 报错引导用 `backend="inductor"` |
+| `call_method` | 任意 | **不支持**(AOT graph 中极罕见),fail-fast |
+| `call_module` | 任意 | **不支持**(仅 built-in nn module,实际几乎不出现),fail-fast |
+| `get_attr` | HOP 子图引用 | 不会单独到达(HOP 整体已 fail) |
+| `get_attr` | 模型参数 | 加入 `captured_tensors_`, ref = `kCapturedTensor(idx)` |
+| `output` | — | 把 args 里每个 Node 转成 `kPrevStepOutput`,挂到 trace.outputs |
+| 任何 args 中出现 Python `list` / `tuple` | — | 整体翻译成 `kList`,元素递归构造 sub-ref |
+
+补充说明:
+
+**关于 list/tuple 构造**:FX graph 里**没有**对应 `getitem` 的"make_tuple/make_list"
+节点。集合构造在 `node.args` 上以 Python `immutable_list` / `tuple` 形态原地存在,
+不进 graph 本身。翻译时直接读取 `args` 上的容器结构,构造 `kList` ref。
+
+**关于 `operator.getitem`**:与早期草案不同,getitem **不被翻译器折叠**,而是和其他
+`operator.*` 一样翻译为 `kPyCall` Step。理由:
+
+- 多输出 op (如 `max.dim`、`var_mean`) 的输出在 IValue 层是 1 个 tuple,
+  `operator.getitem(prev, i)` 是取元素的正常步骤,无需特殊路径。
+- `Tensor[]` 返回 op (如 `split`) 输出 1 个 `List<Tensor>` IValue,同样靠
+  `getitem` 取元素,**capture_fallback 不需要按 schema 拆 List**。
+- AOT graph 经 pytree 摊平后,**永远只产生 1-level getitem**(实测见 §17.6.8),
+  所以 `kPrevStepOutput.slot` 始终是 schema 上静态多元组的 slot,**不会嵌套**。
+
+**关于 `kPrevStepOutput.slot`**:仅当 `kTensorOp` 的 schema 静态声明多元组返回时
+slot > 0(只有少数 op:`max.dim`、`min.dim`、`sort`、`topk`、`var_mean` 等)。
+其余情况一律 slot=0。**绝不应出现 `slot` 指向"上一 step 的内部嵌套元素"** ——
+那类访问只能通过显式 `getitem` step 完成。
 
 #### 17.6.4 Replay 算法(扩展自 v1)
 
 ```python
-def replay(trace, fresh_inputs):
+def replay(trace, captured_tensors, captured_ints):
+    """captured_tensors / captured_ints 来自 Dynamo prelude:
+    它在 graph 入口之前已经从用户 Tensor 上提取了 .size() 等具体 int。
+    runtime 不再有 SymInt,全是 concrete int + 真实 Tensor。"""
     outputs = [None] * len(trace.steps)
-    for i, step in enumerate(trace.steps):
-        if step.kind == SymExpr:
-            args = [resolve(r, outputs).toInt() for r in step.inputs]
-            outputs[i] = IValue(int=step.fn(*args))   # Python int 计算
-        else:  # TensorOp
-            stack = build_stack(step.inputs, outputs)
-            step.op.callBoxed(&stack)
-            outputs[i] = stack[0]
 
-def build_stack(refs, outputs):
-    """对每个 ref,生成对应的 IValue 并 push。kIntList 当场拼装。"""
-    stack = []
-    for r in refs:
-        if r.kind == kIntList:
-            ints = [resolve(sub, outputs).toInt() for sub in r.list_elements]
-            stack.push(IValue(IntArrayRef(ints)))
-        else:
-            stack.push(resolve(r, outputs))
-    return stack
+    def resolve(r):
+        if r.kind == kCapturedTensor:   return captured_tensors[r.idx]
+        if r.kind == kCapturedInt:      return captured_ints[r.idx]
+        if r.kind == kPrevStepOutput:   return outputs[r.step][r.slot]
+        if r.kind == kLiteral:          return r.literal
+        if r.kind == kList:             return [resolve(s) for s in r.list_elements]
+
+    for i, step in enumerate(trace.steps):
+        if step.kind == kPyCall:
+            # Python callable 直接调用,fn 已经覆盖了 operator.* / torch.sym_* / getitem 等
+            args = [resolve(r) for r in step.inputs]
+            outputs[i] = [step.fn(*args)]                  # 默认单输出
+        else:  # kTensorOp
+            stack = [IValue(resolve(r)) for r in step.inputs]
+            step.op.callBoxed(&stack)
+            # 多元组返回 (max.dim / var_mean / sort 等) 时 schema 决定 slot 数
+            outputs[i] = [stack.pop() for _ in range(step.n_outputs)]
+
+    return [resolve(r) for r in trace.outputs]
 ```
 
-每次 replay 都重新跑 SymExpr step,每次 replay 都现场拼 IntList。**SymInt 信息
-通过 step 之间的 `kPrevStepOutput` 边显式保留在 trace 里**,而不是被字面化。
+每次 replay,SymInt 算术 step (kPyCall, fn=operator.floordiv 等) 重跑一次得到新的
+具体 int;IntList 等容器在 `resolve(kList)` 时现场构造。**SymInt 计算依赖关系通过
+step 之间的 `kPrevStepOutput` 边显式保留在 trace 里**,而不是被字面化。
+
+注:从 dispatcher 视角看,`SymInt[]` 形参收到普通 `IntList` IValue 时通过隐式转换
+包成"常量 SymInt"(`SymInt(c)` 退化态),没有 runtime 开销。所以 replay 不需要
+特意构造 SymInt — 用普通 Python int 喂进栈即可,dispatcher 自然识别。
 
 #### 17.6.5 用户 API
 
@@ -838,13 +908,14 @@ def fn(x): ...
 | 子任务 | LoC | 风险 |
 |---|---|---|
 | `tdc_compiler(gm, sample_inputs)` 主框架 | ~150 行 Python | 低(已有 dynamo 套路) |
-| `Step::SymExpr` + `kIntList` 的 C++ 类型扩展 | ~200 行 C++ | 低 |
-| Replay loop 处理 SymExpr / kIntList | ~80 行 C++ | 低 |
+| `Step::kPyCall` + `kList` 的 C++ 类型扩展 | ~200 行 C++ | 低 |
+| Replay loop 处理 kPyCall / kList | ~80 行 C++ | 低 |
 | Aten op 节点翻译 + 输入分类 | ~300 行 Python | 中(core aten 大约 150 个,但绝大多数 schema 很规整) |
-| operator.* 节点翻译(白名单) | ~50 行 Python | 低 |
-| 输出 / 多输出 op 处理 | ~50 行 Python | 中 |
+| operator.* / torch.sym_* 节点翻译(统一为 kPyCall) | ~50 行 Python | 低 |
+| 输出处理(`output` 节点 + 多元组 schema 的 slot) | ~30 行 Python | 低(无需 getitem 折叠) |
+| 防御性断言 + HOP/call_method 等不支持节点的错误信息 | ~50 行 Python | 低 |
 | 测试 + LLM-style workload 验证 | ~300 行 | 中 |
-| **合计** | **~1100 行** | 中 |
+| **合计** | **~1160 行** | 中 |
 
 相比"自研 dynamo + FX graph 解析"的~3000+ 行 + 几乎所有 Python 语义,v2 走
 aot_autograd 接入点是**显著更小的工程**,且与 inductor 共享上游处理逻辑,
@@ -867,3 +938,35 @@ PyTorch 升级时的维护成本也低得多。
 
 实施触发条件:v1 在产品场景跑通后,如果 LLM 训练或动态 shape 推理有明确需求,
 再启动 v2。否则 v1 就够了。
+
+#### 17.6.8 经实测验证的 AOT graph 不变量
+
+`prototypes/v2_aot_api.py` 与 `prototypes/v2_aot_boundaries.py` 通过 16 个边界 case
+(多输出 op / sym_* helper / HOP / 函数化 in-place / 复合 API / 切片) 实测得出的
+不变量,本节作为 §17.6.2~§17.6.4 设计假设的实证依据。
+
+| 不变量 | 探针用例 | v2 设计依赖于此 |
+|---|---|---|
+| `dynamic=True` 下 SymInt 被 AOTAutograd 提到 placeholder | view(x.shape[0]//2)、attention QK、切片用例 | trace 入口签名 = (Int×N, Tensor×M);`sym_size` 不进 graph 内部 |
+| `operator.*` 与 `torch.sym_*` 在 Python 层同构,且 AOTAutograd 同桶分类 | sym_max/sym_min vs floordiv/mul/etc. | 统一 `kPyCall` step,`fn` 字段承载;不需要按子类型分派 |
+| AOT graph 永远只产生 1-level `getitem`(pytree 在所有边界摊平) | max/split/topk/var_mean/sort、cond 多元组分支、嵌套用户代码 | `kPrevStepOutput.slot` 不嵌套;无需链式 ref kind |
+| `Tensor[]` 返回 op (split 等) 后续每个元素**独立** getitem 节点 | split 后接 3 个 getitem | capture 端无需"按 schema destructure List<Tensor>";由 kPyCall(getitem) 自然解 |
+| Python `__getitem__` (tensor 切片) 完全分解为 `aten.select.int` + `aten.slice.Tensor` | `x[0, :] + y[0, :x.shape[1]]`、`x[::2, 1::3]` | 不需要为 indexing 单独建模;`:` 出现为 `INT64_MAX` 字面量;动态上界自然变 `kCapturedInt` |
+| 函数化 in-place 在 graph 末尾留 `aten.copy_.default` fence | y.add_(x)、view().add_(1) | trace 必须保留尾部 copy_ 步骤,否则 caller 看不到 mutation |
+| 复合 API (einsum / layer_norm / dropout / `matmul`) 几乎全被分解为 core aten | 6 个独立 case | 不需要为 `torch.nn.functional` / `torch.functional` 单独路径,落到 `kTensorOp` 即可 |
+| HOP 与 `get_attr` 共存,且 HOP 把 GraphModule 子图作为 arg | torch.cond | v2 显式拒绝 HOP;不引入子图递归翻译 |
+| 没有 `make_tuple` / `make_list` 节点,集合是 `node.args` 上的 Python 容器 | 显式 list 构造 / unbind+stack / 元组返回 | trace 直接把 args 上的 list/tuple 翻译为 `kList`,无对偶"构造 step" |
+
+**v2 翻译器必须实施的防御性断言**(无任一条满足都应 fail-fast,报错指引用户改用
+`backend="inductor"` 或回退到 v1):
+
+1. `placeholder` 的 `val` 不是 `Tensor` 也不是 `SymInt` (例如 `SymFloat`/`SymBool`)。
+2. `call_function` 的 target 是 `HigherOrderOperator`。
+3. `call_method` / `call_module` 节点出现。
+4. `operator.getitem(prev, i)` 的 `prev` 又是一个 `operator.getitem` 节点 (链式访问)。
+5. `output` 的 args 是嵌套 tuple/list (违反 pytree 摊平假设)。
+
+这五条断言一旦在真实 graph 上触发,说明 PyTorch 上游对 AOT graph 形态做了破坏性
+变更,需要回看 §17.6.3 的翻译表是否需要扩展。**只要这些假设成立,v2 翻译器就只
+处理 `placeholder / call_function(OpOverload | builtin | python_callable) / output`
+这 4 类 FX 节点**,设计闭合。
