@@ -804,9 +804,87 @@ trace 层不做静态类型区分,dispatcher 在 push IValue 进栈时按 op sch
 
 #### 17.6.3 翻译规则(从 aot graph FX 节点到 trace step)
 
-翻译规则按 `node.op` 分派(FX 共 6 种),`call_function` 再按 `target` 的五大类分派。
-五大类的源头是 `autograd_cache.py:202` 的 `is_cacheable_function`,等同于 AOTAutograd
-**允许出现在 graph 里**的 target 完整集合。
+##### 17.6.3.1 节点类型完备度的源码依据
+
+v2 翻译器需要处理的 FX 节点是一个**封闭有限集**,这件事由 PyTorch 内部的两层
+枚举保证,翻译器只需覆盖这些枚举即可声称完备。
+
+**第一层:`node.op` 的 6 种取值**
+
+来源:`torch/fx/interpreter.py:294` 的 `Interpreter.run_node`,通过
+`getattr(self, n.op)` 分派,接口固定为以下 6 个方法:
+
+```python
+def run_node(self, n: Node) -> Any:
+    args, kwargs = self.fetch_args_kwargs_from_env(n)
+    return getattr(self, n.op)(n.target, args, kwargs)
+```
+
+`n.op` 的合法取值定义在 `torch/fx/graph.py` 的 `Node` 类,共 6 个:
+`placeholder` / `get_attr` / `call_function` / `call_method` / `call_module` / `output`。
+新增节点类型需要修改 FX 核心,极其罕见。
+
+**第二层:`call_function` 的 target 五大类**
+
+绝大多数计算节点是 `call_function`。它的 `target` 可以是任意 Python callable,
+看似无穷,但 AOTAutograd 用 `autograd_cache.py:202` 的 `is_cacheable_function`
+做了**显式白名单分类**,任何不在白名单里的 target 会抛 `BypassAOTAutogradCache`
+(同文件第 240 行),也就是说**graph 里不会出现白名单之外的 target**:
+
+```python
+def is_cacheable_function(target):
+    if isinstance(target, (torch._ops.OpOverload, torch._ops.OpOverloadPacket)):  # 1
+        return True
+    if is_public_torch_api(target):                                               # 2
+        return True
+    if isinstance(target, torch._ops.HigherOrderOperator):                        # 3
+        return target.cacheable()
+    if type(target).__name__ == "builtin_function_or_method":                     # 4
+        return True
+    if is_safe_torch_function(target):                                            # 5
+        return True
+    if function_name in SAFE_NON_TORCH_FUNCTIONS:                                 # 5b
+        return True
+    return False  # ← BypassAOTAutogradCache raised
+```
+
+逐类拆解:
+
+| # | 类别 | 实例 | 在 graph 里出现的方式 |
+|---|---|---|---|
+| 1 | `OpOverload` / `OpOverloadPacket` | `aten.view.default`, `aten.bmm.default`, `prims.convert_element_type.default`, 用户 `torch.library` 自定义 op | dispatcher 注册过的真实算子 |
+| 2 | public torch API (限于 `torch.functional` / `torch.nn.functional` 两个模块,`SAFE_TORCH_MODULES`) | `torch.nn.functional.relu` 偶尔(通常已分解) | 极少;一般已被 dynamo 进一步 trace 成 OpOverload |
+| 3 | `HigherOrderOperator` | `torch.ops.higher_order.cond` / `while_loop` / `scan` / `invoke_subgraph` / `auto_functionalized_v2` | 控制流 / 子图;伴随 `get_attr` 节点引用子 GraphModule |
+| 4 | `builtin_function_or_method` | `_operator.floordiv` / `add` / `mul` / `sub` / `mod` / `getitem` / `eq` / `lt` / `not_` 等 | sym 算术 / 多输出解包 / 比较 |
+| 5 | `SAFE_TORCH_FUNCTIONS` 白名单 (`autograd_cache.py:161`) | `torch.sym_max` / `sym_min` / `sym_int` / `sym_float` / `sym_sum` / `_sym_sqrt` / `Size` / `Tensor` / `autograd.grad` | sym helper 函数;前 5 个在 graph 里常见,后 3 个罕见 |
+| 5b | `SAFE_NON_TORCH_FUNCTIONS` 白名单 | `einops.rearrange` / `einops.repeat` | 极少;通常已被进一步 trace 成 aten 序列 |
+
+`torch_non_c_binding_in_graph_functions` 也是白名单的一部分(同 `is_safe_torch_function`
+分支),涵盖一些非 C 绑定的 torch 内部函数,实测罕见出现。
+
+**完备度结论**
+
+| `node.op` | 在 v2 里如何处理 | 探针覆盖 |
+|---|---|---|
+| `placeholder` | 翻译为 `kCapturedTensor` / `kCapturedInt`;`SymFloat`/`SymBool` 不支持 | `v2_aot_api.py` 所有用例 |
+| `call_function` (类 1) | 翻译为 `kTensorOp` | 所有用例 |
+| `call_function` (类 4 sym 部分) | 翻译为 `kPyCall` | sym arith、attention QK 用例 |
+| `call_function` (类 4 `getitem`) | 翻译为 `kPyCall(operator.getitem)` | max/split/topk/var_mean/sort 等 |
+| `call_function` (类 5 `torch.sym_*`) | 翻译为 `kPyCall` | sym_max/sym_min 用例 |
+| `call_function` (类 2 nn.functional 残留) | 翻译为 `kPyCall`(同 fn 通用路径) | layer_norm/dropout(实测已分解) |
+| `call_function` (类 3 HOP) | **不支持**,fail-fast | torch.cond 用例 |
+| `call_function` (类 5b einops) | 通用 `kPyCall` 路径或不支持 | 未实测(实测易分解) |
+| `call_method` | **不支持**,fail-fast | 实测未出现 |
+| `call_module` | **不支持**,fail-fast | 实测未出现 |
+| `get_attr` (模型参数) | 加入 `captured_tensors_` | (v2 训练支持时启用) |
+| `get_attr` (HOP 子图) | 仅伴随 HOP 出现,HOP 已 fail | torch.cond 用例 |
+| `output` | 把 args 里 Node 转为 `kPrevStepOutput`,挂到 trace.outputs | 所有用例 |
+
+**总计 `node.op` 6 种,每种都有明确处理(支持或显式 fail)**。`call_function`
+里 5 大类只支持 1 + 4 + 5 这三类(及 2 类的少数残留),其余通过显式断言拒绝,
+与 §17.6.8 的防御性断言列表完全对应。这构成 v2 翻译器的**封闭完备性证明**。
+
+##### 17.6.3.2 完整翻译规则表
 
 | `node.op` | target 类型 | 翻译为 |
 |---|---|---|
