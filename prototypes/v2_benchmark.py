@@ -23,7 +23,8 @@ import time
 
 import torch
 import torch.nn.functional as F
-import torch_dispatch_capture.v2 as tdcv2
+import torch_dispatch_capture as tdc           # v1
+import torch_dispatch_capture.v2 as tdcv2      # v2
 from torch._dynamo.backends.common import aot_autograd
 from torch.profiler import profile, ProfilerActivity
 
@@ -98,12 +99,33 @@ WORKLOADS = {
 # ---------------------------------------------------------------------------
 # Compile each workload under each mode
 # ---------------------------------------------------------------------------
+def _v1_capture(fn, example_inputs):
+    """Capture fn under v1's dispatcher-fallback path.
+
+    Returns a callable that on each invocation replays the captured trace,
+    ignoring the passed-in args (v1 replays against the tensors stashed
+    at capture time, not fresh ones). The benchmark loop will still call
+    it with `*inputs` to keep parity with the other modes.
+
+    Workloads here are fixed-shape so v1's shape-baking is not a concern.
+    """
+    with torch.no_grad():
+        with tdc.capture() as trace:
+            fn(*example_inputs)
+
+    def cb(*_unused):
+        trace.replay()
+
+    return cb
+
+
 def build_variants(fn, example_inputs):
     """Return dict of {label: callable} for fn under each mode."""
     return {
         "eager":     fn,
         "dynamo":    torch.compile(fn, backend="eager", dynamic=True),
         "aot_eager": torch.compile(fn, backend="aot_eager", dynamic=True),
+        "v1":        _v1_capture(fn, example_inputs),
         "v2":        torch.compile(
             fn,
             backend=aot_autograd(fw_compiler=tdcv2.fw_compiler),
@@ -144,7 +166,7 @@ def fmt_us(v):
 
 def run_speed_table():
     header = (f"{'workload':<33} {'eager':>10} {'dynamo':>10} {'aot_eager':>10} "
-              f"{'v2':>10} {'v2_cap':>10} {'cap/eager':>10}")
+              f"{'v1':>10} {'v2':>10} {'v2_cap':>10} {'cap/eager':>10}")
     print(f"\n{header}")
     print(f"{'(all numbers in us)':<33}")
     print("-" * len(header))
@@ -153,13 +175,14 @@ def run_speed_table():
         variants = build_variants(fn, inputs)
         times = {}
         for name, callable_ in variants.items():
-            if name != "v2_cap":   # v2_cap already captured by build_variants
+            if name not in ("v1", "v2_cap"):  # both already captured above
                 torch._dynamo.reset()
             times[name] = time_iters(callable_, inputs)
         cap_over_eager = times["v2_cap"] / times["eager"] if times["eager"] > 0 else float("nan")
         print(f"{label:<33} {fmt_us(times['eager']):>10} {fmt_us(times['dynamo']):>10} "
-              f"{fmt_us(times['aot_eager']):>10} {fmt_us(times['v2']):>10} "
-              f"{fmt_us(times['v2_cap']):>10} {cap_over_eager:>9.2f}x")
+              f"{fmt_us(times['aot_eager']):>10} {fmt_us(times['v1']):>10} "
+              f"{fmt_us(times['v2']):>10} {fmt_us(times['v2_cap']):>10} "
+              f"{cap_over_eager:>9.2f}x")
 
 
 # ---------------------------------------------------------------------------
