@@ -13,6 +13,7 @@ ints that Dynamo specialised on are baked as constants.
 """
 from __future__ import annotations
 
+import inspect
 from typing import Any, Callable, List, Tuple, Union
 
 import torch
@@ -37,10 +38,10 @@ RecipeSpec = Union[
 ]
 
 
-def capture(fn, *example_args, allow_grad: bool = False):
-    """Run `fn(*example_args)` once through torch.compile to extract a
-    Trace, then return a callable that replays the trace directly with
-    fresh args — no Dynamo/AOT machinery on the call path.
+def capture(fn, *example_args, allow_grad: bool = False, **example_kwargs):
+    """Run `fn(*example_args, **example_kwargs)` once through torch.compile
+    to extract a Trace, then return a callable that replays the trace
+    directly with fresh args — no Dynamo/AOT machinery on the call path.
 
     Caller is responsible for: future args matching example_args in
     rank/dtype/device. Sym dimensions may vary; concrete int dimensions
@@ -50,7 +51,55 @@ def capture(fn, *example_args, allow_grad: bool = False):
     one example_arg to have requires_grad=True. The returned callable
     is wrapped in torch.autograd.Function so callers can do the usual
     `loss = captured(*args); loss.backward()` pattern.
+
+    Kwargs: example_kwargs are flattened into the positional arg list
+    in declared order so the trace's recipes can address them by index.
+    The returned callable accepts the same kwarg names as fn (mixing
+    positional and kwarg-style invocation is allowed).
     """
+    # If the user only passed positional args AND fn isn't keyword-only,
+    # the existing positional-only path is enough.
+    if not example_kwargs:
+        return _capture_positional(fn, example_args, allow_grad)
+
+    # Mixed/kwarg path: use inspect.signature to canonicalise parameter
+    # ordering so both the capture call and every later call site can
+    # use any mix of positional / keyword and we'll route via param name.
+    try:
+        sig = inspect.signature(fn)
+    except (ValueError, TypeError) as e:
+        raise RuntimeError(
+            f"v2.capture: can't introspect signature of {fn!r} but "
+            f"example_kwargs were passed; pass example_args positionally "
+            f"or provide a fn with a Python-introspectable signature.") from e
+
+    bound = sig.bind(*example_args, **example_kwargs)
+    bound.apply_defaults()
+    param_names = tuple(bound.arguments.keys())
+    ordered_values = tuple(bound.arguments[n] for n in param_names)
+
+    def _wrapped(*flat):
+        return fn(**dict(zip(param_names, flat)))
+
+    _wrapped.__name__ = getattr(fn, "__name__", "fn") + "__kwflat"
+    inner = _capture_positional(_wrapped, ordered_values, allow_grad)
+
+    def call(*args, **kwargs):
+        bound_call = sig.bind(*args, **kwargs)
+        bound_call.apply_defaults()
+        flat = [bound_call.arguments[n] for n in param_names]
+        return inner(*flat)
+
+    # Forward debug attrs from inner so introspection still works.
+    for attr in ("trace", "recipe_specs", "flat_recipe",
+                 "fw_trace", "bw_trace", "fw_recipe_specs"):
+        if hasattr(inner, attr):
+            setattr(call, attr, getattr(inner, attr))
+    return call
+
+
+def _capture_positional(fn, example_args, allow_grad: bool):
+    """Internal: capture path with strictly-positional example_args."""
     if allow_grad:
         return _capture_with_backward(fn, example_args)
 
