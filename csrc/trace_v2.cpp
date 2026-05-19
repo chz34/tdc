@@ -151,6 +151,38 @@ c10::IValue resolve_ref(
     TORCH_CHECK(false, "unreachable: unknown ref kind");
 }
 
+// Apply the (translation-time) coercion tag to an IValue. Called per
+// arg in the kTensorOp push loop; replaces what used to be a chain of
+// schema().arguments()[k].type()->kind() introspection on every replay.
+inline c10::IValue apply_coercion(c10::IValue iv, ArgCoercion tag) {
+    switch (tag) {
+        case ArgCoercion::kNone:
+            return iv;
+        case ArgCoercion::kScalarToTensor:
+            if (iv.isTensor()) return iv;
+            return c10::IValue(at::scalar_tensor(iv.toScalar()));
+        case ArgCoercion::kListToIntList: {
+            const auto& generic = iv.toList();
+            c10::List<int64_t> ints;
+            ints.reserve(generic.size());
+            for (const auto& e : generic) {
+                ints.push_back(c10::IValue(e).toInt());
+            }
+            return c10::IValue(std::move(ints));
+        }
+        case ArgCoercion::kListToTensorList: {
+            const auto& generic = iv.toList();
+            c10::List<at::Tensor> tensors;
+            tensors.reserve(generic.size());
+            for (const auto& e : generic) {
+                tensors.push_back(c10::IValue(e).toTensor());
+            }
+            return c10::IValue(std::move(tensors));
+        }
+    }
+    return iv;
+}
+
 }  // anonymous namespace
 
 std::vector<c10::IValue> Trace::replay_v2(
@@ -183,78 +215,61 @@ std::vector<c10::IValue> Trace::replay_v2(
     }
 
     std::vector<std::vector<c10::IValue>> outputs(steps_.size());
+    // Single stack reused across all steps (opt 1). For kPyCall steps
+    // we re-use it as a positional-arg buffer; for kTensorOp steps it
+    // doubles as the callBoxed argument stack.
+    torch::jit::Stack stack;
+    stack.reserve(16);
 
     for (size_t i = 0; i < steps_.size(); ++i) {
         const auto& step = steps_[i];
-
-        std::vector<c10::IValue> resolved;
-        resolved.reserve(step.inputs.size());
-        for (const auto& ref : step.inputs) {
-            resolved.push_back(resolve_ref(ref, outputs, captured_tensors, captured_ints));
-        }
+        stack.clear();
 
         if (step.step_kind == Step::Kind::kPyCall) {
+            // PyCall doesn't need coercion — operator.* / torch.sym_*
+            // builtins take raw IValues and return raw IValues.
+            for (const auto& ref : step.inputs) {
+                stack.emplace_back(
+                    resolve_ref(ref, outputs, captured_tensors, captured_ints));
+            }
             c10::IValue result = (step.builtin_kind == BuiltinKind::kPyFallback)
-                ? invoke_py_fallback(step.py_fn_handle, resolved)
-                : invoke_builtin(step.builtin_kind, resolved);
+                ? invoke_py_fallback(step.py_fn_handle, stack)
+                : invoke_builtin(step.builtin_kind, stack);
             outputs[i] = {std::move(result)};
-        } else {
-            // kTensorOp — push resolved IValues to stack and callBoxed.
-            // Schema-aware coercion: aten.X.Tensor variants accept Python
-            // scalars in eager (via OpOverload.__call__'s C path) but
-            // callBoxed is strict, so we wrap Scalar->0-d Tensor for slots
-            // whose schema type is Tensor. This mirrors what PyTorch's
-            // Python __call__ path does internally.
-            TORCH_INTERNAL_ASSERT(step.op.has_value(),
-                "kTensorOp step missing OperatorHandle");
-            const auto& schema_args = step.op->schema().arguments();
-            torch::jit::Stack stack;
-            stack.reserve(resolved.size());
-            for (size_t k = 0; k < resolved.size(); ++k) {
-                c10::IValue iv = std::move(resolved[k]);
-                if (k < schema_args.size()) {
-                    const auto& schema_type = schema_args[k].type();
-                    auto kind = schema_type->kind();
-                    // Scalar -> 0-d Tensor wrap (e.g. aten.mul.Tensor(x, 2.0)).
-                    if (kind == c10::TypeKind::TensorType
-                        && !iv.isTensor()
-                        && (iv.isInt() || iv.isDouble() || iv.isBool())) {
-                        iv = c10::IValue(at::scalar_tensor(iv.toScalar()));
-                    }
-                    // GenericList -> typed list per schema (size args, cat tensors).
-                    else if (kind == c10::TypeKind::ListType && iv.isList()) {
-                        const auto* lt = schema_type->castRaw<c10::ListType>();
-                        auto elem_kind = lt->getElementType()->kind();
-                        const auto& generic = iv.toList();
-                        if (elem_kind == c10::TypeKind::SymIntType
-                            || elem_kind == c10::TypeKind::IntType) {
-                            c10::List<int64_t> ints;
-                            ints.reserve(generic.size());
-                            for (const auto& e : generic) {
-                                ints.push_back(c10::IValue(e).toInt());
-                            }
-                            iv = c10::IValue(std::move(ints));
-                        } else if (elem_kind == c10::TypeKind::TensorType) {
-                            c10::List<at::Tensor> tensors;
-                            tensors.reserve(generic.size());
-                            for (const auto& e : generic) {
-                                tensors.push_back(c10::IValue(e).toTensor());
-                            }
-                            iv = c10::IValue(std::move(tensors));
-                        }
-                        // Other element types fall through with the GenericList.
-                    }
-                }
+            continue;
+        }
+
+        // kTensorOp — opt 2: fold resolve + coerce + push into a single
+        // pass instead of building an intermediate `resolved` vector.
+        // Opt 3: consult precomputed coercions[k] instead of querying
+        // schema().arguments()[k].type()->kind() on every replay.
+        TORCH_INTERNAL_ASSERT(step.op.has_value(),
+            "kTensorOp step missing OperatorHandle");
+        const bool has_coercions = !step.coercions.empty();
+        TORCH_INTERNAL_ASSERT(
+            !has_coercions || step.coercions.size() == step.inputs.size(),
+            "coercions vector must match inputs in length");
+
+        for (size_t k = 0; k < step.inputs.size(); ++k) {
+            c10::IValue iv = resolve_ref(
+                step.inputs[k], outputs, captured_tensors, captured_ints);
+            if (has_coercions) {
+                stack.emplace_back(apply_coercion(std::move(iv), step.coercions[k]));
+            } else {
                 stack.emplace_back(std::move(iv));
             }
-            step.op->callBoxed(&stack);
-            // Multi-output schemas leave N values on the stack; flat slot model
-            // wraps them as a tuple in slot 0 so downstream getitem can extract.
-            if (stack.size() == 1) {
-                outputs[i] = {std::move(stack[0])};
-            } else {
-                outputs[i] = {c10::ivalue::Tuple::create(std::move(stack))};
-            }
+        }
+
+        step.op->callBoxed(&stack);
+
+        // Multi-output schemas leave N values on the stack; flat slot
+        // model wraps them as a tuple in slot 0 so downstream getitem
+        // can extract.
+        if (stack.size() == 1) {
+            outputs[i] = {std::move(stack[0])};
+        } else {
+            outputs[i] = {c10::ivalue::Tuple::create(
+                std::vector<c10::IValue>(stack.begin(), stack.end()))};
         }
     }
 

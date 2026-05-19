@@ -113,7 +113,8 @@ PYBIND11_MODULE(_C, m) {
              [](tdc::Trace& self,
                 const std::string& full_name,
                 std::vector<tdc::StepInputRef> inputs,
-                size_t n_outputs) -> size_t {
+                size_t n_outputs,
+                std::vector<tdc::ArgCoercion> coercions) -> size_t {
                  auto dot = full_name.rfind('.');
                  TORCH_CHECK(dot != std::string::npos,
                      "v2_add_tensor_op_step: expected qualified name 'ns::name.overload', got ",
@@ -123,16 +124,24 @@ PYBIND11_MODULE(_C, m) {
                  auto op = c10::Dispatcher::singleton().findOp({base, overload});
                  TORCH_CHECK(op.has_value(),
                      "v2_add_tensor_op_step: op not found: ", full_name);
+                 TORCH_CHECK(coercions.empty() || coercions.size() == inputs.size(),
+                     "v2_add_tensor_op_step: coercions length ", coercions.size(),
+                     " must equal inputs length ", inputs.size());
                  tdc::Step step;
                  step.step_kind = tdc::Step::Kind::kTensorOp;
                  step.op = op.value();
                  step.inputs = std::move(inputs);
+                 step.coercions = std::move(coercions);
                  step.n_outputs = n_outputs;
                  step.op_name = full_name;
                  size_t idx = self.size();
                  self.append_step(std::move(step));
                  return idx;
-             })
+             },
+             py::arg("full_name"),
+             py::arg("inputs"),
+             py::arg("n_outputs"),
+             py::arg("coercions") = std::vector<tdc::ArgCoercion>{})
         .def("v2_add_pycall_step",
              [](tdc::Trace& self,
                 tdc::BuiltinKind kind,
@@ -215,6 +224,12 @@ PYBIND11_MODULE(_C, m) {
     // graph and builds a C++ Trace through this API. At call time
     // Trace.replay_v2(args) runs the unified C++ replay engine.
     // -------------------------------------------------------------
+
+    py::enum_<tdc::ArgCoercion>(m, "ArgCoercion")
+        .value("NONE",                tdc::ArgCoercion::kNone)
+        .value("SCALAR_TO_TENSOR",    tdc::ArgCoercion::kScalarToTensor)
+        .value("LIST_TO_INT_LIST",    tdc::ArgCoercion::kListToIntList)
+        .value("LIST_TO_TENSOR_LIST", tdc::ArgCoercion::kListToTensorList);
 
     py::enum_<tdc::BuiltinKind>(m, "BuiltinKind")
         .value("FLOORDIV", tdc::BuiltinKind::kFloorDiv)

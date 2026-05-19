@@ -61,6 +61,18 @@ struct StepInputRef {
     static StepInputRef List(std::vector<StepInputRef> elements);
 };
 
+// Per-arg coercion tag for kTensorOp steps. Frozen at translation time
+// by inspecting the op schema + predicted IValue type of each input
+// ref. At replay we just switch on the tag; no schema introspection
+// per call. v1 capture leaves the coercions vector empty (its IValues
+// come from the dispatcher and already match schema).
+enum class ArgCoercion : uint8_t {
+    kNone,              // IValue already matches schema
+    kScalarToTensor,    // Scalar (int/float/bool) -> 0-d Tensor
+    kListToIntList,     // GenericList<IValue<int>> -> c10::List<int64_t>
+    kListToTensorList,  // GenericList<IValue<Tensor>> -> c10::List<at::Tensor>
+};
+
 // Tag for kPyCall steps. The few Python builtin / torch.sym helpers
 // that v2 can encounter in an AOT graph all have direct C++ equivalents;
 // only kPyFallback truly needs a py::object call. DESIGN §17.6.9.
@@ -110,6 +122,11 @@ struct Step {
 
     // Description of how to reconstruct each input on replay.
     std::vector<StepInputRef> inputs;
+    // Per-input coercion tag, parallel to `inputs`. Populated by v2
+    // translator for kTensorOp steps; empty for v1-captured steps and
+    // for kPyCall steps (those don't need coercion). When non-empty
+    // its size() must equal inputs.size().
+    std::vector<ArgCoercion> coercions;
     // Number of return values. For kTensorOp matches schema. For kPyCall
     // always 1 (a single IValue, possibly a tuple/list).
     size_t n_outputs{0};
