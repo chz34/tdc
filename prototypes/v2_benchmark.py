@@ -26,6 +26,7 @@ import time
 
 import torch
 import torch.nn.functional as F
+from torch import nn
 import torch_dispatch_capture as tdc           # v1
 import torch_dispatch_capture.v2 as tdcv2      # v2
 from torch.profiler import profile, ProfilerActivity
@@ -72,6 +73,61 @@ def workload_swiglu_ffn(x, w_gate, w_up, w_down):
     return F.linear(F.silu(gate) * up, w_down)
 
 
+class TransformerBlock(nn.Module):
+    """Pre-LayerNorm transformer block — one of the most common building
+    blocks in modern LLMs:
+
+        h = x + Attn(LayerNorm(x))
+        y = h + FFN(LayerNorm(h))
+
+    Attn is multi-head self-attention with linear Q/K/V/O projections;
+    FFN is SwiGLU. Weights are held as nn.Linear / nn.LayerNorm
+    parameters (the realistic shape). torch.compile and v2.capture both
+    lift these parameters as graph placeholders behind the scenes;
+    v2.capture's param-snapshot path freezes the weight values at
+    capture time, which is the inference contract here.
+
+    Exercises in one block:
+      - 2 LayerNorms (decompose to several aten ops each)
+      - 4 + 3 = 7 nn.Linear (Q/K/V/O + FFN gate/up/down)
+      - 2 matmul + softmax for attention
+      - silu + element-wise mul (SwiGLU)
+      - 2 residual additions
+    """
+
+    def __init__(self, hidden: int, n_heads: int, ffn_inner: int):
+        super().__init__()
+        if hidden % n_heads != 0:
+            raise ValueError("hidden must be divisible by n_heads")
+        self.hidden = hidden
+        self.n_heads = n_heads
+        self.h_dim = hidden // n_heads
+        self.ln1 = nn.LayerNorm(hidden)
+        self.q_proj = nn.Linear(hidden, hidden, bias=False)
+        self.k_proj = nn.Linear(hidden, hidden, bias=False)
+        self.v_proj = nn.Linear(hidden, hidden, bias=False)
+        self.o_proj = nn.Linear(hidden, hidden, bias=False)
+        self.ln2 = nn.LayerNorm(hidden)
+        self.ffn_gate = nn.Linear(hidden, ffn_inner, bias=False)
+        self.ffn_up = nn.Linear(hidden, ffn_inner, bias=False)
+        self.ffn_down = nn.Linear(ffn_inner, hidden, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, S, _ = x.shape
+        h = self.ln1(x)
+        q = self.q_proj(h).view(B, S, self.n_heads, self.h_dim).transpose(1, 2)
+        k = self.k_proj(h).view(B, S, self.n_heads, self.h_dim).transpose(1, 2)
+        v = self.v_proj(h).view(B, S, self.n_heads, self.h_dim).transpose(1, 2)
+        scores = torch.matmul(q, k.transpose(-2, -1))
+        attn = torch.softmax(scores, dim=-1)
+        out = torch.matmul(attn, v).transpose(1, 2).reshape(B, S, self.hidden)
+        x = x + self.o_proj(out)
+
+        h2 = self.ln2(x)
+        h2 = self.ffn_down(F.silu(self.ffn_gate(h2)) * self.ffn_up(h2))
+        return x + h2
+
+
 def _rand(*shape):
     return torch.randn(*shape, device=DEVICE)
 
@@ -87,6 +143,11 @@ def _swiglu_inputs(B, S, H, H_inner):
     )
 
 
+def _build_transformer_block(hidden, n_heads, ffn_inner):
+    """Instantiate a TransformerBlock on DEVICE in eval mode."""
+    return TransformerBlock(hidden, n_heads, ffn_inner).to(DEVICE).eval()
+
+
 WORKLOADS = {
     "tiny (view+floordiv)":            (workload_tiny,      (_rand(8, 6),)),
     "pointwise (small 64x64)":         (workload_pointwise, (_rand(64, 64), _rand(64, 64))),
@@ -95,6 +156,14 @@ WORKLOADS = {
     "attention QK (B=8,S=512,H=128)":  (workload_attention, (_rand(8, 512, 128), _rand(8, 512, 128))),
     "SwiGLU FFN (B=2,S=64,H=128,Hi=512)":   (workload_swiglu_ffn, _swiglu_inputs(2, 64, 128, 512)),
     "SwiGLU FFN (B=4,S=256,H=512,Hi=2048)": (workload_swiglu_ffn, _swiglu_inputs(4, 256, 512, 2048)),
+    # Transformer block uses an nn.Module instance as `fn`. Weights live
+    # on the module's nn.Parameter slots; Dynamo / v1 / v2 each lift
+    # them into the graph in their own way (v2 snapshots them via the
+    # id()-based param classification — see compile.py:_build_recipe_specs).
+    "Transformer block (B=2,S=128,H=256,Hi=1024)": (
+        _build_transformer_block(hidden=256, n_heads=8, ffn_inner=1024),
+        (_rand(2, 128, 256),),
+    ),
 }
 
 
