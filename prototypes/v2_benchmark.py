@@ -68,7 +68,7 @@ WORKLOADS = {
 # ---------------------------------------------------------------------------
 # Compile each workload under each mode
 # ---------------------------------------------------------------------------
-def build_variants(fn):
+def build_variants(fn, example_inputs):
     """Return dict of {label: callable} for fn under each mode."""
     return {
         "eager":     fn,
@@ -79,6 +79,9 @@ def build_variants(fn):
             backend=aot_autograd(fw_compiler=tdcv2.fw_compiler),
             dynamic=True,
         ),
+        # Direct-replay path: capture once with example_inputs, then call
+        # the resulting callable without going through Dynamo/AOT again.
+        "v2_cap":    tdcv2.capture(fn, *example_inputs),
     }
 
 
@@ -107,21 +110,22 @@ def fmt_us(v):
 
 def run_speed_table():
     header = (f"{'workload':<33} {'eager':>10} {'dynamo':>10} {'aot_eager':>10} "
-              f"{'v2':>10} {'v2/eager':>10} {'v2-aot':>10}")
+              f"{'v2':>10} {'v2_cap':>10} {'cap/eager':>10}")
     print(f"\n{header}")
     print(f"{'(all numbers in us)':<33}")
     print("-" * len(header))
     for label, (fn, inputs) in WORKLOADS.items():
-        variants = build_variants(fn)
+        torch._dynamo.reset()
+        variants = build_variants(fn, inputs)
         times = {}
         for name, callable_ in variants.items():
-            torch._dynamo.reset()
+            if name != "v2_cap":   # v2_cap already captured by build_variants
+                torch._dynamo.reset()
             times[name] = time_iters(callable_, inputs)
-        v2_over_eager = times["v2"] / times["eager"] if times["eager"] > 0 else float("nan")
-        v2_minus_aot = times["v2"] - times["aot_eager"]
+        cap_over_eager = times["v2_cap"] / times["eager"] if times["eager"] > 0 else float("nan")
         print(f"{label:<33} {fmt_us(times['eager']):>10} {fmt_us(times['dynamo']):>10} "
               f"{fmt_us(times['aot_eager']):>10} {fmt_us(times['v2']):>10} "
-              f"{v2_over_eager:>9.1f}x {v2_minus_aot:>9.2f}")
+              f"{fmt_us(times['v2_cap']):>10} {cap_over_eager:>9.2f}x")
 
 
 # ---------------------------------------------------------------------------
@@ -130,23 +134,23 @@ def run_speed_table():
 def run_profile(workload_label="attention QK (B=8,S=512,H=128)",
                 out="prototypes/traces/v2_replay.json"):
     fn, inputs = WORKLOADS[workload_label]
-    variants = build_variants(fn)
+    variants = build_variants(fn, inputs)
     cfn_v2 = variants["v2"]
-    cfn_aot = variants["aot_eager"]
+    cfn_cap = variants["v2_cap"]
 
     # warmup both to amortize compile
     for _ in range(50):
         cfn_v2(*inputs)
-        cfn_aot(*inputs)
+        cfn_cap(*inputs)
 
     os.makedirs(os.path.dirname(out), exist_ok=True)
     with profile(activities=[ProfilerActivity.CPU], record_shapes=False) as prof:
         for _ in range(100):
-            cfn_v2(*inputs)
+            cfn_cap(*inputs)
     prof.export_chrome_trace(out)
 
     print(f"\n{'='*78}")
-    print(f"  v2 replay profile — {workload_label}, 100 iterations")
+    print(f"  v2.capture direct-replay profile — {workload_label}, 100 iterations")
     print(f"  trace: {out}")
     print(f"{'='*78}")
     print(prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=20))

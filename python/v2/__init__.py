@@ -14,11 +14,12 @@ Quick start:
     fn(torch.randn(8, 6))      # first call: torch.compile machinery
     fn(torch.randn(12, 5))     # subsequent: one C++ trace, replayed
 """
-from .compile import compile, fw_compiler
+from .compile import compile, capture, fw_compiler
 from .translator import translate_graph
 
 __all__ = [
     "compile",
+    "capture",
     "fw_compiler",
     "translate_graph",
 ]
