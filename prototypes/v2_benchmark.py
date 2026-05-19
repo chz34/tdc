@@ -122,7 +122,15 @@ def _v1_capture(fn, example_inputs):
 
 
 def build_variants(fn, example_inputs):
-    """Return dict of {label: callable} for fn under each mode."""
+    """Return dict of {label: callable} for fn under each mode.
+
+    Comment out a line to skip that mode entirely — the speed table and
+    profile section read the dict's keys at runtime, so partial coverage
+    (e.g., NPU where inductor is not available) just works without
+    touching either of those functions.
+
+    Key order here is the column order in the printed table.
+    """
     return {
         "eager":     fn,
         "dynamo":    torch.compile(fn, backend="eager", dynamic=True),
@@ -133,6 +141,12 @@ def build_variants(fn, example_inputs):
         # call the resulting callable without going through Dynamo/AOT.
         "v2":        tdcv2.capture(fn, *example_inputs),
     }
+
+
+# Modes that don't reuse Dynamo's compile cache between workloads — we
+# reset before timing each. v1/v2 capture once and stash their own state,
+# so resetting Dynamo's cache afterwards would be a no-op for them.
+_CAPTURE_MODES = {"v1", "v2"}
 
 
 # ---------------------------------------------------------------------------
@@ -163,34 +177,62 @@ def fmt_us(v):
 
 
 def run_speed_table():
-    # Numbers (us), then three ratio columns relative to eager so the
-    # speed-up / slow-down vs baseline is visible at a glance.
-    header = (
-        f"{'workload':<33} {'eager':>9} {'dynamo':>9} {'aot_eager':>9} "
-        f"{'inductor':>9} {'v1':>9} {'v2':>9} | "
-        f"{'v1/eager':>9} {'ind/eager':>9} {'v2/eager':>9}"
-    )
+    """Print a per-workload x per-mode timing table.
+
+    Column order is the insertion order of build_variants(); modes can
+    be added / commented out there without touching this function.
+    Ratio columns relative to 'eager' are appended for every non-eager
+    mode that's present. If 'eager' is not in the variant set, the
+    ratio block is omitted entirely.
+    """
+    # Discover the column structure once from a representative workload.
+    sample_fn, sample_inputs = next(iter(WORKLOADS.values()))
+    sample_variants = build_variants(sample_fn, sample_inputs)
+    variant_names = list(sample_variants.keys())
+    has_eager = "eager" in variant_names
+    ratio_names = [n for n in variant_names if n != "eager"] if has_eager else []
+
+    col_w = 9
+    time_header = " ".join(f"{n:>{col_w}}" for n in variant_names)
+    ratio_header = " ".join(f"{(n + '/eager'):>{col_w + 1}}" for n in ratio_names)
+    if ratio_header:
+        header = f"{'workload':<33} {time_header} | {ratio_header}"
+    else:
+        header = f"{'workload':<33} {time_header}"
+
     print(f"\n{header}")
-    print(f"{'(times in us; ratios relative to eager)':<33}")
+    sub = "(times in us"
+    if ratio_header:
+        sub += "; ratios relative to eager)"
+    else:
+        sub += ")"
+    print(sub)
     print("-" * len(header))
+
     for label, (fn, inputs) in WORKLOADS.items():
         torch._dynamo.reset()
         variants = build_variants(fn, inputs)
+        # Sanity: schema is expected to be stable across workloads.
+        if list(variants.keys()) != variant_names:
+            raise RuntimeError(
+                f"build_variants returned different keys for workload "
+                f"'{label}': {list(variants.keys())} vs {variant_names}")
         times = {}
         for name, callable_ in variants.items():
-            if name not in ("v1", "v2"):  # both already captured above
+            if name not in _CAPTURE_MODES:
                 torch._dynamo.reset()
             times[name] = time_iters(callable_, inputs)
-        eg = times["eager"]
-        ratio = lambda x: x / eg if eg > 0 else float("nan")
-        print(
-            f"{label:<33} "
-            f"{fmt_us(times['eager']):>9} {fmt_us(times['dynamo']):>9} "
-            f"{fmt_us(times['aot_eager']):>9} {fmt_us(times['inductor']):>9} "
-            f"{fmt_us(times['v1']):>9} {fmt_us(times['v2']):>9} | "
-            f"{ratio(times['v1']):>8.2f}x {ratio(times['inductor']):>8.2f}x "
-            f"{ratio(times['v2']):>8.2f}x"
-        )
+
+        time_strs = " ".join(f"{fmt_us(times[n]):>{col_w}}" for n in variant_names)
+        if has_eager:
+            eg = times["eager"]
+            ratio_strs = " ".join(
+                f"{(times[n]/eg if eg > 0 else float('nan')):>{col_w}.2f}x"
+                for n in ratio_names
+            )
+            print(f"{label:<33} {time_strs} | {ratio_strs}")
+        else:
+            print(f"{label:<33} {time_strs}")
 
 
 # ---------------------------------------------------------------------------
@@ -243,28 +285,29 @@ def _profile_one(label, callable_, inputs, out_path, n_warmup=50, n_iters=100):
 
 def run_profile(workload_label="attention QK (B=8,S=512,H=128)",
                 out_dir="prototypes/traces"):
-    """Profile the same workload under four modes and export four
-    Chrome-traces so the timelines can be loaded side-by-side in
-    perfetto/chrome://tracing for direct visual comparison.
+    """Profile the chosen workload under every mode that build_variants
+    enables, exporting one Chrome-trace per mode for side-by-side
+    timeline inspection in perfetto / chrome://tracing.
 
-      <workload>__eager.json     — baseline; no compile pipeline
-      <workload>__inductor.json  — torch.compile inductor (fused kernels)
-      <workload>__v1.json        — v1 capture/replay (dispatcher level)
-      <workload>__v2.json        — v2.capture direct-replay
+    File naming: <workload>__<mode>.json, e.g. `..__inductor.json`,
+    `..__v1.json`. If a mode is commented out in build_variants, no
+    trace is produced for it.
     """
     fn, inputs = WORKLOADS[workload_label]
     variants = build_variants(fn, inputs)
     stem = _safe_filename(workload_label)
 
-    _profile_one("eager",    variants["eager"],    inputs, f"{out_dir}/{stem}__eager.json")
-    _profile_one("inductor", variants["inductor"], inputs, f"{out_dir}/{stem}__inductor.json")
-    _profile_one("v1",       variants["v1"],       inputs, f"{out_dir}/{stem}__v1.json")
-    _profile_one("v2",       variants["v2"],       inputs, f"{out_dir}/{stem}__v2.json")
+    for name, callable_ in variants.items():
+        _profile_one(name, callable_, inputs, f"{out_dir}/{stem}__{name}.json")
 
 
 if __name__ == "__main__":
     print("# v2 framework benchmark")
     print_device_banner()
-    print("# eager / dynamo / aot_eager / inductor / v1 / v2")
+    # Reflect the live build_variants() output so commenting out a
+    # backend (e.g. inductor on NPU) is reflected in the banner too.
+    sample_fn, sample_inputs = next(iter(WORKLOADS.values()))
+    _names = list(build_variants(sample_fn, sample_inputs).keys())
+    print(f"# modes: {' / '.join(_names)}")
     run_speed_table()
     run_profile()
