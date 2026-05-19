@@ -22,6 +22,7 @@ import sys
 import time
 
 import torch
+import torch.nn.functional as F
 import torch_dispatch_capture.v2 as tdcv2
 from torch._dynamo.backends.common import aot_autograd
 from torch.profiler import profile, ProfilerActivity
@@ -55,8 +56,32 @@ def workload_attention(q, k):
     return torch.matmul(q2, k2)
 
 
+def workload_swiglu_ffn(x, w_gate, w_up, w_down):
+    """SwiGLU feed-forward block, as used in LLaMA / Mistral / Qwen:
+
+        SwiGLU(x) = (silu(x W_gate^T) * x W_up^T) W_down^T
+
+    Exercises 3 matmuls + 1 silu + 1 elementwise mul. Decomposes in AOT
+    to expand/clone/_unsafe_view/bmm sequences for each linear, plus
+    sigmoid+mul for silu. Representative of a non-trivial LLM block."""
+    gate = F.linear(x, w_gate)
+    up = F.linear(x, w_up)
+    return F.linear(F.silu(gate) * up, w_down)
+
+
 def _rand(*shape):
     return torch.randn(*shape, device=DEVICE)
+
+
+def _swiglu_inputs(B, S, H, H_inner):
+    """Allocate the (x, w_gate, w_up, w_down) tuple for a SwiGLU FFN.
+    Weight shapes mirror torch.nn.Linear's convention: [out, in]."""
+    return (
+        _rand(B, S, H),
+        _rand(H_inner, H),
+        _rand(H_inner, H),
+        _rand(H, H_inner),
+    )
 
 
 WORKLOADS = {
@@ -65,6 +90,8 @@ WORKLOADS = {
     "pointwise (medium 512x512)":      (workload_pointwise, (_rand(512, 512), _rand(512, 512))),
     "attention QK (B=4,S=64,H=32)":    (workload_attention, (_rand(4, 64, 32), _rand(4, 64, 32))),
     "attention QK (B=8,S=512,H=128)":  (workload_attention, (_rand(8, 512, 128), _rand(8, 512, 128))),
+    "SwiGLU FFN (B=2,S=64,H=128,Hi=512)":   (workload_swiglu_ffn, _swiglu_inputs(2, 64, 128, 512)),
+    "SwiGLU FFN (B=4,S=256,H=512,Hi=2048)": (workload_swiglu_ffn, _swiglu_inputs(4, 256, 512, 2048)),
 }
 
 
