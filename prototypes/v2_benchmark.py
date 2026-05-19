@@ -153,32 +153,53 @@ def _profile_activities():
     return acts
 
 
-def run_profile(workload_label="attention QK (B=8,S=512,H=128)",
-                out="prototypes/traces/v2_replay.json"):
-    fn, inputs = WORKLOADS[workload_label]
-    variants = build_variants(fn, inputs)
-    cfn_v2 = variants["v2"]
-    cfn_cap = variants["v2_cap"]
+def _safe_filename(label):
+    return "".join(c if c.isalnum() else "_" for c in label).strip("_")
 
-    # warmup both to amortize compile
-    for _ in range(50):
-        cfn_v2(*inputs)
-        cfn_cap(*inputs)
+
+def _profile_one(label, callable_, inputs, out_path, n_warmup=50, n_iters=100):
+    """Warmup, then profile n_iters calls; export Chrome-trace and print
+    the top events. Returns the prof object for caller introspection."""
+    for _ in range(n_warmup):
+        callable_(*inputs)
     SYNC()
 
-    os.makedirs(os.path.dirname(out), exist_ok=True)
-    with profile(activities=_profile_activities(), record_shapes=False) as prof:
-        for _ in range(100):
-            cfn_cap(*inputs)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with profile(
+        activities=_profile_activities(),
+        record_shapes=False,
+        with_stack=True,
+    ) as prof:
+        for _ in range(n_iters):
+            callable_(*inputs)
         SYNC()
-    prof.export_chrome_trace(out)
+    prof.export_chrome_trace(out_path)
 
-    print(f"\n{'='*78}")
-    print(f"  v2.capture direct-replay profile — {workload_label}, 100 iterations")
-    print(f"  device: {DEVICE}    trace: {out}")
-    print(f"{'='*78}")
     sort_key = "self_cuda_time_total" if DEVICE.type == "cuda" else "self_cpu_time_total"
-    print(prof.key_averages().table(sort_by=sort_key, row_limit=20))
+    print(f"\n{'='*78}")
+    print(f"  {label} profile — device: {DEVICE}    trace: {out_path}")
+    print(f"{'='*78}")
+    print(prof.key_averages().table(sort_by=sort_key, row_limit=15))
+    return prof
+
+
+def run_profile(workload_label="attention QK (B=8,S=512,H=128)",
+                out_dir="prototypes/traces"):
+    """Profile the same workload under three modes and export three
+    Chrome-traces so the timelines can be loaded side-by-side in
+    perfetto/chrome://tracing for direct visual comparison.
+
+      <workload>__eager.json   — baseline; no compile pipeline
+      <workload>__v2.json      — torch.compile + v2 fw_compiler
+      <workload>__v2_cap.json  — v2.capture direct-replay
+    """
+    fn, inputs = WORKLOADS[workload_label]
+    variants = build_variants(fn, inputs)
+    stem = _safe_filename(workload_label)
+
+    _profile_one("eager",      variants["eager"],   inputs, f"{out_dir}/{stem}__eager.json")
+    _profile_one("v2 compile", variants["v2"],      inputs, f"{out_dir}/{stem}__v2.json")
+    _profile_one("v2 capture", variants["v2_cap"],  inputs, f"{out_dir}/{stem}__v2_cap.json")
 
 
 if __name__ == "__main__":
