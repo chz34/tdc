@@ -1,6 +1,6 @@
 """v2 replay performance benchmark.
 
-Compares wall-clock per call across four modes on the same function:
+Compares wall-clock per call across five modes on the same function:
 
     eager        : plain function call, no compile pipeline
     dynamo       : torch.compile(backend="eager")
@@ -9,27 +9,26 @@ Compares wall-clock per call across four modes on the same function:
                    -- Dynamo prelude + AOTAutograd graph + boxed_nop runner
     v2           : torch.compile(backend=aot_autograd(fw_compiler=v2.fw_compiler))
                    -- Dynamo prelude + AOTAutograd graph + C++ trace replay
+    v2_cap       : v2.capture(fn, *example_args) direct-replay
+                   -- Trace replay only, bypasses Dynamo at call time
 
-Post Phase-2a (DESIGN.md §17.6.9), v2 replay runs in C++ via the unified
-Trace::replay_v2 engine that v1 capture also shares. Expected outcome:
-
-  1. v2 still cannot beat eager for tiny workloads — the compile
-     pipeline (Dynamo + AOT) dominates regardless of how the trace
-     runs. This is unavoidable on torch.compile-based paths.
-  2. v2 can match or beat aot_eager because it skips AOTAutograd's
-     runtime_wrapper codegen and goes straight to callBoxed. The
-     post-compile overhead surface is smaller.
-  3. For larger workloads where aten kernels dominate, all four modes
-     converge — Python/C++ overhead is a fixed slab vs. growing kernel
-     time.
+Device is controlled by TDC_DEVICE (default cpu). When running on an
+accelerator, tensors are allocated on DEVICE and each timed call is
+wrapped in SYNC() so wall-clock measurements reflect kernel completion,
+not just dispatch enqueueing.
 """
 import os
+import sys
 import time
 
 import torch
 import torch_dispatch_capture.v2 as tdcv2
 from torch._dynamo.backends.common import aot_autograd
 from torch.profiler import profile, ProfilerActivity
+
+# Share the test suite's device helper. test/ is a sibling of prototypes/.
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "test"))
+from _device import DEVICE, SYNC, print_device_banner  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -56,12 +55,16 @@ def workload_attention(q, k):
     return torch.matmul(q2, k2)
 
 
+def _rand(*shape):
+    return torch.randn(*shape, device=DEVICE)
+
+
 WORKLOADS = {
-    "tiny (view+floordiv)":            (workload_tiny,      (torch.randn(8, 6),)),
-    "pointwise (small 64x64)":         (workload_pointwise, (torch.randn(64, 64), torch.randn(64, 64))),
-    "pointwise (medium 512x512)":      (workload_pointwise, (torch.randn(512, 512), torch.randn(512, 512))),
-    "attention QK (B=4,S=64,H=32)":    (workload_attention, (torch.randn(4, 64, 32), torch.randn(4, 64, 32))),
-    "attention QK (B=8,S=512,H=128)":  (workload_attention, (torch.randn(8, 512, 128), torch.randn(8, 512, 128))),
+    "tiny (view+floordiv)":            (workload_tiny,      (_rand(8, 6),)),
+    "pointwise (small 64x64)":         (workload_pointwise, (_rand(64, 64), _rand(64, 64))),
+    "pointwise (medium 512x512)":      (workload_pointwise, (_rand(512, 512), _rand(512, 512))),
+    "attention QK (B=4,S=64,H=32)":    (workload_attention, (_rand(4, 64, 32), _rand(4, 64, 32))),
+    "attention QK (B=8,S=512,H=128)":  (workload_attention, (_rand(8, 512, 128), _rand(8, 512, 128))),
 }
 
 
@@ -90,14 +93,18 @@ def build_variants(fn, example_inputs):
 # ---------------------------------------------------------------------------
 def time_iters(callable_, inputs, n_warmup=50, n_iters=500):
     """Pre-generated inputs reused across all iterations so the timing
-    excludes randn() cost (which was ~27% of profile noise). Median of
-    n_iters samples in microseconds."""
+    excludes randn() cost. Median of n_iters samples in microseconds.
+
+    On accelerator devices, SYNC() bracketing each call ensures we
+    measure kernel completion rather than just dispatch enqueueing."""
     for _ in range(n_warmup):
         callable_(*inputs)
+    SYNC()
     samples = []
     for _ in range(n_iters):
         t0 = time.perf_counter()
         callable_(*inputs)
+        SYNC()
         t1 = time.perf_counter()
         samples.append((t1 - t0) * 1e6)
     samples.sort()
@@ -131,6 +138,21 @@ def run_speed_table():
 # ---------------------------------------------------------------------------
 # Profile: open the v2 mode under torch.profiler and dump a chrome trace
 # ---------------------------------------------------------------------------
+def _profile_activities():
+    """Profile activities matching the current device. CPU is always
+    included; accelerator activity is added when one is detected."""
+    acts = [ProfilerActivity.CPU]
+    if DEVICE.type == "cuda" and hasattr(ProfilerActivity, "CUDA"):
+        acts.append(ProfilerActivity.CUDA)
+    elif DEVICE.type == "xpu" and hasattr(ProfilerActivity, "XPU"):
+        acts.append(ProfilerActivity.XPU)
+    elif DEVICE.type == "mps" and hasattr(ProfilerActivity, "MPS"):
+        acts.append(ProfilerActivity.MPS)
+    elif DEVICE.type == "privateuseone" and hasattr(ProfilerActivity, "PrivateUse1"):
+        acts.append(ProfilerActivity.PrivateUse1)
+    return acts
+
+
 def run_profile(workload_label="attention QK (B=8,S=512,H=128)",
                 out="prototypes/traces/v2_replay.json"):
     fn, inputs = WORKLOADS[workload_label]
@@ -142,22 +164,26 @@ def run_profile(workload_label="attention QK (B=8,S=512,H=128)",
     for _ in range(50):
         cfn_v2(*inputs)
         cfn_cap(*inputs)
+    SYNC()
 
     os.makedirs(os.path.dirname(out), exist_ok=True)
-    with profile(activities=[ProfilerActivity.CPU], record_shapes=False) as prof:
+    with profile(activities=_profile_activities(), record_shapes=False) as prof:
         for _ in range(100):
             cfn_cap(*inputs)
+        SYNC()
     prof.export_chrome_trace(out)
 
     print(f"\n{'='*78}")
     print(f"  v2.capture direct-replay profile — {workload_label}, 100 iterations")
-    print(f"  trace: {out}")
+    print(f"  device: {DEVICE}    trace: {out}")
     print(f"{'='*78}")
-    print(prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=20))
+    sort_key = "self_cuda_time_total" if DEVICE.type == "cuda" else "self_cpu_time_total"
+    print(prof.key_averages().table(sort_by=sort_key, row_limit=20))
 
 
 if __name__ == "__main__":
     print("# v2 framework benchmark")
-    print("# Pure-Python replay against eager / Dynamo-only / aot_eager baselines")
+    print_device_banner()
+    print("# eager / dynamo / aot_eager / v2 (compile) / v2_cap (direct-replay)")
     run_speed_table()
     run_profile()
