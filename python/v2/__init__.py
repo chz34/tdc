@@ -7,19 +7,17 @@ Quick start:
     import torch
     import torch_dispatch_capture.v2 as tdcv2
 
-    @tdcv2.compile(dynamic=True)
-    def fn(x):
-        return x.view(x.shape[0] // 2, 2, -1)   # v1 cannot handle this
+    captured = tdcv2.capture(fn, *example_args)   # one-time
+    out = captured(*real_args)                    # direct replay, no torch.compile per call
 
-    fn(torch.randn(8, 6))      # first call: torch.compile machinery
-    fn(torch.randn(12, 5))     # subsequent: one C++ trace, replayed
+A torch.compile-style decorator was historically also exposed but turned
+out to be strictly slower than 'dynamo eager backend', so it was removed
+in favour of v2.capture's direct-replay path.
 """
-from .compile import compile, capture, fw_compiler
+from .compile import capture
 from .translator import translate_graph
 
 __all__ = [
-    "compile",
     "capture",
-    "fw_compiler",
     "translate_graph",
 ]

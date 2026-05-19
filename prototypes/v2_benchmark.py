@@ -1,16 +1,18 @@
 """v2 replay performance benchmark.
 
-Compares wall-clock per call across five modes on the same function:
+Compares wall-clock per call across six modes on the same function:
 
     eager        : plain function call, no compile pipeline
     dynamo       : torch.compile(backend="eager")
                    -- Dynamo prelude (call_size etc.) + raw gm
     aot_eager    : torch.compile(backend="aot_eager")
                    -- Dynamo prelude + AOTAutograd graph + boxed_nop runner
-    v2           : torch.compile(backend=aot_autograd(fw_compiler=v2.fw_compiler))
-                   -- Dynamo prelude + AOTAutograd graph + C++ trace replay
+    inductor     : torch.compile(backend="inductor")
+                   -- Full Dynamo + AOT + Inductor codegen (fused kernels)
+    v1           : with tdc.capture(): ...; trace.replay()
+                   -- Dispatcher-level capture, C++ callBoxed in a loop
     v2_cap       : v2.capture(fn, *example_args) direct-replay
-                   -- Trace replay only, bypasses Dynamo at call time
+                   -- AOT graph translated to C++ trace, replay only
 
 Device is controlled by TDC_DEVICE (default cpu). When running on an
 accelerator, tensors are allocated on DEVICE and each timed call is
@@ -25,7 +27,6 @@ import torch
 import torch.nn.functional as F
 import torch_dispatch_capture as tdc           # v1
 import torch_dispatch_capture.v2 as tdcv2      # v2
-from torch._dynamo.backends.common import aot_autograd
 from torch.profiler import profile, ProfilerActivity
 
 # Share the test suite's device helper. test/ is a sibling of prototypes/.
@@ -125,12 +126,8 @@ def build_variants(fn, example_inputs):
         "eager":     fn,
         "dynamo":    torch.compile(fn, backend="eager", dynamic=True),
         "aot_eager": torch.compile(fn, backend="aot_eager", dynamic=True),
+        "inductor":  torch.compile(fn, backend="inductor", dynamic=True),
         "v1":        _v1_capture(fn, example_inputs),
-        "v2":        torch.compile(
-            fn,
-            backend=aot_autograd(fw_compiler=tdcv2.fw_compiler),
-            dynamic=True,
-        ),
         # Direct-replay path: capture once with example_inputs, then call
         # the resulting callable without going through Dynamo/AOT again.
         "v2_cap":    tdcv2.capture(fn, *example_inputs),
@@ -166,7 +163,7 @@ def fmt_us(v):
 
 def run_speed_table():
     header = (f"{'workload':<33} {'eager':>10} {'dynamo':>10} {'aot_eager':>10} "
-              f"{'v1':>10} {'v2':>10} {'v2_cap':>10} {'cap/eager':>10}")
+              f"{'inductor':>10} {'v1':>10} {'v2_cap':>10} {'cap/eager':>10}")
     print(f"\n{header}")
     print(f"{'(all numbers in us)':<33}")
     print("-" * len(header))
@@ -180,8 +177,8 @@ def run_speed_table():
             times[name] = time_iters(callable_, inputs)
         cap_over_eager = times["v2_cap"] / times["eager"] if times["eager"] > 0 else float("nan")
         print(f"{label:<33} {fmt_us(times['eager']):>10} {fmt_us(times['dynamo']):>10} "
-              f"{fmt_us(times['aot_eager']):>10} {fmt_us(times['v1']):>10} "
-              f"{fmt_us(times['v2']):>10} {fmt_us(times['v2_cap']):>10} "
+              f"{fmt_us(times['aot_eager']):>10} {fmt_us(times['inductor']):>10} "
+              f"{fmt_us(times['v1']):>10} {fmt_us(times['v2_cap']):>10} "
               f"{cap_over_eager:>9.2f}x")
 
 
@@ -235,26 +232,28 @@ def _profile_one(label, callable_, inputs, out_path, n_warmup=50, n_iters=100):
 
 def run_profile(workload_label="attention QK (B=8,S=512,H=128)",
                 out_dir="prototypes/traces"):
-    """Profile the same workload under three modes and export three
+    """Profile the same workload under four modes and export four
     Chrome-traces so the timelines can be loaded side-by-side in
     perfetto/chrome://tracing for direct visual comparison.
 
-      <workload>__eager.json   — baseline; no compile pipeline
-      <workload>__v2.json      — torch.compile + v2 fw_compiler
-      <workload>__v2_cap.json  — v2.capture direct-replay
+      <workload>__eager.json     — baseline; no compile pipeline
+      <workload>__inductor.json  — torch.compile inductor (fused kernels)
+      <workload>__v1.json        — v1 capture/replay (dispatcher level)
+      <workload>__v2_cap.json    — v2.capture direct-replay
     """
     fn, inputs = WORKLOADS[workload_label]
     variants = build_variants(fn, inputs)
     stem = _safe_filename(workload_label)
 
-    _profile_one("eager",      variants["eager"],   inputs, f"{out_dir}/{stem}__eager.json")
-    _profile_one("v2 compile", variants["v2"],      inputs, f"{out_dir}/{stem}__v2.json")
-    _profile_one("v2 capture", variants["v2_cap"],  inputs, f"{out_dir}/{stem}__v2_cap.json")
+    _profile_one("eager",      variants["eager"],     inputs, f"{out_dir}/{stem}__eager.json")
+    _profile_one("inductor",   variants["inductor"],  inputs, f"{out_dir}/{stem}__inductor.json")
+    _profile_one("v1",         variants["v1"],        inputs, f"{out_dir}/{stem}__v1.json")
+    _profile_one("v2 capture", variants["v2_cap"],    inputs, f"{out_dir}/{stem}__v2_cap.json")
 
 
 if __name__ == "__main__":
     print("# v2 framework benchmark")
     print_device_banner()
-    print("# eager / dynamo / aot_eager / v2 (compile) / v2_cap (direct-replay)")
+    print("# eager / dynamo / aot_eager / inductor / v1 / v2_cap")
     run_speed_table()
     run_profile()

@@ -1,20 +1,15 @@
-"""Public v2 API — @tdcv2.compile() decorator and v2.capture() direct entry.
+"""v2.capture() — direct-replay entry that bypasses Dynamo at call time.
 
-Two paths are provided:
+The historical @tdcv2.compile decorator (a thin wrapper around
+torch.compile + fw_compiler) was removed: it was strictly slower than
+the dynamo eager backend and provided no value v2.capture doesn't
+already cover. capture() runs torch.compile internally exactly once to
+materialise the trace, then returns a callable whose per-call overhead
+is just IValue conversion + C++ replay.
 
-  @tdcv2.compile(dynamic=True)
-    The transparent path. Each call goes through torch.compile's full
-    runtime: Dynamo guard check, prelude bytecode, AOTAutograd runtime
-    wrapper, then our replay. Overhead is dominated by the torch.compile
-    pipeline (~7-10us/call on small workloads) regardless of how the
-    trace itself runs.
-
-  v2.capture(fn, *example_args)
-    The direct-replay path. Capture the trace once via torch.compile,
-    then return a callable that bypasses Dynamo at call time. Per-call
-    overhead is just IValue conversion + C++ replay. Trade-off: the
-    user must guarantee future calls have the same arg structure as
-    example_args (same rank, same dtype, ...).
+Trade-off: the user must guarantee future calls match example_args in
+arg structure (rank, dtype, device). Sym dimensions may vary; concrete
+ints that Dynamo specialised on are baked as constants.
 """
 from __future__ import annotations
 
@@ -26,41 +21,6 @@ from torch._dynamo.backends.common import aot_autograd
 
 from .translator import translate_graph
 
-
-# ---------------------------------------------------------------------------
-# Path 1: torch.compile-integrated entry
-# ---------------------------------------------------------------------------
-def fw_compiler(gm, _sample_inputs):
-    """AOTAutograd fw_compiler: AOT GraphModule -> C++ Trace -> callable."""
-    trace = translate_graph(gm)
-
-    def replay_callable(*args):
-        result = trace.v2_replay(list(args))
-        return result[0] if len(result) == 1 else tuple(result)
-
-    return replay_callable
-
-
-def compile(fn=None, *, dynamic: bool = True):
-    """Decorator. Equivalent to:
-
-        torch.compile(fn,
-                      backend=aot_autograd(fw_compiler=tdcv2.fw_compiler),
-                      dynamic=dynamic)
-    """
-    def wrap(f):
-        return torch.compile(
-            f,
-            backend=aot_autograd(fw_compiler=fw_compiler),
-            dynamic=dynamic,
-        )
-
-    return wrap if fn is None else wrap(fn)
-
-
-# ---------------------------------------------------------------------------
-# Path 2: v2.capture() direct-replay entry
-# ---------------------------------------------------------------------------
 
 # A recipe spec is a tagged tuple describing how to fetch one placeholder
 # slot at replay time. _compile_flat_recipe collapses a list of specs into
