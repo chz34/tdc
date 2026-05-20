@@ -143,38 +143,15 @@ def _build_alexnet():
     ).to(DEVICE).eval()
 
 
-# Local checkout of https://github.com/pytorch/benchmark — see the
-# project's README for setup. We import it lazily so the benchmark
-# still runs when torchbench isn't installed.
-_TORCHBENCH_ROOT = "/home/chz34/src/ai-framework/benchmark"
-
-
-def _torchbench_available() -> bool:
-    """Add the torchbench checkout to sys.path and return True if its
-    package imports cleanly. Cached after the first call."""
-    if getattr(_torchbench_available, "_cached", None) is not None:
-        return _torchbench_available._cached    # type: ignore[attr-defined]
-    ok = False
-    if os.path.isdir(_TORCHBENCH_ROOT):
-        if _TORCHBENCH_ROOT not in sys.path:
-            sys.path.insert(0, _TORCHBENCH_ROOT)
-        try:
-            import torchbenchmark  # noqa: F401
-            ok = True
-        except Exception as e:
-            print(f"# torchbench: import failed ({type(e).__name__}: {e})")
-    _torchbench_available._cached = ok          # type: ignore[attr-defined]
-    return ok
-
-
 def _load_torchbench(name: str, batch_size=None, test: str = "eval"):
     """Load a torchbench model via its standardised Model API. Returns
     (model, example_inputs) on success or None if anything goes wrong
-    (missing checkout, weight-download failure, model init error,
-    incompatibility with the local torch version, ...). Failures are
-    logged but never raise — the workload is just skipped."""
-    if not _torchbench_available():
-        return None
+    (torchbench not installed, weight-download failure, model init
+    error, incompatibility with the local torch version, ...). Failures
+    are logged but never raise — the workload is just skipped.
+
+    Expects the `torchbenchmark` package on sys.path (e.g. installed
+    from the pytorch/benchmark repo via `pip install .`)."""
     try:
         import importlib
         mod = importlib.import_module(f"torchbenchmark.models.{name}")
