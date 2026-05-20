@@ -231,16 +231,17 @@ WORKLOADS = {
 _TB_SKIP_CORRECTNESS = {"torchbench:BERT_pytorch (B=1)"}
 
 if os.environ.get("TDC_TORCHBENCH", "0") == "1":
-    # llama: pure-decoder LLM (torchbench's reference Llama impl).
-    # llava: multimodal HF model; metadata.yaml marks CPU as unsupported
-    #   (OOM on CI), so on cpu this entry will simply be skipped via
-    #   _load_torchbench's broad exception handler.
-    for _label, _name, _bs in [
-        ("torchbench:squeezenet1_1 (B=1)", "squeezenet1_1", 1),
-        ("torchbench:BERT_pytorch (B=1)",  "BERT_pytorch",  1),
-        ("torchbench:llama (B=1)",         "llama",         1),
-        ("torchbench:llava (B=1)",         "llava",         1),
+    # Label is auto-derived as f"torchbench:{name} (B={bs})". llama is
+    # torchbench's reference Llama decoder; llava is the HF multimodal
+    # model — metadata.yaml marks CPU unsupported (OOM on CI), so on
+    # cpu it skips via _load_torchbench's broad except.
+    for _name, _bs in [
+        ("squeezenet1_1", 1),
+        ("BERT_pytorch",  1),
+        ("llama",         1),
+        ("llava",         1),
     ]:
+        _label = f"torchbench:{_name} (B={_bs})"
         _loaded = _load_torchbench(_name, batch_size=_bs)
         if _loaded is not None:
             WORKLOADS[_label] = _loaded
