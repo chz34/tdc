@@ -268,6 +268,8 @@ std::vector<c10::IValue> Trace::replay_v2(
             }
         }
 
+        debug_dump_callBoxed("v2", i, step.op_name, step.target_dk, stack,
+                             has_coercions ? &step.coercions : nullptr);
         step.op->callBoxed(&stack);
 
         // Mirror v1's flat slot layout: outputs[i] holds N IValues, one

@@ -96,6 +96,8 @@ void Trace::replay() {
 
         TORCH_INTERNAL_ASSERT(step.op.has_value(),
             "v1 step missing OperatorHandle (this is a v2 step?)");
+        debug_dump_callBoxed("v1", i, step.op_name, step.target_dk, stack,
+                             /*coercions=*/nullptr);
         step.op->callBoxed(&stack);
 
         TORCH_CHECK(stack.size() == step.n_outputs,

@@ -252,6 +252,20 @@ private:
     std::vector<StepInputRef> outputs_;
 };
 
+// Debug helper: when TDC_TRACE_DEBUG=1, dump a one-line summary of the
+// op + stack about to be sent to callBoxed. Used by both v1 replay() and
+// v2 replay_v2() so the two paths can be diff'd side-by-side. Called
+// per-step on the hot path; the env-var lookup happens once and is
+// cached, so when the flag is off the cost is one atomic-bool load.
+void debug_dump_callBoxed(
+    const char* mode,                    // "v1" or "v2"
+    size_t step_idx,
+    const std::string& op_name,
+    c10::DispatchKey target_dk,          // Undefined for v2 (full dispatch)
+    const torch::jit::Stack& stack,
+    const std::vector<ArgCoercion>* coercions);  // v2-only, may be nullptr
+
+
 // Thread-local registry of the currently-active capture.
 class CaptureContext {
 public:

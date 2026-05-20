@@ -1,8 +1,13 @@
 #include "capture_context.h"
 
+#include <ATen/core/Formatting.h>     // operator<< for at::DeprecatedTypeProperties etc.
+#include <ATen/core/ivalue.h>         // operator<< for c10::IValue
 #include <c10/util/Exception.h>
 #include <c10/util/irange.h>
 
+#include <atomic>
+#include <cstdlib>
+#include <iostream>
 #include <sstream>
 
 namespace tdc {
@@ -97,6 +102,96 @@ std::string Trace::dump() const {
     }
     return os.str();
 }
+
+// ---------------- debug_dump_callBoxed ----------------
+//
+// One-line summary of "what is about to be sent through callBoxed" so v1
+// replay() and v2 replay_v2() can be diff'd side by side. Off unless
+// TDC_TRACE_DEBUG=1 (env var read once and cached).
+//
+// Formatting policy: we lean on torch's existing operator<< overloads
+// wherever possible -- IValue::operator<<, Tensor::sizes(), Tensor::dtype(),
+// Tensor::device() all already have stream operators in
+// ATen/core/Formatting.h and ATen/core/ivalue.h. The one place we DON'T
+// just stream the IValue verbatim is for Tensors, because IValue's default
+// formatting dumps the entire tensor's data -- way too noisy for a
+// per-step trace. For tensors we emit a compact Tensor(dtype,sizes,device)
+// summary using the same accessors print_handler would have used.
+
+namespace {
+
+const char* coercion_tag(ArgCoercion c) {
+    switch (c) {
+        case ArgCoercion::kNone:             return "N";
+        case ArgCoercion::kScalarToTensor:   return "S>T";
+        case ArgCoercion::kListToIntList:    return "L>I";
+        case ArgCoercion::kListToTensorList: return "L>T";
+    }
+    return "?";
+}
+
+bool debug_enabled() {
+    static std::atomic<int> cached{-1};
+    int v = cached.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* env = std::getenv("TDC_TRACE_DEBUG");
+        v = (env != nullptr && env[0] == '1') ? 1 : 0;
+        cached.store(v, std::memory_order_relaxed);
+    }
+    return v == 1;
+}
+
+void format_ivalue(std::ostream& os, const c10::IValue& iv) {
+    // Tensor: compact summary (avoid dumping full data via IValue<<).
+    if (iv.isTensor()) {
+        const auto& t = iv.toTensor();
+        if (!t.defined()) {
+            os << "Tensor(undefined)";
+            return;
+        }
+        os << "Tensor(" << t.dtype() << "," << t.sizes()
+           << "," << t.device() << ")";
+        return;
+    }
+    if (iv.isTensorList()) {
+        const auto lst = iv.toTensorList();
+        os << "TensorList[" << lst.size() << "]";
+        return;
+    }
+    // Everything else (Int, Double, Bool, IntList, GenericList, None,
+    // String, Scalar, ...) goes through IValue::operator<< -- compact
+    // enough for primitives and small lists.
+    os << iv;
+}
+
+}  // namespace
+
+void debug_dump_callBoxed(
+    const char* mode,
+    size_t step_idx,
+    const std::string& op_name,
+    c10::DispatchKey target_dk,
+    const torch::jit::Stack& stack,
+    const std::vector<ArgCoercion>* coercions) {
+    if (!debug_enabled()) return;
+    std::ostringstream os;
+    os << "[" << mode << "][" << step_idx << "] " << op_name;
+    if (target_dk != c10::DispatchKey::Undefined) {
+        os << " dk=" << target_dk;
+    }
+    os << " stack=[";
+    for (size_t k = 0; k < stack.size(); ++k) {
+        if (k) os << ", ";
+        format_ivalue(os, stack[k]);
+        if (coercions && k < coercions->size()
+            && (*coercions)[k] != ArgCoercion::kNone) {
+            os << "<" << coercion_tag((*coercions)[k]);
+        }
+    }
+    os << "]";
+    std::cerr << os.str() << "\n";
+}
+
 
 // ---------------- Trace::v2_pre_bind ----------------
 

@@ -299,7 +299,7 @@ _CAPTURE_MODES = {"v1", "v2"}
 # ---------------------------------------------------------------------------
 # Timing
 # ---------------------------------------------------------------------------
-def time_iters(callable_, inputs, n_warmup=50, n_iters=500):
+def time_iters(callable_, inputs, n_warmup=10, n_iters=100):
     """Pre-generated inputs reused across all iterations so the timing
     excludes randn() cost. Median of n_iters samples in microseconds.
 
