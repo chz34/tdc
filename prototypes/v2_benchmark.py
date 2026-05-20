@@ -221,14 +221,14 @@ WORKLOADS = {
 # Each entry calls _load_torchbench(); if the model can't load (e.g.
 # weight-download hash failure, missing torchbench checkout, hitting a
 # v2 unsupported FX op), we skip it instead of failing the whole
-# benchmark. Models listed in _TB_SKIP_CORRECTNESS still participate in
-# timing but are excluded from the eager-vs-everything diff — useful for
-# graphs whose AOT output arity doesn't match the user-visible tuple
-# (e.g. BERT_pytorch returns (logits, lm_logits) but AOT emits a third
-# intermediate that v2.capture currently can't drop, since the AOT
-# output mapping isn't exposed).
+# benchmark. Models listed in _TB_SKIP_CORRECTNESS still participate
+# in timing but are excluded from the eager-vs-everything diff. The
+# set is empty by default — v2.capture now reshapes its raw trace
+# outputs back to the user-visible structure (compile.py's
+# _build_output_shaper), so AOT's extra saved-for-backward outputs
+# no longer leak through and BERT_pytorch passes correctness.
 # ---------------------------------------------------------------------------
-_TB_SKIP_CORRECTNESS = {"torchbench:BERT_pytorch (B=1)"}
+_TB_SKIP_CORRECTNESS: set[str] = set()
 
 if os.environ.get("TDC_TORCHBENCH", "0") == "1":
     # Label is auto-derived as f"torchbench:{name} (B={bs})". llama is
@@ -542,4 +542,4 @@ if __name__ == "__main__":
     print(f"# modes: {' / '.join(_names)}")
     run_correctness_check()
     run_speed_table()
-    run_profile()
+    run_profile(list(WORKLOADS)[-1])

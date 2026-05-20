@@ -108,12 +108,21 @@ def _capture_positional(fn, example_args, allow_grad: bool):
 
     def grab_compiler(gm, sample_inputs):
         trace = translate_graph(gm)
-        state = {"trace": trace, "gm": gm, "observed_args": None}
+        state = {
+            "trace": trace,
+            "gm": gm,
+            "observed_args": None,
+            "last_trace_out": None,
+        }
         captured.append(state)
         def wrapping_cb(*args):
             if state["observed_args"] is None:
                 state["observed_args"] = list(args)
             result = trace.v2_replay(list(args))
+            # Snapshot every wrapping_cb invocation; the final one
+            # corresponds to the result AOT will reshape into the
+            # user-visible structure (see below).
+            state["last_trace_out"] = list(result)
             return result[0] if len(result) == 1 else tuple(result)
         return wrapping_cb
 
@@ -123,7 +132,11 @@ def _capture_positional(fn, example_args, allow_grad: bool):
             backend=aot_autograd(fw_compiler=grab_compiler),
             dynamic=True,
         )
-        compiled_fn(*example_args)
+        # AOT's runtime layer turns wrapping_cb's flat tuple into the
+        # final user-visible structure (drops saved-for-backward
+        # intermediates, restores the original Python container).
+        # Capture that structure so direct_replay can reproduce it.
+        user_visible_out = compiled_fn(*example_args)
     if not captured:
         raise RuntimeError(
             "v2.capture: fw_compiler was never called; torch.compile may have "
@@ -135,6 +148,8 @@ def _capture_positional(fn, example_args, allow_grad: bool):
         raise RuntimeError(
             "v2.capture: example call did not exercise the trace; "
             "torch.compile may have specialized to a different cache entry.")
+    output_shaper = _build_output_shaper(
+        user_visible_out, state["last_trace_out"])
     runtime_specs, pre_binds, _ = _build_recipe_specs(
         state["gm"], example_args, state["observed_args"])
     # Push frozen values (params / Dynamo-specialised constants) into
@@ -146,14 +161,95 @@ def _capture_positional(fn, example_args, allow_grad: bool):
     def direct_replay(*user_args):
         flat = flat_recipe(user_args)
         result = trace.v2_replay(flat)
-        return result[0] if len(result) == 1 else tuple(result)
+        return output_shaper(result)
 
     # Expose internals for introspection / debug.
     direct_replay.trace = trace                  # type: ignore[attr-defined]
     direct_replay.recipe_specs = runtime_specs   # type: ignore[attr-defined]
     direct_replay.pre_binds = pre_binds          # type: ignore[attr-defined]
     direct_replay.flat_recipe = flat_recipe      # type: ignore[attr-defined]
+    direct_replay.output_shaper = output_shaper  # type: ignore[attr-defined]
     return direct_replay
+
+
+def _build_output_shaper(user_visible_out, trace_out):
+    """Given the structure returned by AOT's runtime layer and the
+    list of raw trace outputs that fed into it, produce a function
+    `shaper(result) -> structure` that reshapes a fresh trace.v2_replay
+    result the same way on every call.
+
+    Why: AOT's FW graph often emits more outputs than the user sees
+    (intermediates saved for the backward, or simply outputs the AOT
+    runtime drops/reorders). trace_v2 always returns ALL graph outputs,
+    so direct_replay must drop / reorder / repack them to match what
+    the user got out of compiled_fn(*example_args).
+
+    Matching is by tensor `id()` — AOT's runtime layer aliases (does
+    not clone) when packaging outputs, so a Tensor in user_visible_out
+    is the *same* Python object as the corresponding entry in
+    trace_out. We record (kind, index) tuples that direct_replay
+    consumes against a fresh trace_out list."""
+    id_to_idx = {
+        id(v): i for i, v in enumerate(trace_out) if isinstance(v, torch.Tensor)
+    }
+
+    def _plan(v):
+        if isinstance(v, torch.Tensor):
+            idx = id_to_idx.get(id(v))
+            if idx is None:
+                # AOT cloned/derived a tensor we never returned to it
+                # — fall back to keeping all trace outputs as a flat
+                # tuple. Loses the user-visible structure but keeps
+                # correctness; warn so this is visible.
+                raise _OutputShaperBail(
+                    f"AOT returned a Tensor (shape={tuple(v.shape)}) that "
+                    "doesn't match any trace output by id(); AOT may have "
+                    "cloned/aliased an output, which v2.capture's id()-based "
+                    "matching doesn't handle.")
+            return ("T", idx)
+        if isinstance(v, tuple):
+            return ("tuple", [_plan(e) for e in v])
+        if isinstance(v, list):
+            return ("list", [_plan(e) for e in v])
+        if v is None:
+            return ("none",)
+        # Scalars, etc. — best to pass-through as a literal-by-value
+        # snapshot. Rare in AOT outputs.
+        return ("literal", v)
+
+    try:
+        plan = _plan(user_visible_out)
+    except _OutputShaperBail as e:
+        print(f"# v2.capture: output_shaper fallback ({e})")
+        n = len(trace_out)
+        def fallback(result):
+            return result[0] if len(result) == 1 else tuple(result[:n])
+        return fallback
+
+    def apply(plan, result):
+        kind = plan[0]
+        if kind == "T":
+            return result[plan[1]]
+        if kind == "tuple":
+            return tuple(apply(p, result) for p in plan[1])
+        if kind == "list":
+            return [apply(p, result) for p in plan[1]]
+        if kind == "none":
+            return None
+        if kind == "literal":
+            return plan[1]
+        raise AssertionError(f"unhandled plan kind: {kind}")
+
+    def shaper(result):
+        return apply(plan, result)
+    return shaper
+
+
+class _OutputShaperBail(Exception):
+    """Sentinel signalling that the id()-based output mapping couldn't
+    cover the user-visible structure. Caught by _build_output_shaper
+    which then returns a flat-passthrough fallback shaper."""
+    pass
 
 
 def _capture_with_backward(fn, example_args):
