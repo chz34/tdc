@@ -27,6 +27,7 @@ import time
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torchvision import models as tv_models
 import torch_dispatch_capture as tdc           # v1
 import torch_dispatch_capture.v2 as tdcv2      # v2
 from torch.profiler import profile, ProfilerActivity
@@ -132,6 +133,63 @@ def _rand(*shape):
     return torch.randn(*shape, device=DEVICE)
 
 
+# ---------------------------------------------------------------------------
+# torchbench models
+# ---------------------------------------------------------------------------
+def _build_alexnet():
+    """AlexNet (torchvision) with ImageNet weights, eval mode."""
+    return tv_models.alexnet(
+        weights=tv_models.AlexNet_Weights.IMAGENET1K_V1
+    ).to(DEVICE).eval()
+
+
+# Local checkout of https://github.com/pytorch/benchmark — see the
+# project's README for setup. We import it lazily so the benchmark
+# still runs when torchbench isn't installed.
+_TORCHBENCH_ROOT = "/home/chz34/src/ai-framework/benchmark"
+
+
+def _torchbench_available() -> bool:
+    """Add the torchbench checkout to sys.path and return True if its
+    package imports cleanly. Cached after the first call."""
+    if getattr(_torchbench_available, "_cached", None) is not None:
+        return _torchbench_available._cached    # type: ignore[attr-defined]
+    ok = False
+    if os.path.isdir(_TORCHBENCH_ROOT):
+        if _TORCHBENCH_ROOT not in sys.path:
+            sys.path.insert(0, _TORCHBENCH_ROOT)
+        try:
+            import torchbenchmark  # noqa: F401
+            ok = True
+        except Exception as e:
+            print(f"# torchbench: import failed ({type(e).__name__}: {e})")
+    _torchbench_available._cached = ok          # type: ignore[attr-defined]
+    return ok
+
+
+def _load_torchbench(name: str, batch_size=None, test: str = "eval"):
+    """Load a torchbench model via its standardised Model API. Returns
+    (model, example_inputs) on success or None if anything goes wrong
+    (missing checkout, weight-download failure, model init error,
+    incompatibility with the local torch version, ...). Failures are
+    logged but never raise — the workload is just skipped."""
+    if not _torchbench_available():
+        return None
+    try:
+        import importlib
+        mod = importlib.import_module(f"torchbenchmark.models.{name}")
+        kwargs: dict = {"test": test, "device": DEVICE.type}
+        if batch_size is not None:
+            kwargs["batch_size"] = batch_size
+        bench = mod.Model(**kwargs)
+        model, example_inputs = bench.get_module()
+        model.eval()
+        return model, tuple(example_inputs)
+    except Exception as e:
+        print(f"# torchbench: skipping {name!r} ({type(e).__name__}: {str(e)[:160]})")
+        return None
+
+
 def _swiglu_inputs(B, S, H, H_inner):
     """Allocate the (x, w_gate, w_up, w_down) tuple for a SwiGLU FFN.
     Weight shapes mirror torch.nn.Linear's convention: [out, in]."""
@@ -164,7 +222,45 @@ WORKLOADS = {
         _build_transformer_block(hidden=256, n_heads=8, ffn_inner=1024),
         (_rand(2, 128, 256),),
     ),
+    # torchvision-direct: weights frozen at capture via v2.capture's
+    # param-snapshot path.
+    "alexnet (B=64)": (
+        _build_alexnet(),
+        (_rand(64, 3, 224, 224),),
+    ),
 }
+
+
+# ---------------------------------------------------------------------------
+# Append torchbench-sourced workloads, best-effort.
+#
+# Off by default — these are full models (e.g. BERT_pytorch is ~116M
+# params) and running them through the eager / dynamo / inductor /
+# v1 / v2 matrix with the full warmup+iter budget makes a CPU run take
+# many minutes. Set TDC_TORCHBENCH=1 to enable; on accelerators they're
+# usually fast enough to keep on by default but we still gate on the
+# env var to keep CI predictable.
+#
+# Each entry calls _load_torchbench(); if the model can't load (e.g.
+# weight-download hash failure, missing torchbench checkout, hitting a
+# v2 unsupported FX op), we skip it instead of failing the whole
+# benchmark. Models listed in _TB_SKIP_CORRECTNESS still participate in
+# timing but are excluded from the eager-vs-everything diff — useful for
+# graphs whose AOT output arity doesn't match the user-visible tuple
+# (e.g. BERT_pytorch returns (logits, lm_logits) but AOT emits a third
+# intermediate that v2.capture currently can't drop, since the AOT
+# output mapping isn't exposed).
+# ---------------------------------------------------------------------------
+_TB_SKIP_CORRECTNESS = {"torchbench:BERT_pytorch (B=1)"}
+
+if os.environ.get("TDC_TORCHBENCH", "0") == "1":
+    for _label, _name, _bs in [
+        ("torchbench:squeezenet1_1 (B=1)", "squeezenet1_1", 1),
+        ("torchbench:BERT_pytorch (B=1)",  "BERT_pytorch",  1),
+    ]:
+        _loaded = _load_torchbench(_name, batch_size=_bs)
+        if _loaded is not None:
+            WORKLOADS[_label] = _loaded
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +392,9 @@ def run_correctness_check():
     print("-" * 78)
     all_ok = True
     for label, (fn, inputs) in WORKLOADS.items():
+        if label in _TB_SKIP_CORRECTNESS:
+            print(f"  {label:<44} (skipped — v2 / AOT output-arity mismatch)")
+            continue
         torch._dynamo.reset()
         variants = build_variants(fn, inputs)
         if "eager" not in variants:
