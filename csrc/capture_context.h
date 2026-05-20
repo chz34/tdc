@@ -199,13 +199,32 @@ public:
     // or captured_ints_[idx]".
     enum class PlaceholderTarget { kTensor, kInt };
     size_t append_placeholder_tensor() {
-        placeholder_routing_.push_back({PlaceholderTarget::kTensor, n_captured_tensors_++});
-        return n_captured_tensors_ - 1;
+        size_t slot = n_captured_tensors_++;
+        placeholder_routing_.push_back({PlaceholderTarget::kTensor, slot});
+        if (captured_tensors_.size() < n_captured_tensors_) {
+            captured_tensors_.resize(n_captured_tensors_);
+        }
+        v2_arg_pre_bound_.push_back(false);
+        return slot;
     }
     size_t append_placeholder_int() {
-        placeholder_routing_.push_back({PlaceholderTarget::kInt, n_captured_ints_++});
-        return n_captured_ints_ - 1;
+        size_t slot = n_captured_ints_++;
+        placeholder_routing_.push_back({PlaceholderTarget::kInt, slot});
+        if (captured_ints_.size() < n_captured_ints_) {
+            captured_ints_.resize(n_captured_ints_);
+        }
+        v2_arg_pre_bound_.push_back(false);
+        return slot;
     }
+
+    // v2: mark the arg_idx-th placeholder as pre-bound with `value`.
+    // Pre-bound slots are populated once at capture time and reused on
+    // every replay — no Python -> IValue conversion, no arg routing
+    // for that slot. Used for nn.Module parameters and other
+    // constants Dynamo lifted into the graph but that don't change
+    // across calls.
+    void v2_pre_bind(size_t arg_idx, c10::IValue value);
+
     void set_outputs(std::vector<StepInputRef> outs) { outputs_ = std::move(outs); }
     size_t n_captured_tensors_count() const { return n_captured_tensors_; }
     size_t n_captured_ints_count() const { return n_captured_ints_; }
@@ -213,7 +232,14 @@ public:
 private:
     std::vector<Step> steps_;
     // External tensors referenced by Step inputs. Strong refs keep them alive.
+    // For v2 these slots survive across replays — user-input slots get
+    // overwritten by arg routing, pre-bound (param) slots stay frozen.
     std::vector<at::Tensor> captured_tensors_;
+    // v2 only: persistent int slots (parallel to captured_tensors_).
+    std::vector<int64_t> captured_ints_;
+    // v2 only: mask parallel to placeholder_routing_. true at index k
+    // means placeholder k is pre-bound — skipped during arg routing.
+    std::vector<bool> v2_arg_pre_bound_;
     // v1 capture-time bookkeeping: TensorImpl* -> (step, output slot).
     std::unordered_map<c10::TensorImpl*, std::pair<size_t, size_t>> tensor_to_step_;
 

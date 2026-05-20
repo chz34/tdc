@@ -172,6 +172,14 @@ PYBIND11_MODULE(_C, m) {
              [](tdc::Trace& self, std::vector<tdc::StepInputRef> outs) {
                  self.set_outputs(std::move(outs));
              })
+        .def("v2_pre_bind",
+             [](tdc::Trace& self, size_t arg_idx, py::object value) {
+                 self.v2_pre_bind(arg_idx, py_to_ivalue_any(value));
+             },
+             "Mark placeholder arg_idx as pre-bound with this value. "
+             "The slot stays filled across replays; v2_replay's args "
+             "list omits the slot. Used for module parameters and "
+             "Dynamo-specialised constants.")
         .def("v2_replay",
              [](tdc::Trace& self, std::vector<py::object> py_args) {
                  std::vector<c10::IValue> args;
@@ -267,5 +275,23 @@ PYBIND11_MODULE(_C, m) {
     m.def("v2_ref_list",
           [](std::vector<tdc::StepInputRef> elements) {
               return tdc::StepInputRef::List(std::move(elements));
+          });
+    // Optimisation: when a list arg is fully literal (e.g.
+    // permute([0,2,1,3])), pre-build the typed c10::List at translation
+    // time and store as one kLiteral IValue. Replay's coercion table
+    // tag is then kNone — no per-call IntList re-construction.
+    m.def("v2_ref_literal_int_list",
+          [](std::vector<int64_t> values) {
+              c10::List<int64_t> ints;
+              ints.reserve(values.size());
+              for (auto v : values) ints.push_back(v);
+              return tdc::StepInputRef::Literal(c10::IValue(std::move(ints)));
+          });
+    m.def("v2_ref_literal_tensor_list",
+          [](std::vector<at::Tensor> tensors) {
+              c10::List<at::Tensor> ts;
+              ts.reserve(tensors.size());
+              for (auto& t : tensors) ts.push_back(t);
+              return tdc::StepInputRef::Literal(c10::IValue(std::move(ts)));
           });
 }

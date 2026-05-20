@@ -179,13 +179,18 @@ def _v1_capture(fn, example_inputs):
     it with `*inputs` to keep parity with the other modes.
 
     Workloads here are fixed-shape so v1's shape-baking is not a concern.
+
+    The captured output tensor(s) are held in the closure so the timing
+    loop / correctness check can read v1's result post-replay — v1's
+    replay rewrites these tensors in place.
     """
     with torch.no_grad():
         with tdc.capture() as trace:
-            fn(*example_inputs)
+            captured_out = fn(*example_inputs)
 
     def cb(*_unused):
         trace.replay()
+        return captured_out
 
     return cb
 
@@ -243,6 +248,80 @@ def time_iters(callable_, inputs, n_warmup=50, n_iters=500):
 
 def fmt_us(v):
     return f"{v:8.2f}"
+
+
+# ---------------------------------------------------------------------------
+# Correctness check against eager
+# ---------------------------------------------------------------------------
+def _flatten_output(out):
+    """Flatten the return value of a workload to a list of Tensors so we
+    can compare element-wise. Non-Tensor leaves are dropped — workloads
+    here only return Tensor / tuple-of-Tensor / module-of-Tensor."""
+    if out is None:
+        return []
+    if isinstance(out, torch.Tensor):
+        return [out]
+    if isinstance(out, (tuple, list)):
+        flat = []
+        for o in out:
+            flat.extend(_flatten_output(o))
+        return flat
+    return []
+
+
+def _compare_outputs(ref, got, atol=5e-4, rtol=5e-4):
+    """Return (ok, message). Tolerances are loose enough that inductor's
+    fused/reordered kernels don't trigger false negatives on fp32 ops."""
+    if len(ref) != len(got):
+        return False, f"flat output count {len(got)} vs eager {len(ref)}"
+    for i, (a, b) in enumerate(zip(ref, got)):
+        if a.shape != b.shape:
+            return False, f"out[{i}] shape {tuple(b.shape)} vs eager {tuple(a.shape)}"
+        if a.dtype != b.dtype:
+            return False, f"out[{i}] dtype {b.dtype} vs eager {a.dtype}"
+        if not torch.allclose(a, b, atol=atol, rtol=rtol):
+            diff = (a.float() - b.float()).abs().max().item()
+            return False, f"out[{i}] max abs diff {diff:.3e} (atol={atol})"
+    return True, ""
+
+
+def run_correctness_check():
+    """Run each variant once and compare its output against eager.
+
+    Aborts the benchmark on any mismatch so a timing table for broken
+    captures is never printed. v1 returns the in-place-updated capture
+    tensors via the closure in _v1_capture; the other variants return
+    fresh tensors from the call itself."""
+    print("\n# correctness check vs eager")
+    print("-" * 78)
+    all_ok = True
+    for label, (fn, inputs) in WORKLOADS.items():
+        torch._dynamo.reset()
+        variants = build_variants(fn, inputs)
+        if "eager" not in variants:
+            print(f"  {label}: no eager variant, skipping")
+            continue
+        with torch.no_grad():
+            ref = _flatten_output(variants["eager"](*inputs))
+        # Clone so a later in-place variant (v1) can't accidentally alias
+        # the reference tensors and mask a real discrepancy.
+        ref = [t.detach().clone() for t in ref]
+
+        for name, callable_ in variants.items():
+            if name == "eager":
+                continue
+            if name not in _CAPTURE_MODES:
+                torch._dynamo.reset()
+            with torch.no_grad():
+                got = _flatten_output(callable_(*inputs))
+            ok, msg = _compare_outputs(ref, got)
+            status = "ok" if ok else f"MISMATCH ({msg})"
+            print(f"  {label:<44} {name:<10} {status}")
+            if not ok:
+                all_ok = False
+    if not all_ok:
+        raise RuntimeError(
+            "v2_benchmark correctness check failed — see lines above")
 
 
 def run_speed_table():
@@ -378,5 +457,6 @@ if __name__ == "__main__":
     sample_fn, sample_inputs = next(iter(WORKLOADS.values()))
     _names = list(build_variants(sample_fn, sample_inputs).keys())
     print(f"# modes: {' / '.join(_names)}")
+    run_correctness_check()
     run_speed_table()
     run_profile()

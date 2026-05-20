@@ -194,24 +194,32 @@ std::vector<c10::IValue> Trace::replay_v2(
         c10::DispatchKeySet(kCaptureKey)};
     at::AutoDispatchBelowAutograd no_autograd_guard;
 
-    TORCH_CHECK(args.size() == placeholder_routing_.size(),
-        "replay_v2: expected ", placeholder_routing_.size(),
-        " positional args, got ", args.size());
+    // Pre-bound slots (param tensors etc.) live in the Trace's
+    // persistent captured_tensors_ / captured_ints_ buffers. We only
+    // route the non-pre-bound slots from `args` on each call. The
+    // expected args length is the number of non-pre-bound placeholders.
+    size_t expected_args = 0;
+    for (bool b : v2_arg_pre_bound_) if (!b) ++expected_args;
+    TORCH_CHECK(args.size() == expected_args,
+        "replay_v2: expected ", expected_args,
+        " positional args (after pre-bind), got ", args.size());
 
-    // Route positional args into captured_tensors / captured_ints.
-    std::vector<at::Tensor> captured_tensors(n_captured_tensors_);
-    std::vector<int64_t> captured_ints(n_captured_ints_);
-    for (size_t i = 0; i < args.size(); ++i) {
-        const auto& [target, idx] = placeholder_routing_[i];
+    size_t arg_cursor = 0;
+    for (size_t k = 0; k < placeholder_routing_.size(); ++k) {
+        if (v2_arg_pre_bound_[k]) continue;
+        const auto& [target, slot] = placeholder_routing_[k];
         if (target == PlaceholderTarget::kTensor) {
-            TORCH_CHECK(args[i].isTensor(),
-                "replay_v2 arg ", i, " expected Tensor, got ", args[i].tagKind());
-            captured_tensors[idx] = args[i].toTensor();
+            TORCH_CHECK(args[arg_cursor].isTensor(),
+                "replay_v2 arg ", arg_cursor, " expected Tensor, got ",
+                args[arg_cursor].tagKind());
+            captured_tensors_[slot] = args[arg_cursor].toTensor();
         } else {
-            TORCH_CHECK(args[i].isInt(),
-                "replay_v2 arg ", i, " expected int, got ", args[i].tagKind());
-            captured_ints[idx] = args[i].toInt();
+            TORCH_CHECK(args[arg_cursor].isInt(),
+                "replay_v2 arg ", arg_cursor, " expected int, got ",
+                args[arg_cursor].tagKind());
+            captured_ints_[slot] = args[arg_cursor].toInt();
         }
+        ++arg_cursor;
     }
 
     std::vector<std::vector<c10::IValue>> outputs(steps_.size());
@@ -230,7 +238,7 @@ std::vector<c10::IValue> Trace::replay_v2(
             // builtins take raw IValues and return raw IValues.
             for (const auto& ref : step.inputs) {
                 stack.emplace_back(
-                    resolve_ref(ref, outputs, captured_tensors, captured_ints));
+                    resolve_ref(ref, outputs, captured_tensors_, captured_ints_));
             }
             c10::IValue result = (step.builtin_kind == BuiltinKind::kPyFallback)
                 ? invoke_py_fallback(step.py_fn_handle, stack)
@@ -252,7 +260,7 @@ std::vector<c10::IValue> Trace::replay_v2(
 
         for (size_t k = 0; k < step.inputs.size(); ++k) {
             c10::IValue iv = resolve_ref(
-                step.inputs[k], outputs, captured_tensors, captured_ints);
+                step.inputs[k], outputs, captured_tensors_, captured_ints_);
             if (has_coercions) {
                 stack.emplace_back(apply_coercion(std::move(iv), step.coercions[k]));
             } else {
@@ -280,7 +288,7 @@ std::vector<c10::IValue> Trace::replay_v2(
     std::vector<c10::IValue> result;
     result.reserve(outputs_.size());
     for (const auto& ref : outputs_) {
-        result.push_back(resolve_ref(ref, outputs, captured_tensors, captured_ints));
+        result.push_back(resolve_ref(ref, outputs, captured_tensors_, captured_ints_));
     }
     return result;
 }

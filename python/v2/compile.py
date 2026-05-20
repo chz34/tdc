@@ -14,7 +14,7 @@ ints that Dynamo specialised on are baked as constants.
 from __future__ import annotations
 
 import inspect
-from typing import Any, Callable, List, Tuple, Union
+from typing import Any, Callable, Dict, List, Tuple, Union
 
 import torch
 from torch import fx
@@ -135,8 +135,13 @@ def _capture_positional(fn, example_args, allow_grad: bool):
         raise RuntimeError(
             "v2.capture: example call did not exercise the trace; "
             "torch.compile may have specialized to a different cache entry.")
-    recipe_specs = _build_recipe_specs(state["gm"], example_args, state["observed_args"])
-    flat_recipe = _compile_flat_recipe(recipe_specs)
+    runtime_specs, pre_binds, _ = _build_recipe_specs(
+        state["gm"], example_args, state["observed_args"])
+    # Push frozen values (params / Dynamo-specialised constants) into
+    # the trace once; subsequent replays skip those slots entirely.
+    for arg_idx, value in pre_binds:
+        trace.v2_pre_bind(arg_idx, value)
+    flat_recipe = _compile_flat_recipe(runtime_specs)
 
     def direct_replay(*user_args):
         flat = flat_recipe(user_args)
@@ -144,9 +149,10 @@ def _capture_positional(fn, example_args, allow_grad: bool):
         return result[0] if len(result) == 1 else tuple(result)
 
     # Expose internals for introspection / debug.
-    direct_replay.trace = trace                # type: ignore[attr-defined]
-    direct_replay.recipe_specs = recipe_specs  # type: ignore[attr-defined]
-    direct_replay.flat_recipe = flat_recipe    # type: ignore[attr-defined]
+    direct_replay.trace = trace                  # type: ignore[attr-defined]
+    direct_replay.recipe_specs = runtime_specs   # type: ignore[attr-defined]
+    direct_replay.pre_binds = pre_binds          # type: ignore[attr-defined]
+    direct_replay.flat_recipe = flat_recipe      # type: ignore[attr-defined]
     return direct_replay
 
 
@@ -203,14 +209,13 @@ def _capture_with_backward(fn, example_args):
     fw_state = captured[0]
     bw_state = captured[1]
 
-    fw_specs = _build_recipe_specs(fw_state["gm"], example_args, fw_state["observed_args"])
+    fw_specs, fw_pre_binds, fw_ph_to_user_input = _build_recipe_specs(
+        fw_state["gm"], example_args, fw_state["observed_args"])
+    fw_trace_obj = fw_state["trace"]
+    for arg_idx, value in fw_pre_binds:
+        fw_trace_obj.v2_pre_bind(arg_idx, value)
     fw_flat = _compile_flat_recipe(fw_specs)
 
-    # bw outputs at fw-placeholder positions are grads for fw inputs.
-    # Only tensor placeholders carry user-visible grads.
-    fw_ph_to_user_input: dict = {
-        i: spec[1] for i, spec in enumerate(fw_specs) if spec[0] == "T"
-    }
     n_user_inputs = len(example_args)
 
     # Count tangent placeholders in bw_gm to learn how many of fw's
@@ -314,25 +319,27 @@ def _capture_with_backward(fn, example_args):
 
 def _build_recipe_specs(
     gm: fx.GraphModule, example_args, observed_args
-) -> List[RecipeSpec]:
-    """For each gm placeholder, return a tagged spec describing how to
-    fetch its runtime value.
+):
+    """For each gm placeholder, decide whether it varies with the user
+    call (runtime spec) or is constant across calls (pre-bind).
 
-    Per-placeholder resolution:
+    Returns (runtime_specs, pre_binds) where:
+      - runtime_specs: list of ("T", i) / ("S", i, dim) tuples. Each
+        becomes an expression in the generated flat_recipe (one entry
+        in v2_replay's args list per call).
+      - pre_binds: list of (arg_idx, value) tuples. Applied via
+        trace.v2_pre_bind() once at capture; replays skip these slots
+        entirely (no pybind round-trip, no captured_tensors_ overwrite).
 
     Tensor placeholders:
-      (a) id() matches one of example_args -> user input, recipe ("T", i).
-      (b) Otherwise = module parameter / buffer lifted into the graph
-          by Dynamo. Snapshot the observed Tensor as a literal — recipe
-          ("L", tensor). Weights stay frozen across replays; re-capture
-          after a parameter update. (Sufficient for inference; training
-          would need to expose param grads explicitly.)
+      id() match with example_args  -> ("T", user_idx) runtime spec
+      otherwise (module param/buffer)-> (arg_idx, observed_tensor) pre-bind
 
     SymInt placeholders:
-      (a) Symbol appears in a USER-INPUT Tensor's FakeTensor.shape:
-          recipe ("S", user_idx, dim). Reads from the live caller arg.
-      (b) Otherwise: fall back to the observed value as a literal
-          (closure constants, Dynamo-specialised ints).
+      symbol appears in a USER-INPUT Tensor's FakeTensor.shape
+        -> ("S", user_idx, dim) runtime spec
+      otherwise (Dynamo-specialised closure const, etc.)
+        -> (arg_idx, observed_int) pre-bind
     """
     placeholders = [n for n in gm.graph.nodes if n.op == "placeholder"]
     if len(placeholders) != len(observed_args):
@@ -383,69 +390,72 @@ def _build_recipe_specs(
             f"not appear as Tensor placeholders. The call site must pass "
             f"the same tensor objects through (matched by id()).")
 
-    specs: List[RecipeSpec] = []
+    runtime_specs: List[RecipeSpec] = []
+    pre_binds: List[Tuple[int, Any]] = []
+    # ph_idx (the original gm placeholder index) -> user_arg_idx, for
+    # the subset of placeholders that ARE user-input Tensors. Needed by
+    # the backward-replay path which maps bw outputs back to user-input
+    # grads — bw outputs are aligned with the FW graph's placeholder
+    # positions, NOT with the (smaller) runtime_specs.
+    ph_to_user_input: Dict[int, int] = {}
     for ph_idx, n in enumerate(placeholders):
         val = n.meta.get("val")
         if isinstance(val, torch.Tensor):
             if is_user_input[ph_idx]:
-                specs.append(("T", user_tensor_ids[id(observed_args[ph_idx])]))
+                user_idx = user_tensor_ids[id(observed_args[ph_idx])]
+                runtime_specs.append(("T", user_idx))
+                ph_to_user_input[ph_idx] = user_idx
             else:
-                # Module parameter / buffer snapshot.
-                specs.append(("L", observed_args[ph_idx]))
+                # Module parameter / buffer: pre-bind once.
+                pre_binds.append((ph_idx, observed_args[ph_idx]))
         elif isinstance(val, torch.SymInt):
             key = str(val.node.expr)
             if key in symbol_source:
                 ua_idx, dim = symbol_source[key]
-                specs.append(("S", ua_idx, dim))
+                runtime_specs.append(("S", ua_idx, dim))
             else:
-                specs.append(("L", observed_args[ph_idx]))
+                pre_binds.append((ph_idx, observed_args[ph_idx]))
         elif isinstance(val, int):
-            specs.append(("L", val))
+            pre_binds.append((ph_idx, val))
         else:
             raise RuntimeError(
                 f"v2.capture: unsupported placeholder val type "
                 f"{type(val).__name__} for node {n.name}")
-    return specs
+    return runtime_specs, pre_binds, ph_to_user_input
 
 
 def _compile_flat_recipe(specs: List[RecipeSpec]) -> Callable[[Tuple[Any, ...]], list]:
     """Generate and exec() a single function that materialises all
-    placeholder values in one Python call.
+    NON-pre-bound placeholder values in one Python call.
 
     Output shape: `def _flat(args): return [<expr_0>, <expr_1>, ...]`
-    where each expression is either `args[i]`, `args[i].size(d)`, or a
-    literal value (baked as a constant reference into a closure cell).
+    where each expression is either `args[i]` (T spec) or
+    `args[i].size(d)` (S spec). Pre-bound placeholders (param tensors,
+    Dynamo-specialised constants) are NOT in the list — they live in
+    the trace's persistent buffers, set once via v2_pre_bind.
 
     Why exec/eval: this collapses N lambda calls (one per placeholder)
     into a single function invocation. On accelerators where kernel
     time is amortised across calls and host-side Python overhead is
     the bottleneck, this can save 1-3us per replay (≈ N * 300-500ns).
     """
-    # Build the expressions. Literals can't always be inlined safely
-    # (an int 8 is fine via repr(); arbitrary objects may not have a
-    # parseable repr). Stash them in a local list referenced by index.
-    literal_table: list = []
     expr_parts: list[str] = []
     for spec in specs:
         if spec[0] == "T":
             expr_parts.append(f"args[{spec[1]}]")
         elif spec[0] == "S":
             expr_parts.append(f"args[{spec[1]}].size({spec[2]})")
-        elif spec[0] == "L":
-            idx = len(literal_table)
-            literal_table.append(spec[1])
-            expr_parts.append(f"_L[{idx}]")
         else:
-            raise AssertionError(f"unknown recipe spec tag: {spec[0]!r}")
+            raise AssertionError(
+                f"flat_recipe only handles T/S specs after pre-bind extraction; "
+                f"got {spec!r}")
 
     src = (
         "def _flat_recipe(args):\n"
         f"    return [{', '.join(expr_parts)}]\n"
     )
-    ns: dict = {"_L": literal_table}
+    ns: dict = {}
     exec(src, ns)
     fn = ns["_flat_recipe"]
-    # Keep the generated source available for debugging.
     fn._source = src                   # type: ignore[attr-defined]
-    fn._literal_table = literal_table  # type: ignore[attr-defined]
     return fn

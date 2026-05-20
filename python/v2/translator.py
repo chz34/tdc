@@ -14,7 +14,7 @@ path; see csrc/trace_v2.cpp::apply_coercion.
 from __future__ import annotations
 
 import operator
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 import torch
 from torch import fx
@@ -249,12 +249,31 @@ def _merge_args_kwargs_via_schema(op, args, kwargs, node_to_ref, node_to_kind):
     """For a kTensorOp step, lift kwargs into the positional slot order
     dictated by the op's schema. Return (refs, kinds) parallel lists in
     schema-positional order. Missing args get filled with their schema
-    default value as a literal ref / kind."""
+    default value as a literal ref / kind.
+
+    Optimisation: a list/tuple arg whose elements are ALL Python
+    literals (no fx.Node references) and whose schema slot is a List
+    type is frozen into a typed c10::List<int64_t> / c10::List<Tensor>
+    at translation time, returned as a single kLiteral. The coercion
+    pass then sees this ref as 'list' kind but the spec-level handling
+    will skip generating LIST_TO_INT_LIST since the IValue is already
+    typed. We mark with a sentinel kind 'frozen_list' so
+    _compute_coercions emits NONE instead.
+    """
     schema_args = op._schema.arguments
     n_positional = len(args)
 
-    refs: List[Any] = [_node_arg_to_ref(a, node_to_ref) for a in args]
-    kinds: List[str] = [_predict_value_kind(a, node_to_kind) for a in args]
+    refs: List[Any] = []
+    kinds: List[str] = []
+
+    def _emit(value, schema_arg):
+        ref, kind = _ref_and_kind_for(value, schema_arg, node_to_ref, node_to_kind)
+        refs.append(ref)
+        kinds.append(kind)
+
+    for i, a in enumerate(args):
+        sa = schema_args[i] if i < len(schema_args) else None
+        _emit(a, sa)
 
     remaining_kwargs = dict(kwargs)
     for i in range(n_positional, len(schema_args)):
@@ -262,12 +281,10 @@ def _merge_args_kwargs_via_schema(op, args, kwargs, node_to_ref, node_to_kind):
         name = sa.name
         if name in remaining_kwargs:
             v = remaining_kwargs.pop(name)
-            refs.append(_node_arg_to_ref(v, node_to_ref))
-            kinds.append(_predict_value_kind(v, node_to_kind))
+            _emit(v, sa)
         elif sa.has_default_value():
             v = sa.default_value
-            refs.append(_C.v2_ref_literal(v))
-            kinds.append(_predict_value_kind(v, node_to_kind))
+            _emit(v, sa)
         else:
             break
     if remaining_kwargs:
@@ -277,6 +294,40 @@ def _merge_args_kwargs_via_schema(op, args, kwargs, node_to_ref, node_to_kind):
             f"{[a.name for a in schema_args]}"
         )
     return refs, kinds
+
+
+def _ref_and_kind_for(value, schema_arg, node_to_ref, node_to_kind):
+    """Build a StepInputRef and predicted kind for one (value, schema)
+    pair. If the value is a fully-literal list whose schema slot is a
+    List type, freeze it into a typed c10::List literal so replay
+    skips list rebuild + coercion.
+    """
+    # Schema may be None for positions beyond the declared schema args
+    # (e.g. *args-style ops; should be rare in AOT graphs).
+    if schema_arg is not None and isinstance(value, (list, tuple)):
+        # Check if this is a fully-literal list that we can freeze.
+        sa_type = schema_arg.type
+        if sa_type.kind() == "OptionalType":
+            sa_type = sa_type.getElementType()
+        if sa_type.kind() == "ListType":
+            elem_kind = sa_type.getElementType().kind()
+            all_python_literal = all(not isinstance(v, fx.Node) for v in value)
+            if all_python_literal:
+                if elem_kind in ("IntType", "SymIntType") and all(
+                    isinstance(v, int) and not isinstance(v, bool) for v in value
+                ):
+                    return (
+                        _C.v2_ref_literal_int_list(list(value)),
+                        "frozen_list",
+                    )
+                if elem_kind == "TensorType" and all(
+                    isinstance(v, torch.Tensor) for v in value
+                ):
+                    return (
+                        _C.v2_ref_literal_tensor_list(list(value)),
+                        "frozen_list",
+                    )
+    return (_node_arg_to_ref(value, node_to_ref), _predict_value_kind(value, node_to_kind))
 
 
 def _compute_coercions(op, positional_kinds) -> List[Any]:
@@ -296,6 +347,11 @@ def _compute_coercions(op, positional_kinds) -> List[Any]:
     out: List[Any] = []
     for k, kind in enumerate(positional_kinds):
         if k >= len(schema_args):
+            out.append(NONE)
+            continue
+        # Frozen lists are already typed (c10::List<int64_t> /
+        # c10::List<Tensor>) — no coercion needed at replay.
+        if kind == "frozen_list":
             out.append(NONE)
             continue
         sa_type = schema_args[k].type

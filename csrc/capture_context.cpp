@@ -98,6 +98,25 @@ std::string Trace::dump() const {
     return os.str();
 }
 
+// ---------------- Trace::v2_pre_bind ----------------
+
+void Trace::v2_pre_bind(size_t arg_idx, c10::IValue value) {
+    TORCH_CHECK(arg_idx < placeholder_routing_.size(),
+        "v2_pre_bind: arg_idx ", arg_idx,
+        " out of range (placeholders=", placeholder_routing_.size(), ")");
+    const auto& [target, slot] = placeholder_routing_[arg_idx];
+    if (target == PlaceholderTarget::kTensor) {
+        TORCH_CHECK(value.isTensor(),
+            "v2_pre_bind: arg ", arg_idx, " expected Tensor, got ", value.tagKind());
+        captured_tensors_[slot] = value.toTensor();
+    } else {
+        TORCH_CHECK(value.isInt(),
+            "v2_pre_bind: arg ", arg_idx, " expected int, got ", value.tagKind());
+        captured_ints_[slot] = value.toInt();
+    }
+    v2_arg_pre_bound_[arg_idx] = true;
+}
+
 // ---------------- CaptureContext (TLS) ----------------
 
 namespace {
