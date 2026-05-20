@@ -74,12 +74,18 @@ def translate_graph(gm: fx.GraphModule) -> _C.Trace:
     trace = _C.Trace()
     node_to_ref: Dict[fx.Node, Any] = {}        # fx.Node -> _C.StepInputRef
     node_to_kind: Dict[fx.Node, str] = {}       # fx.Node -> predicted IValue kind
+    # FX node -> (step_idx, n_outputs) for OpOverload steps whose schema
+    # declares >1 returns. Lets us fold operator.getitem(node, k) into
+    # a direct PrevStep(step_idx, k) reference instead of emitting an
+    # extra PyCall step + paying for the Tuple wrap at replay.
+    multi_output_step: Dict[fx.Node, int] = {}
 
     for node in gm.graph.nodes:
         if node.op == "placeholder":
             _translate_placeholder(node, trace, node_to_ref, node_to_kind)
         elif node.op == "call_function":
-            _translate_call_function(node, trace, node_to_ref, node_to_kind)
+            _translate_call_function(
+                node, trace, node_to_ref, node_to_kind, multi_output_step)
         elif node.op == "output":
             _translate_output(node, trace, node_to_ref)
         elif node.op in ("call_method", "call_module", "get_attr"):
@@ -112,7 +118,8 @@ def _translate_placeholder(node, trace, node_to_ref, node_to_kind):
         )
 
 
-def _translate_call_function(node, trace, node_to_ref, node_to_kind):
+def _translate_call_function(node, trace, node_to_ref, node_to_kind,
+                              multi_output_step):
     target = node.target
 
     if isinstance(target, torch._ops.HigherOrderOperator):
@@ -120,6 +127,22 @@ def _translate_call_function(node, trace, node_to_ref, node_to_kind):
             f"v2 does not support HigherOrderOperator {target}. Use "
             f"torch.compile(backend='inductor') for control-flow workloads."
         )
+
+    # Fold-fast: operator.getitem on a known multi-output OpOverload node
+    # collapses to a slot index into that step's outputs. No PyCall step
+    # is emitted; no Tuple is created at replay.
+    if (target is operator.getitem
+            and len(node.args) == 2
+            and isinstance(node.args[0], fx.Node)
+            and node.args[0] in multi_output_step
+            and isinstance(node.args[1], int)):
+        predecessor_step = multi_output_step[node.args[0]]
+        slot = node.args[1]
+        node_to_ref[node] = _C.v2_ref_prev_step(predecessor_step, slot)
+        # Output kind: a multi-output OpOverload always returns Tensors
+        # in practice (max.dim, native_layer_norm, sort, topk, ...).
+        node_to_kind[node] = "tensor"
+        return
 
     if isinstance(target, (torch._ops.OpOverload, torch._ops.OpOverloadPacket)):
         # Merge args+kwargs into the schema's positional slot order, then
@@ -132,7 +155,11 @@ def _translate_call_function(node, trace, node_to_ref, node_to_kind):
         n_out = len(target._schema.returns)
         step_idx = trace.v2_add_tensor_op_step(
             op_name, positional_refs, n_out, coercions=coercions)
-        node_to_kind[node] = "tuple" if n_out > 1 else "tensor"
+        if n_out > 1:
+            multi_output_step[node] = step_idx
+            node_to_kind[node] = "tuple"
+        else:
+            node_to_kind[node] = "tensor"
     elif callable(target):
         inputs = [_node_arg_to_ref(a, node_to_ref) for a in node.args]
         builtin = _OP_TO_BUILTIN.get(target)

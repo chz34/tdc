@@ -262,15 +262,18 @@ std::vector<c10::IValue> Trace::replay_v2(
 
         step.op->callBoxed(&stack);
 
-        // Multi-output schemas leave N values on the stack; flat slot
-        // model wraps them as a tuple in slot 0 so downstream getitem
-        // can extract.
-        if (stack.size() == 1) {
-            outputs[i] = {std::move(stack[0])};
-        } else {
-            outputs[i] = {c10::ivalue::Tuple::create(
-                std::vector<c10::IValue>(stack.begin(), stack.end()))};
-        }
+        // Mirror v1's flat slot layout: outputs[i] holds N IValues, one
+        // per schema return. Downstream refs use kPrevStepOutput(step,
+        // slot) to address individual returns directly — no per-call
+        // Tuple allocation needed (the translator folds
+        // operator.getitem on multi-output OpOverloads into slot
+        // indices, removing the corresponding PyCall steps as well).
+        // Move semantics so each IValue is transferred not copied; the
+        // stack ends up in a valid empty-ish state and gets clear()'d
+        // on the next loop iteration.
+        outputs[i].assign(
+            std::make_move_iterator(stack.begin()),
+            std::make_move_iterator(stack.end()));
     }
 
     // Materialize the trace's declared outputs.
