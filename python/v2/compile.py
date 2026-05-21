@@ -69,9 +69,12 @@ def capture(
         no in-place side effects.
 
     Caveats for `wrapper=True`:
-      - For functions closing over nn.Module parameters, aot_function
-        can't see the params and fails with a FakeTensor assertion;
-        pass the Module itself (or use wrapper=False).
+      - Functions that reference nn.Modules through a non-Module
+        container (list, dict, dataclass, plain object attr-chain)
+        aren't detected by our closure-scan shim. The error message
+        will tell you to use wrapper=False or restructure. Modules
+        held directly in closure cells, globals, or as an outer
+        Module's attribute *are* handled.
       - Models with tied weights (e.g. BERT's shared attention) hit
         aot_module's `_reparametrize_module` tied-key error; use
         wrapper=False for those.
@@ -222,6 +225,61 @@ def _capture_positional(fn, example_args, allow_grad: bool, wrapper: bool = True
     return direct_replay
 
 
+class _ClosureModuleShim(torch.nn.Module):
+    """Thin nn.Module that registers fn's closure-captured nn.Modules
+    as submodules so aot_module can find their Parameters/Buffers.
+
+    Why this works: aot_module's _reparametrize_module mutates module
+    attrs via setattr; since both `self._closure_mod_N` and the cell
+    captured by fn refer to the *same* nn.Module object, the in-place
+    parameter swap is visible through both. Calling self(*args) hits
+    self.forward which delegates to fn — fn picks up the swapped
+    FakeTensor params through its closure exactly as if they were its
+    own attrs.
+    """
+    def __init__(self, fn, modules):
+        super().__init__()
+        # add_module dedupes-by-name only; do NOT use the same name
+        # twice. Iteration order matches the closure scan.
+        for i, m in enumerate(modules):
+            self.add_module(f"_closure_mod_{i}", m)
+        # Store fn as a plain attr (not a submodule) so __setattr__'s
+        # nn.Module / Tensor specialisation doesn't try to register it.
+        object.__setattr__(self, "_fn", fn)
+
+    def forward(self, *args, **kwargs):
+        return self._fn(*args, **kwargs)
+
+
+def _scan_closure_modules(fn):
+    """Return the list of unique nn.Module objects fn references via
+    its closure cells OR globals.
+
+    `inspect.getclosurevars` walks fn's bytecode and resolves every
+    LOAD_DEREF / LOAD_GLOBAL name to its current value, so we catch
+    both `def fn(x): return linear(x)` at module scope (linear is in
+    .globals) and the same idiom inside another function (linear is
+    in .nonlocals).
+
+    Best-effort: nn.Modules reached only through an intermediate
+    object (e.g. a list of models, or `cfg.model`) aren't found by
+    name lookup; those still hit aot_function's FakeTensor assert
+    and should fall back to wrapper=False."""
+    try:
+        cv = inspect.getclosurevars(fn)
+    except TypeError:
+        # Built-ins, C-level callables, etc.
+        return []
+    seen: set = set()
+    modules: list = []
+    for source in (cv.nonlocals, cv.globals):
+        for val in source.values():
+            if isinstance(val, torch.nn.Module) and id(val) not in seen:
+                modules.append(val)
+                seen.add(id(val))
+    return modules
+
+
 def _capture_via_aot_wrapper(fn, example_args):
     """wrapper=True path. Hand fn to torch's aot_function / aot_module
     so the call site goes through PyTorch's native RuntimeWrapper —
@@ -243,21 +301,59 @@ def _capture_via_aot_wrapper(fn, example_args):
             return trace.v2_replay(list(flat_args))
         return run_via_trace
 
-    # nn.Module parameters live in closures aot_function can't trace
-    # through (FakeTensor sees the real Parameter and bails). aot_module
-    # is the dedicated entry that lifts module params/buffers as
-    # explicit graph inputs.
+    # nn.Module parameters live in attributes aot_function can't see
+    # (FakeTensor sees the real Parameter and bails). aot_module is the
+    # dedicated entry that lifts module params/buffers as explicit
+    # graph inputs.
+    #
+    # The same problem hits plain functions that close over an nn.Module
+    # (e.g. `def fn(x): return linear(x)` where `linear` is a Linear in
+    # the surrounding scope). aot_function can't see those Parameters
+    # any more than it could when they live in `fn`'s attrs. Detect
+    # closure-captured Modules and wrap them into a shim nn.Module so
+    # aot_module's parameter-lifting handles them. The shim adds each
+    # Module via add_module, so aot_module's _reparametrize_module
+    # walks them; since the closure cell and the shim attr point to
+    # the same object, mutating one is observed by the other.
     if isinstance(fn, torch.nn.Module):
+        target = fn
+    else:
+        closure_mods = _scan_closure_modules(fn)
+        target = _ClosureModuleShim(fn, closure_mods) if closure_mods else None
+
+    if target is not None:
         aot_compiled = aot_module(
-            fn, fw_compiler=grab_compiler, dynamic=True)
+            target, fw_compiler=grab_compiler, dynamic=True)
     else:
         aot_compiled = aot_function(
             fn, fw_compiler=grab_compiler, dynamic=True)
 
     # Trigger AOT trace + RuntimeWrapper wiring. The first call also
     # forces fw_compiler to fire, populating `captured`.
-    with torch.no_grad():
-        aot_compiled(*example_args)
+    try:
+        with torch.no_grad():
+            aot_compiled(*example_args)
+    except AssertionError as e:
+        # FakeTensorMode rejecting a real Parameter is the signature of
+        # "fn references an nn.Module through a path our closure scan
+        # missed" — e.g. self.cfg.model where cfg isn't an nn.Module,
+        # or models stored in a list/dict. Re-raise with the actual
+        # remediation rather than the cryptic FakeTensor assert.
+        if "convert all Tensors to FakeTensors" in str(e):
+            raise RuntimeError(
+                "v2.capture(wrapper=True): aot_function/aot_module's "
+                "FakeTensorMode hit a real Parameter that our closure-"
+                "scan shim didn't lift. fn likely references an "
+                "nn.Module through a non-Module container (list, dict, "
+                "dataclass, plain object attr-chain). Either:\n"
+                "  - move the Module into a closure cell / global / "
+                "self.X attr so it's name-resolvable, or\n"
+                "  - pass the outer Module directly to v2.capture, or\n"
+                "  - use wrapper=False which goes through torch.compile "
+                "(Dynamo can resolve any attribute chain).\n"
+                f"original error: {e}"
+            ) from e
+        raise
 
     if not captured:
         raise RuntimeError(
