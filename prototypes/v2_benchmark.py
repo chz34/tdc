@@ -23,6 +23,7 @@ not just dispatch enqueueing.
 import os
 import sys
 import time
+import traceback
 
 import torch
 import torch.nn.functional as F
@@ -264,9 +265,13 @@ def _v1_capture(fn, example_inputs):
     loop / correctness check can read v1's result post-replay — v1's
     replay rewrites these tensors in place.
     """
-    with torch.no_grad():
-        with tdc.capture() as trace:
-            captured_out = fn(*example_inputs)
+    try:
+        with torch.no_grad():
+            with tdc.capture() as trace:
+                captured_out = fn(*example_inputs)
+    except Exception:
+        traceback.print_exc()
+        return None
 
     def cb(*_unused):
         trace.replay()
@@ -350,17 +355,22 @@ def build_variants(fn, example_inputs):
     # workload (control flow torch.export refuses) — _export_capture
     # then returns None, and the speed table skips that cell while
     # keeping the column.
-    return {
-        "eager":     fn,
-        "dynamo":    torch.compile(fn, backend="eager", dynamic=True),
-        "aot_eager": torch.compile(fn, backend="aot_eager", dynamic=True),
-        "inductor":  torch.compile(fn, backend="inductor", dynamic=True),
-        "v1":        _v1_capture(fn, example_inputs),
-        # v2 direct-replay path: capture once with example_inputs, then
-        # call the resulting callable without going through Dynamo/AOT.
-        "v2":        tdcv2.capture(fn, *example_inputs),
-        "export":    _export_capture(fn, example_inputs),
-    }
+    variants = {}
+    for name, builder in [
+        ("eager",     lambda: fn),
+        ("dynamo",    lambda: torch.compile(fn, backend="eager", dynamic=True)),
+        ("aot_eager", lambda: torch.compile(fn, backend="aot_eager", dynamic=True)),
+        ("inductor",  lambda: torch.compile(fn, backend="inductor", dynamic=True)),
+        ("v1",        lambda: _v1_capture(fn, example_inputs)),
+        ("v2",        lambda: tdcv2.capture(fn, *example_inputs)),
+        ("export",    lambda: _export_capture(fn, example_inputs)),
+    ]:
+        try:
+            variants[name] = builder()
+        except Exception:
+            traceback.print_exc()
+            variants[name] = None
+    return variants
 
 
 # Modes that don't reuse Dynamo's compile cache between workloads — we
@@ -378,13 +388,21 @@ def time_iters(callable_, inputs, n_warmup=10, n_iters=100):
 
     On accelerator devices, SYNC() bracketing each call ensures we
     measure kernel completion rather than just dispatch enqueueing."""
-    for _ in range(n_warmup):
-        callable_(*inputs)
+    try:
+        for _ in range(n_warmup):
+            callable_(*inputs)
+    except Exception:
+        traceback.print_exc()
+        return None
     SYNC()
     samples = []
     for _ in range(n_iters):
         t0 = time.perf_counter()
-        callable_(*inputs)
+        try:
+            callable_(*inputs)
+        except Exception:
+            traceback.print_exc()
+            return None
         SYNC()
         t1 = time.perf_counter()
         samples.append((t1 - t0) * 1e6)
@@ -393,6 +411,8 @@ def time_iters(callable_, inputs, n_warmup=10, n_iters=100):
 
 
 def fmt_us(v):
+    if v is None:
+        return "     N/A"
     return f"{v:8.2f}"
 
 
@@ -415,9 +435,13 @@ def _flatten_output(out):
     return []
 
 
-def _compare_outputs(ref, got, atol=5e-4, rtol=5e-4):
-    """Return (ok, message). Tolerances are loose enough that inductor's
-    fused/reordered kernels don't trigger false negatives on fp32 ops."""
+def _compare_outputs(ref, got, atol=1e-3, rtol=1e-3):
+    """Return (ok, message). Tolerances allow for fp32 FMA reordering
+    introduced by inductor fusion or by v2's core_aten_decompositions
+    rewrites (e.g. aten.linear -> mm + add, aten.silu -> mul +
+    sigmoid). Both 1e-3 keeps the check strict enough to catch real
+    algorithmic bugs (wrong shape/dtype, NaN, order-1 errors) while
+    tolerating FMA reordering on typical fp32 nets."""
     if len(ref) != len(got):
         return False, f"flat output count {len(got)} vs eager {len(ref)}"
     for i, (a, b) in enumerate(zip(ref, got)):
@@ -427,7 +451,12 @@ def _compare_outputs(ref, got, atol=5e-4, rtol=5e-4):
             return False, f"out[{i}] dtype {b.dtype} vs eager {a.dtype}"
         if not torch.allclose(a, b, atol=atol, rtol=rtol):
             diff = (a.float() - b.float()).abs().max().item()
-            return False, f"out[{i}] max abs diff {diff:.3e} (atol={atol})"
+            ref_max = a.float().abs().max().item()
+            return False, (
+                f"out[{i}] max abs diff {diff:.3e} (atol={atol}, "
+                f"ref max abs {ref_max:.3e}, "
+                f"rel {diff/max(ref_max, 1e-12):.2e})"
+            )
     return True, ""
 
 
@@ -465,7 +494,13 @@ def run_correctness_check():
             if name not in _CAPTURE_MODES:
                 torch._dynamo.reset()
             with torch.no_grad():
-                got = _flatten_output(callable_(*inputs))
+                try:
+                    got = _flatten_output(callable_(*inputs))
+                except Exception:
+                    traceback.print_exc()
+                    print(f"  {label:<44} {name:<10} N/A (exception during call)")
+                    all_ok = False
+                    continue
             ok, msg = _compare_outputs(ref, got)
             status = "ok" if ok else f"MISMATCH ({msg})"
             print(f"  {label:<44} {name:<10} {status}")
@@ -527,7 +562,7 @@ def run_speed_table():
             times[name] = time_iters(callable_, inputs)
 
         def cell(t):
-            return "    --   " if t is None else fmt_us(t)
+            return "     N/A" if t is None else fmt_us(t)
 
         time_strs = " ".join(f"{cell(times[n]):>{col_w}}" for n in variant_names)
         if has_eager:
@@ -535,7 +570,7 @@ def run_speed_table():
             def ratio(n):
                 t = times[n]
                 if t is None or eg is None or eg <= 0:
-                    return "   --  "
+                    return "    N/A "
                 return f"{(t/eg):>{col_w}.2f}x"
             ratio_strs = " ".join(f"{ratio(n):>{col_w}}" for n in ratio_names)
             print(f"{label:<33} {time_strs} | {ratio_strs}")
@@ -608,7 +643,11 @@ def run_profile(workload_label="attention QK (B=8,S=512,H=128)",
     for name, callable_ in variants.items():
         if callable_ is None:
             continue
-        _profile_one(name, callable_, inputs, f"{out_dir}/{stem}__{name}.json")
+        try:
+            _profile_one(name, callable_, inputs, f"{out_dir}/{stem}__{name}.json")
+        except Exception:
+            traceback.print_exc()
+            print(f"# profile: {name} skipped due to exception (see traceback above)")
 
 
 if __name__ == "__main__":

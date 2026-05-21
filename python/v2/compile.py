@@ -18,18 +18,19 @@ from typing import Any, Callable, Dict, List, Tuple, Union
 
 import torch
 from torch import fx
-from torch._decomp import core_aten_decompositions
 from torch._dynamo.backends.common import aot_autograd
 
 from .translator import translate_graph
 
 
-# AOT decomposition table applied at compile time. Eliminates prim ops
-# (e.g. complex Python decompositions of higher-level aten ops) that
-# would otherwise route through CompositeImplicitAutograd Python
-# kernels at replay (~30-100us per call, deep stack into torch._refs
-# / torch._prims). See DESIGN.md §17.6.9 for the full analysis.
-_AOT_DECOMPOSITIONS = core_aten_decompositions()
+# Note: we deliberately do NOT pass core_aten_decompositions() to
+# aot_function / aot_autograd. That table also decomposes high-level
+# ops like aten.linear -> mm + add, which reorders fp32 FMA and
+# changes numerical results by ~1e-2 absolute on near-zero outputs of
+# 2048-dim matmul (fully within fp32 machine precision but visible at
+# tight tolerances). The only prim we actually need to eliminate is
+# prims.convert_element_type, and _rewrite_prims_in_gm handles it
+# directly without touching high-level aten ops. See DESIGN.md §17.6.9.
 
 
 def _rewrite_prims_in_gm(gm: fx.GraphModule) -> fx.GraphModule:
@@ -243,10 +244,7 @@ def _capture_positional(fn, example_args, allow_grad: bool, wrapper: bool = True
     with torch.no_grad():
         compiled_fn = torch.compile(
             fn,
-            backend=aot_autograd(
-                fw_compiler=grab_compiler,
-                decompositions=_AOT_DECOMPOSITIONS,
-            ),
+            backend=aot_autograd(fw_compiler=grab_compiler),
             dynamic=True,
         )
         # AOT's runtime layer turns wrapping_cb's flat tuple into the
@@ -389,12 +387,10 @@ def _capture_via_aot_wrapper(fn, example_args):
     if target is not None:
         aot_compiled = aot_module(
             target, fw_compiler=grab_compiler, dynamic=True,
-            decompositions=_AOT_DECOMPOSITIONS,
         )
     else:
         aot_compiled = aot_function(
             fn, fw_compiler=grab_compiler, dynamic=True,
-            decompositions=_AOT_DECOMPOSITIONS,
         )
 
     # Trigger AOT trace + RuntimeWrapper wiring. The first call also
@@ -547,7 +543,6 @@ def _capture_with_backward(fn, example_args):
         backend=aot_autograd(
             fw_compiler=grab_compiler,
             bw_compiler=grab_compiler,
-            decompositions=_AOT_DECOMPOSITIONS,
         ),
         dynamic=True,
     )
