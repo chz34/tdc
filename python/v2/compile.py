@@ -18,9 +18,69 @@ from typing import Any, Callable, Dict, List, Tuple, Union
 
 import torch
 from torch import fx
+from torch._decomp import core_aten_decompositions
 from torch._dynamo.backends.common import aot_autograd
 
 from .translator import translate_graph
+
+
+# AOT decomposition table applied at compile time. Eliminates prim ops
+# (e.g. complex Python decompositions of higher-level aten ops) that
+# would otherwise route through CompositeImplicitAutograd Python
+# kernels at replay (~30-100us per call, deep stack into torch._refs
+# / torch._prims). See DESIGN.md §17.6.9 for the full analysis.
+_AOT_DECOMPOSITIONS = core_aten_decompositions()
+
+
+def _rewrite_prims_in_gm(gm: fx.GraphModule) -> fx.GraphModule:
+    """Replace prims.convert_element_type nodes with aten._to_copy.
+
+    AOT functionalization inserts prims.convert_element_type when it
+    lifts Python scalars (e.g. RMSNorm's `self.eps = 1e-6`) into 0-d
+    Tensors. Without inductor's codegen lowering, this prim falls
+    back to a Python decomposition path at replay time -- much
+    slower than the equivalent aten._to_copy which has direct C++
+    backend kernels.
+
+    Passing decompositions={prims.convert_element_type: ...} to
+    aot_function doesn't help because functionalization-inserted ops
+    skip the decomposition table. We rewrite post-AOT, pre-translate.
+
+    Same-dtype rewrites collapse to a no-op (we drop the node and
+    rewire users to the input). Different-dtype becomes aten._to_copy.
+    See DESIGN.md §17.6.9.
+    """
+    convert_op = torch.ops.prims.convert_element_type.default
+    to_copy_op = torch.ops.aten._to_copy.default
+    changed = False
+    for node in list(gm.graph.nodes):
+        if not (node.op == "call_function" and node.target is convert_op):
+            continue
+        src, target_dtype = node.args
+        src_dtype = (
+            src.meta["val"].dtype
+            if "val" in src.meta and hasattr(src.meta["val"], "dtype")
+            else None
+        )
+        if src_dtype == target_dtype:
+            node.replace_all_uses_with(src)
+            gm.graph.erase_node(node)
+            changed = True
+            continue
+        with gm.graph.inserting_after(node):
+            new_node = gm.graph.call_function(
+                to_copy_op, args=(src,), kwargs={"dtype": target_dtype}
+            )
+        # Propagate meta so downstream consumers (including subsequent
+        # rewrites) see the right dtype.
+        new_node.meta = dict(node.meta)
+        node.replace_all_uses_with(new_node)
+        gm.graph.erase_node(node)
+        changed = True
+    if changed:
+        gm.graph.lint()
+        gm.recompile()
+    return gm
 
 
 # A recipe spec is a tagged tuple describing how to fetch one placeholder
@@ -160,6 +220,7 @@ def _capture_positional(fn, example_args, allow_grad: bool, wrapper: bool = True
     captured: list = []
 
     def grab_compiler(gm, sample_inputs):
+        gm = _rewrite_prims_in_gm(gm)
         trace = translate_graph(gm)
         state = {
             "trace": trace,
@@ -182,7 +243,10 @@ def _capture_positional(fn, example_args, allow_grad: bool, wrapper: bool = True
     with torch.no_grad():
         compiled_fn = torch.compile(
             fn,
-            backend=aot_autograd(fw_compiler=grab_compiler),
+            backend=aot_autograd(
+                fw_compiler=grab_compiler,
+                decompositions=_AOT_DECOMPOSITIONS,
+            ),
             dynamic=True,
         )
         # AOT's runtime layer turns wrapping_cb's flat tuple into the
@@ -295,6 +359,7 @@ def _capture_via_aot_wrapper(fn, example_args):
     captured: list = []
 
     def grab_compiler(gm, example_inputs):
+        gm = _rewrite_prims_in_gm(gm)
         trace = translate_graph(gm)
         captured.append({"trace": trace, "gm": gm})
         def run_via_trace(*flat_args):
@@ -323,10 +388,14 @@ def _capture_via_aot_wrapper(fn, example_args):
 
     if target is not None:
         aot_compiled = aot_module(
-            target, fw_compiler=grab_compiler, dynamic=True)
+            target, fw_compiler=grab_compiler, dynamic=True,
+            decompositions=_AOT_DECOMPOSITIONS,
+        )
     else:
         aot_compiled = aot_function(
-            fn, fw_compiler=grab_compiler, dynamic=True)
+            fn, fw_compiler=grab_compiler, dynamic=True,
+            decompositions=_AOT_DECOMPOSITIONS,
+        )
 
     # Trigger AOT trace + RuntimeWrapper wiring. The first call also
     # forces fw_compiler to fire, populating `captured`.
@@ -462,6 +531,7 @@ def _capture_with_backward(fn, example_args):
     captured: list = []
 
     def grab_compiler(gm, sample_inputs):
+        gm = _rewrite_prims_in_gm(gm)
         trace = translate_graph(gm)
         state = {"trace": trace, "gm": gm, "observed_args": None}
         captured.append(state)
@@ -477,6 +547,7 @@ def _capture_with_backward(fn, example_args):
         backend=aot_autograd(
             fw_compiler=grab_compiler,
             bw_compiler=grab_compiler,
+            decompositions=_AOT_DECOMPOSITIONS,
         ),
         dynamic=True,
     )
