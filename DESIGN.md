@@ -1048,3 +1048,116 @@ PyTorch 升级时的维护成本也低得多。
 变更,需要回看 §17.6.3 的翻译表是否需要扩展。**只要这些假设成立,v2 翻译器就只
 处理 `placeholder / call_function(OpOverload | builtin | python_callable) / output`
 这 4 类 FX 节点**,设计闭合。
+
+#### 17.6.9 已知性能缺陷:AOT 对 Python scalar 的 functionalize 处理
+
+在 torchbench llama 等含 RMSNorm / attention-scale 的模型上,实测 v2 trace
+里出现明显异常的 op 序列(`TDC_TRACE_DEBUG=1` 抓到的真实 dump,设备 NPU):
+
+```
+[v2][N]   aten::mean.dim          → Tensor(float,[64,32,1],npu:0)
+[v2][N+1] prims::convert_element_type. stack=[Tensor(double,[],cpu), 7]
+[v2][N+2] prims::convert_element_type. stack=[Tensor(double,[],cpu), 6]
+[v2][N+3] aten::add.Tensor        stack=[Tensor(float,[64,32,1],npu:0),
+                                         Tensor(float,[],cpu),         ← !!
+                                         1]
+```
+
+每个 RMSNorm + attention scaling 都会重复这一段。
+
+**根因**
+
+源代码层是 `x + self.eps` (其中 `self.eps = 1e-6` 是 Python float),或者
+`scores / math.sqrt(head_dim)` (math.sqrt 返回 Python float)。
+
+Dynamo / AOT 处理这条路径分三步:
+
+1. Dynamo bytecode trace 把 `self.eps` 读为 `ConstantVariable(1e-6)`,作为
+   constant 注入 graph
+2. AOT functionalize 阶段要求 graph 每条边都是 Tensor (subclass tracing
+   的固有约束),所以 Python scalar 被 **lift 成 0-d Tensor 作为 graph
+   input** (placeholder)
+3. lift 出来的 Tensor 用 `torch.tensor(1e-6)` 的默认行为构造,**dtype=float64,
+   device=cpu**——Python float 的默认值
+
+v2 在 `_build_recipe_specs` 里把这个 placeholder 走 pre-bind 路径:
+`is_user_input` 检查匹配不上,落到 "module parameter / buffer" 分支
+`pre_binds.append(...)`。pre-bind 的 value 就是 capture 时的 cpu 0-d
+double tensor,被永久存到 `captured_tensors_` 里,**device 在 capture 时
+钉死成 CPU**。
+
+紧跟的两个 `prims::convert_element_type` 是 AOT functionalize 出来的:
+- 第 1 个 (`double → 7=float64`) 实际是 no-op,AOT 出于保守加的占位
+  cast
+- 第 2 个 (`double → 6=float32`) 把 dtype 对齐到 compute dtype
+
+`prims::*` 不带后端 C++ kernel,replay 时走 `CompositeImplicitAutograd`
+Python decomposition (回调进 Python,转发 `aten._to_copy`,再 dispatch
+一遍才到 backend kernel)。每次 ~30-100 μs Python 跳板开销。
+
+最终的 `aten::add.Tensor(npu_tensor, cpu_scalar_tensor, 1)` 是 **跨 device
+混合操作**:NPU backend kernel 检测到 RHS 是 CPU 标量,必须先 H2D 同步,
+才能在设备上做加法。
+
+**costs 累加**
+
+LLaMA decoder block 含 2~3 个 RMSNorm + 1 个 attention-scale,每个都重复
+这一套。8~12 个 transformer block 下来,**单次 replay 累积 30+ 次** "CPU
+标量 + NPU tensor" 混合操作。
+
+| 单次开销 | 来源 |
+|---|---|
+| ~30-100 μs | `prims::convert_element_type` (double→double, no-op) Python decomposition |
+| ~30-100 μs | `prims::convert_element_type` (double→float) 同上 |
+| ~50-200 μs (取决于 backend) | `aten::add.Tensor` 跨 device 同步 |
+
+整体 latency 可能在毫秒级,跟"绕过 Dynamo 节省的 host overhead"在同一个数量级
+甚至更高,完全可能让 v2 比 eager / aot_eager 还慢。
+
+**为什么 v1 没这个问题**
+
+v1 是 dispatcher fallback 捕获,看到的是用户 Python 代码实际 dispatch 出去
+的 op。`x + 1e-6` 在 Python 层走 overload resolution,RHS 是 Python number
+⇒ 直接 dispatch 到 `aten::add.Scalar(Tensor self, Scalar other, Scalar alpha=1)`。
+scalar 是 `c10::IValue(Scalar)`,**纯 host-side 数字,不是 Tensor**:
+
+```
+[v1][N] aten::add.Scalar  stack=[Tensor(float,[64,32,1],npu:0), 1e-06, 1]
+                                                                ^^^^^^
+                                                  c10::Scalar (kLiteral)
+```
+
+无 prim、无 device、无 H2D。整套问题是 AOT functionalize 强制 Tensor-only
+IR 引入的。
+
+**为什么 inductor 没这个问题**
+
+inductor 在 lower 阶段有完整的 decomposition + pattern rewrite,会把
+`aten.add.Tensor(t, cpu_scalar_t)` 识别为 "标量+张量" 模式并 codegen 成
+scalar-on-host kernel,prim 也被它的 decomposition 表展平到 aten 后再 fuse
+进生成 kernel。aot_eager 和我们 v2 都不带这一层 rewrite,保留了 functionalize
+后的"丑"形态。
+
+**修复方案**
+
+按收益从大到小:
+
+| 级别 | 改动 | 解决的问题 |
+|---|---|---|
+| ★ 必做 | `_capture_positional` (和 `_capture_with_backward`) 在 `trace.v2_pre_bind()` 前扫 `pre_binds`,把 device 是 cpu / dim==0 的 Tensor `.to(target_device)` | 消除每次 replay 的 H2D 同步 |
+| ★ 必做 | 给 `aot_function` / `aot_module` 调用传 `decompositions=core_aten_decompositions()` | 消除 `prims::convert_element_type` 的 Python decomposition 跳板,展开为 `aten._to_copy` 的原生 C++ kernel |
+| 中 | translator 检测 "Tensor + (kLiteral/kCapturedTensor 是 0-d scalar tensor)" 模式,rewrite 成 `aten.add.Scalar` + Scalar literal;同理 div / mul / sub / pow | 完全消除 0-d tensor placeholder,达到 v1 的 op 形态 |
+| 长期 | 在 v2 翻译器中维护"Python scalar literal 回退表":Dynamo 标记 `kCapturedConst` 的 placeholder 不走 pre-bind,直接 inline 成 Scalar IValue | 等价于把 v1 的 overload 选择能力反过来推到 v2 |
+
+`target_device` 推断策略:从 `example_args` 的第一个 Tensor 取 device,
+fallback 看 pre_binds 里第一个非 0-d Tensor 的 device。
+
+**该缺陷的诊断方法**
+
+设 `TDC_TRACE_DEBUG=1` 跑 v2,grep `Tensor(.*cpu)` 在 stack 里出现的频次:
+- 出现在用户 input / 真 Parameter 里:正常
+- 出现在 0-d 形态 `Tensor(...,[],cpu)` 里,且跟着 `prims::convert_element_type`
+  或紧邻 `aten::add.Tensor` / `aten::div.Tensor` / `aten::mul.Tensor`:就是
+  本节描述的缺陷
+
+可以作为接入新模型时的标准 sanity check。
