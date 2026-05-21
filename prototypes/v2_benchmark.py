@@ -275,6 +275,66 @@ def _v1_capture(fn, example_inputs):
     return cb
 
 
+def _export_capture(fn, example_inputs):
+    """Export fn via torch.export and return ep.module() as the callable.
+
+    torch.export captures a self-contained fx.GraphModule (Dynamo
+    bytecode trace, all params lifted to graph inputs) plus an
+    input/output spec. ep.module() returns an InterpreterModule that
+    walks the graph eagerly on each call — no Dynamo guards, no AOT
+    functionalization wrapper, but also no C++ replay. Useful to
+    isolate "graph snapshot + Python interpretation" overhead vs the
+    eager-everywhere or fully-compiled extremes.
+
+    torch.export only accepts nn.Module; wrap plain functions in a
+    thin Module. Returns None on failure (some workloads have control
+    flow torch.export refuses to spec)."""
+    try:
+        if isinstance(fn, torch.nn.Module):
+            mod = fn
+        else:
+            # torch.export needs named forward parameters to match
+            # dynamic_shapes against, so synthesize an arity-correct
+            # forward with positional names a0, a1, ... Closures over
+            # `fn` keep dispatching to the original.
+            n = len(example_inputs)
+            arg_names = [f"a{i}" for i in range(n)]
+            src = (
+                "def forward(self, " + ", ".join(arg_names) + "):\n"
+                "    return _fn(" + ", ".join(arg_names) + ")\n"
+            )
+            ns = {"_fn": fn}
+            exec(src, ns)
+            cls = type("_FnAsModule", (torch.nn.Module,), {"forward": ns["forward"]})
+            mod = cls()
+            forward_arg_names = arg_names
+        # Declare every Tensor input's dim 0 as dynamic so the export
+        # tolerates the same kind of batch variation the other backends
+        # (dynamic=True) tolerate.
+        from torch.export import Dim
+        if isinstance(fn, torch.nn.Module):
+            # Use the module's own forward signature.
+            import inspect
+            sig = inspect.signature(fn.forward)
+            forward_arg_names = [
+                n for n in sig.parameters if n != "self"
+            ][:len(example_inputs)]
+        dynamic_shapes = {}
+        for name, a in zip(forward_arg_names, example_inputs):
+            if isinstance(a, torch.Tensor) and a.dim() > 0:
+                dynamic_shapes[name] = {0: Dim.AUTO}
+            else:
+                dynamic_shapes[name] = None
+        ep = torch.export.export(
+            mod, tuple(example_inputs),
+            dynamic_shapes=dynamic_shapes,
+        )
+        return ep.module()
+    except Exception as e:
+        print(f"# export: skipping ({type(e).__name__}: {str(e)[:160]})")
+        return None
+
+
 def build_variants(fn, example_inputs):
     """Return dict of {label: callable} for fn under each mode.
 
@@ -285,6 +345,11 @@ def build_variants(fn, example_inputs):
 
     Key order here is the column order in the printed table.
     """
+    # torch.export: Dynamo bytecode trace once into a self-contained
+    # gm + spec; ep.module() interprets it on each call. May fail per
+    # workload (control flow torch.export refuses) — _export_capture
+    # then returns None, and the speed table skips that cell while
+    # keeping the column.
     return {
         "eager":     fn,
         "dynamo":    torch.compile(fn, backend="eager", dynamic=True),
@@ -294,6 +359,7 @@ def build_variants(fn, example_inputs):
         # v2 direct-replay path: capture once with example_inputs, then
         # call the resulting callable without going through Dynamo/AOT.
         "v2":        tdcv2.capture(fn, *example_inputs),
+        "export":    _export_capture(fn, example_inputs),
     }
 
 
@@ -393,6 +459,9 @@ def run_correctness_check():
         for name, callable_ in variants.items():
             if name == "eager":
                 continue
+            if callable_ is None:
+                print(f"  {label:<44} {name:<10} skipped (variant not available)")
+                continue
             if name not in _CAPTURE_MODES:
                 torch._dynamo.reset()
             with torch.no_grad():
@@ -448,19 +517,27 @@ def run_speed_table():
             raise RuntimeError(
                 f"build_variants returned different keys for workload "
                 f"'{label}': {list(variants.keys())} vs {variant_names}")
-        times = {}
+        times: dict = {}
         for name, callable_ in variants.items():
+            if callable_ is None:
+                times[name] = None
+                continue
             if name not in _CAPTURE_MODES:
                 torch._dynamo.reset()
             times[name] = time_iters(callable_, inputs)
 
-        time_strs = " ".join(f"{fmt_us(times[n]):>{col_w}}" for n in variant_names)
+        def cell(t):
+            return "    --   " if t is None else fmt_us(t)
+
+        time_strs = " ".join(f"{cell(times[n]):>{col_w}}" for n in variant_names)
         if has_eager:
             eg = times["eager"]
-            ratio_strs = " ".join(
-                f"{(times[n]/eg if eg > 0 else float('nan')):>{col_w}.2f}x"
-                for n in ratio_names
-            )
+            def ratio(n):
+                t = times[n]
+                if t is None or eg is None or eg <= 0:
+                    return "   --  "
+                return f"{(t/eg):>{col_w}.2f}x"
+            ratio_strs = " ".join(f"{ratio(n):>{col_w}}" for n in ratio_names)
             print(f"{label:<33} {time_strs} | {ratio_strs}")
         else:
             print(f"{label:<33} {time_strs}")
@@ -488,7 +565,7 @@ def _safe_filename(label):
     return "".join(c if c.isalnum() else "_" for c in label).strip("_")
 
 
-def _profile_one(label, callable_, inputs, out_path, n_warmup=50, n_iters=100):
+def _profile_one(label, callable_, inputs, out_path, n_warmup=5, n_iters=30):
     """Warmup, then profile n_iters calls; export Chrome-trace and print
     the top events. Returns the prof object for caller introspection."""
     for _ in range(n_warmup):
@@ -529,6 +606,8 @@ def run_profile(workload_label="attention QK (B=8,S=512,H=128)",
     stem = _safe_filename(workload_label)
 
     for name, callable_ in variants.items():
+        if callable_ is None:
+            continue
         _profile_one(name, callable_, inputs, f"{out_dir}/{stem}__{name}.json")
 
 
