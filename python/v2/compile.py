@@ -38,29 +38,73 @@ RecipeSpec = Union[
 ]
 
 
-def capture(fn, *example_args, allow_grad: bool = False, **example_kwargs):
+def capture(
+    fn,
+    *example_args,
+    allow_grad: bool = False,
+    wrapper: bool = True,
+    **example_kwargs,
+):
     """Run `fn(*example_args, **example_kwargs)` once through torch.compile
     to extract a Trace, then return a callable that replays the trace
-    directly with fresh args — no Dynamo/AOT machinery on the call path.
+    on fresh args.
 
-    Caller is responsible for: future args matching example_args in
-    rank/dtype/device. Sym dimensions may vary; concrete int dimensions
-    that Dynamo guarded on must stay the same.
+    `wrapper` (default True) controls how the replay callable handles
+    the AOT runtime layer:
 
-    allow_grad=True: also capture the backward graph. Requires at least
-    one example_arg to have requires_grad=True. The returned callable
-    is wrapped in torch.autograd.Function so callers can do the usual
-    `loss = captured(*args); loss.backward()` pattern.
+      - `wrapper=True`  (default): wrap the trace with
+        `torch._functorch.aot_autograd.aot_function`. The returned
+        callable goes through PyTorch's native RuntimeWrapper on every
+        call — input mutations get written back, output aliases get
+        rebuilt, the user-visible pytree is restored automatically.
+        Adds ~5-15us per call vs the bare path but matches eager
+        semantics exactly. Required for training (optimizer.step,
+        any in-place parameter / KV-cache mutation).
+
+      - `wrapper=False`: return our direct_replay callable
+        (flat_recipe + param pre-bind + id()-based output_shaper). No
+        AOT RuntimeWrapper on the call path: fastest possible per-call
+        overhead (~5-10us total) but the caller is responsible for
+        anything mutation-related. Suitable for pure inference with
+        no in-place side effects.
+
+    Caveats for `wrapper=True`:
+      - For functions closing over nn.Module parameters, aot_function
+        can't see the params and fails with a FakeTensor assertion;
+        pass the Module itself (or use wrapper=False).
+      - Models with tied weights (e.g. BERT's shared attention) hit
+        aot_module's `_reparametrize_module` tied-key error; use
+        wrapper=False for those.
+      - Combined with allow_grad=True we silently downgrade to
+        wrapper=False (aot_function carries its own autograd path).
+
+    Either way, Dynamo guards / cache / recompile are NOT on the call
+    path — the caller must guarantee future args match example_args
+    in rank/dtype/device.
+
+    `allow_grad=True`: also capture the backward graph. Requires at
+    least one example_arg with requires_grad=True. The returned
+    callable is wrapped in torch.autograd.Function. Only compatible
+    with `wrapper=False` for now (the wrapped path uses aot_function
+    which already wires up backward via its own autograd.Function).
 
     Kwargs: example_kwargs are flattened into the positional arg list
-    in declared order so the trace's recipes can address them by index.
-    The returned callable accepts the same kwarg names as fn (mixing
-    positional and kwarg-style invocation is allowed).
+    in declared order so the trace's recipes can address them by
+    index. The returned callable accepts the same kwarg names as fn
+    (mixing positional and kwarg-style invocation is allowed).
     """
+    # allow_grad uses its own torch.autograd.Function-based dual-graph
+    # path; the aot_function wrapper has its own incompatible mechanism
+    # for backward (it returns a callable that already triggers bw via
+    # autograd.Function on `.backward()`). Silently fall back to the
+    # direct path so the user doesn't have to thread two flags.
+    if allow_grad and wrapper:
+        wrapper = False
+
     # If the user only passed positional args AND fn isn't keyword-only,
     # the existing positional-only path is enough.
     if not example_kwargs:
-        return _capture_positional(fn, example_args, allow_grad)
+        return _capture_positional(fn, example_args, allow_grad, wrapper)
 
     # Mixed/kwarg path: use inspect.signature to canonicalise parameter
     # ordering so both the capture call and every later call site can
@@ -82,7 +126,7 @@ def capture(fn, *example_args, allow_grad: bool = False, **example_kwargs):
         return fn(**dict(zip(param_names, flat)))
 
     _wrapped.__name__ = getattr(fn, "__name__", "fn") + "__kwflat"
-    inner = _capture_positional(_wrapped, ordered_values, allow_grad)
+    inner = _capture_positional(_wrapped, ordered_values, allow_grad, wrapper)
 
     def call(*args, **kwargs):
         bound_call = sig.bind(*args, **kwargs)
@@ -98,10 +142,16 @@ def capture(fn, *example_args, allow_grad: bool = False, **example_kwargs):
     return call
 
 
-def _capture_positional(fn, example_args, allow_grad: bool):
+def _capture_positional(fn, example_args, allow_grad: bool, wrapper: bool = True):
     """Internal: capture path with strictly-positional example_args."""
     if allow_grad:
+        # allow_grad uses its own autograd.Function path and is
+        # incompatible with the aot_function wrapper. Callers will
+        # have hit the NotImplementedError in `capture` already.
         return _capture_with_backward(fn, example_args)
+
+    if wrapper:
+        return _capture_via_aot_wrapper(fn, example_args)
 
     # ---- inference-only path (no backward graph) ----
     captured: list = []
@@ -170,6 +220,57 @@ def _capture_positional(fn, example_args, allow_grad: bool):
     direct_replay.flat_recipe = flat_recipe      # type: ignore[attr-defined]
     direct_replay.output_shaper = output_shaper  # type: ignore[attr-defined]
     return direct_replay
+
+
+def _capture_via_aot_wrapper(fn, example_args):
+    """wrapper=True path. Hand fn to torch's aot_function / aot_module
+    so the call site goes through PyTorch's native RuntimeWrapper —
+    input mutation writeback, output alias regen, pytree unflatten
+    all come for free.
+
+    fw_compiler swaps gm.forward for trace.v2_replay so we still get
+    the C++ replay speed-up at the innermost layer; the per-call cost
+    is bare RuntimeWrapper, not Dynamo guards.
+    """
+    from torch._functorch.aot_autograd import aot_function, aot_module
+
+    captured: list = []
+
+    def grab_compiler(gm, example_inputs):
+        trace = translate_graph(gm)
+        captured.append({"trace": trace, "gm": gm})
+        def run_via_trace(*flat_args):
+            return trace.v2_replay(list(flat_args))
+        return run_via_trace
+
+    # nn.Module parameters live in closures aot_function can't trace
+    # through (FakeTensor sees the real Parameter and bails). aot_module
+    # is the dedicated entry that lifts module params/buffers as
+    # explicit graph inputs.
+    if isinstance(fn, torch.nn.Module):
+        aot_compiled = aot_module(
+            fn, fw_compiler=grab_compiler, dynamic=True)
+    else:
+        aot_compiled = aot_function(
+            fn, fw_compiler=grab_compiler, dynamic=True)
+
+    # Trigger AOT trace + RuntimeWrapper wiring. The first call also
+    # forces fw_compiler to fire, populating `captured`.
+    with torch.no_grad():
+        aot_compiled(*example_args)
+
+    if not captured:
+        raise RuntimeError(
+            "v2.capture(wrapper=True): fw_compiler was never called; "
+            "aot_function/aot_module may have graph-broken on the "
+            "example function.")
+
+    state = captured[0]
+    # Expose internals so callers can still introspect the trace even
+    # though the call path now goes through aot_function.
+    aot_compiled.trace = state["trace"]    # type: ignore[attr-defined]
+    aot_compiled.gm = state["gm"]          # type: ignore[attr-defined]
+    return aot_compiled
 
 
 def _build_output_shaper(user_visible_out, trace_out):
