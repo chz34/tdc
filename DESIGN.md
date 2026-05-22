@@ -1140,24 +1140,55 @@ scalar-on-host kernel,prim 也被它的 decomposition 表展平到 aten 后再 f
 
 **修复方案**
 
+落地中的关键认知:**这些"丑形态"在源头上都是 AOT functionalize 这一步引入
+的**。Python scalar 被 lift 成 Tensor、in-place 被改写为 slice_scatter +
+copy_ 都是 functionalize 为了让 graph 变成纯函数才做的事。Dynamo 的原始 FX
+graph 里没有这些问题(实测:Dynamo backend 直接看 gm,`x[i:j] = y` 仍是单个
+`<built-in setitem>` 节点;经 AOT functionalize 后才裂成 slice + slice_scatter
++ copy_)。
+
 按收益从大到小:
 
 | 级别 | 改动 | 解决的问题 |
 |---|---|---|
-| ★ 必做 | `_capture_positional` (和 `_capture_with_backward`) 在 `trace.v2_pre_bind()` 前扫 `pre_binds`,把 device 是 cpu / dim==0 的 Tensor `.to(target_device)` | 消除每次 replay 的 H2D 同步 |
-| ★ 必做 | 给 `aot_function` / `aot_module` 调用传 `decompositions=core_aten_decompositions()` | 消除 `prims::convert_element_type` 的 Python decomposition 跳板,展开为 `aten._to_copy` 的原生 C++ kernel |
-| 中 | translator 检测 "Tensor + (kLiteral/kCapturedTensor 是 0-d scalar tensor)" 模式,rewrite 成 `aten.add.Scalar` + Scalar literal;同理 div / mul / sub / pow | 完全消除 0-d tensor placeholder,达到 v1 的 op 形态 |
-| 长期 | 在 v2 翻译器中维护"Python scalar literal 回退表":Dynamo 标记 `kCapturedConst` 的 placeholder 不走 pre-bind,直接 inline 成 Scalar IValue | 等价于把 v1 的 overload 选择能力反过来推到 v2 |
+| ★ 已落地 | 推理路径(`_capture_positional` / `_capture_via_aot_wrapper`)给 AOT 传 **`disable_functionalization=True`** | **通用解** —— 所有 in-place op(`__setitem__` / `copy_` / `add_` / `index_put_` / `scatter_` / `fill_` ...) 都保持原貌,不再被 functionalize 翻成 `<functional op> + copy_(input, result)` 形态。LLaMA KV cache 的 slice_scatter 直接消失,trace op 数显著下降。 |
+| ★ 已落地 | `_capture_positional` / `_capture_with_backward` 在 `trace.v2_pre_bind()` 前扫 `pre_binds`,把 device 是 cpu / dim==0 的 Tensor `.to(target_device)` (`_promote_scalar_pre_binds_to_device`) | 消除 RMSNorm / attention scale 的 CPU 标量在每次 replay 触发的 H2D 同步。 |
+| ★ 已落地 | translator pre-translate FX pass(`_rewrite_prims_in_gm`)将 `prims.convert_element_type` 重写为 `aten._to_copy` | 消除 prim 的 Python decomposition 跳板;同 dtype 的 no-op 转换在 capture 时直接被折叠掉。 |
+| ◯ 兜底 | `_rewrite_slice_scatter_to_inplace` FX pass | 仅在 backward 路径(`allow_grad=True`)生效 —— autograd 的 partition_fn 要求纯函数图,不能 disable_functionalization,所以那条路仍然会出现 slice_scatter。 |
+| 中 | translator 检测 "Tensor + (kLiteral/kCapturedTensor 是 0-d scalar tensor)" 模式,rewrite 成 `aten.add.Scalar` + Scalar literal;同理 div / mul / sub / pow | 完全消除 0-d tensor placeholder,达到 v1 的 op 形态。device-promote 之后这个的边际收益变小,优先级降。 |
+| 长期 | 在 v2 翻译器中维护"Python scalar literal 回退表":Dynamo 标记 `kCapturedConst` 的 placeholder 不走 pre-bind,直接 inline 成 Scalar IValue | 等价于把 v1 的 overload 选择能力反过来推到 v2。 |
 
-`target_device` 推断策略:从 `example_args` 的第一个 Tensor 取 device,
-fallback 看 pre_binds 里第一个非 0-d Tensor 的 device。
+**为什么 disable_functionalization 是真正的通用解,而 inductor 选了打补丁**
+
+Inductor 的 `auto_functionalized_v2` 走的是"全 functionalize → 再 pattern
+match 还原"的路径。原因是 inductor 后端 codegen 对纯函数 IR 有强依赖
+(CSE、buffer 复用、kernel fusion 都基于"边是 SSA value"的假设)。所以
+inductor 不能 disable functionalize,只能事后挨个 pattern 还原。
+
+**v2.capture 的目标不是 codegen,只是 replay**。我们要的就是"用户写了什么
+op 我就跑什么 op",in-place 保持 in-place,view 保持 view 关系。这种场景下
+disable functionalize 不仅可行,而且**消除了一整类需要后续打补丁的根源问题**。
+
+**禁用 functionalize 的边界**
+
+| 场景 | functionalize | 原因 |
+|---|---|---|
+| 推理(`allow_grad=False`,wrapper True/False) | 关 | 没有反向传播需求,纯函数 IR 不是必要 |
+| 训练(`allow_grad=True`) | 开 | AOTAutograd 的 partition_fn 要求纯函数图来切分 fw/bw |
+
+backward 路径仍然保留 `_rewrite_slice_scatter_to_inplace` 作为兜底,等到训练
+场景的 KV cache 真的成为热点再说(目前训练通常 batch 大、host overhead 占比
+小,优先级低)。
 
 **该缺陷的诊断方法**
 
-设 `TDC_TRACE_DEBUG=1` 跑 v2,grep `Tensor(.*cpu)` 在 stack 里出现的频次:
-- 出现在用户 input / 真 Parameter 里:正常
-- 出现在 0-d 形态 `Tensor(...,[],cpu)` 里,且跟着 `prims::convert_element_type`
-  或紧邻 `aten::add.Tensor` / `aten::div.Tensor` / `aten::mul.Tensor`:就是
-  本节描述的缺陷
+设 `TDC_TRACE_DEBUG=1` 跑 v2:
+
+| 看到 | 含义 |
+|---|---|
+| `slice_scatter` 出现在 trace 里(且 wrapper=False / wrapper=True 推理路径) | 不应该发生 —— disable_functionalization 没生效。检查 AOT 版本对 kwarg 的支持。 |
+| `Tensor(...,[],cpu)` 出现在 `add.Tensor` / `div.Tensor` 等 op 的 stack 里 | device-promote 没覆盖到 —— 可能是 0-d 之外的 cpu tensor,或者 target device 推断失败。 |
+| `prims::*` 出现在 trace 里 | `_rewrite_prims_in_gm` 没覆盖到此 prim,加规则。 |
+| `aten::copy_` 紧邻 `slice` 出现 | 这是**正确的 in-place 写**,跟 eager 一致,**不要去除**。 |
 
 可以作为接入新模型时的标准 sanity check。

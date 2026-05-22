@@ -41,27 +41,24 @@ def _rewrite_slice_scatter_to_inplace(gm: fx.GraphModule) -> fx.GraphModule:
         slice_view = slice(t, dim, start, end, step)
         copy_(slice_view, val)
 
+    The primary mitigation for this problem now lives in the AOT
+    call: inference paths pass `disable_functionalization=True` so
+    in-place mutations stay as in-place ops in the captured graph
+    and slice_scatter never appears (DESIGN.md §17.6.9). This pass
+    is the *fallback* for the backward path (allow_grad=True), where
+    autograd's partition_fn requires a pure-functional graph and
+    we can't disable functionalize. It's also harmless on inference
+    graphs that have no slice_scatter -- it just walks the graph
+    and finds nothing.
+
     Why: LLaMA / GPT-style decoders write into a KV cache via
-    `cache_k[:, start:end] = xk`. AOT functionalize transforms this
-    into `slice + slice_scatter`, which **allocates a full-size new
-    cache_k and memcpy's the unchanged portion** every replay -- on
-    a [64, 1024, 8, 64] cache (128 MB), that's 128 MB of pointless
-    copy per layer per replay. 8 layers x 2 (K+V) = 2 GB of memory
-    bandwidth wasted per replay (DESIGN.md §17.6.9 quantifies this
-    as ~17ms NPU device time vs eager's ~8ms).
-
-    keep_inference_input_mutations=True alone doesn't help -- it just
-    appends a final copy_(t, slice_scatter_result), so we now do TWO
-    full-tensor memcpys per cache update (the scatter + the writeback).
-
-    Inductor handles this via its `auto_functionalized_v2` pattern
-    matcher at lowering time. For non-inductor paths (us, aot_eager)
-    we need the same rewrite ourselves. This pass detects the exact
-    `slice_scatter -> copy_(base, scatter_result)` pair that AOT
-    emits and replaces it with `slice(base, ...) -> copy_(view, val)`,
-    matching eager's in-place behavior. Other consumers of the
-    slice_scatter result are rewired to read from `base` directly
-    (which is the base tensor's post-mutation value).
+    `cache_k[:, start:end] = xk`. With functionalize on, AOT
+    transforms this into `slice + slice_scatter`, which **allocates
+    a full-size new cache_k and memcpy's the unchanged portion** --
+    on a [64, 1024, 8, 64] cache (128 MB), that's 128 MB of pointless
+    copy per layer per replay. The rewrite restores eager's in-place
+    behavior. Other consumers of the slice_scatter result are
+    rewired to read from `base` directly (post-mutation value).
     """
     slice_op = torch.ops.aten.slice.Tensor
     slice_scatter_op = torch.ops.aten.slice_scatter.default
@@ -426,13 +423,19 @@ def _capture_positional(fn, example_args, allow_grad: bool, wrapper: bool = True
             fn,
             backend=aot_autograd(
                 fw_compiler=grab_compiler,
-                # Inference-only: keep `x[..] = y` style buffer mutations
-                # (e.g. KV-cache writes in transformer decoders) as
-                # aten::copy_ / index_put_ instead of letting AOT
-                # functionalize them into slice + slice_scatter, which
-                # would force a full kv_cache realloc + memcpy of the
-                # unchanged portion every replay. See DESIGN.md §17.6.9.
-                keep_inference_input_mutations=True,
+                # Inference path: skip AOT functionalize entirely. AOT
+                # still decomposes Dynamo's high-level Python ops
+                # (__setitem__, etc.) to core aten and adds sym_size
+                # for dynamic shape, but leaves user-written in-place
+                # mutations (aten.copy_, aten.add_, aten.index_put_,
+                # aten.scatter_, ...) as in-place ops -- avoiding the
+                # entire class of "functional copy + slice_scatter +
+                # writeback" patterns that would force ~MB-scale
+                # tensor reallocation per replay. Inductor handles
+                # the same problem via auto_functionalized_v2 pattern
+                # matching; we sidestep it by not creating the patterns
+                # in the first place. See DESIGN.md §17.6.9.
+                disable_functionalization=True,
             ),
             dynamic=True,
         )
@@ -581,15 +584,19 @@ def _capture_via_aot_wrapper(fn, example_args):
         closure_mods = _scan_closure_modules(fn)
         target = _ClosureModuleShim(fn, closure_mods) if closure_mods else None
 
+    # Same disable_functionalization rationale as _capture_positional
+    # (see DESIGN.md §17.6.9). Inference-only; the backward path
+    # (_capture_with_backward) keeps functionalize on because
+    # autograd's partition_fn requires a pure-functional graph.
     if target is not None:
         aot_compiled = aot_module(
             target, fw_compiler=grab_compiler, dynamic=True,
-            keep_inference_input_mutations=True,
+            disable_functionalization=True,
         )
     else:
         aot_compiled = aot_function(
             fn, fw_compiler=grab_compiler, dynamic=True,
-            keep_inference_input_mutations=True,
+            disable_functionalization=True,
         )
 
     # Trigger AOT trace + RuntimeWrapper wiring. The first call also
