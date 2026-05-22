@@ -103,6 +103,60 @@ class TestV2Capture(unittest.TestCase):
             self.assertEqual(out.shape, ref.shape)
             self.assertTrue(torch.allclose(out, ref))
 
+    def test_varied_python_int_arg(self):
+        """A plain Python int positional arg must be routed at every
+        replay, not frozen at capture. The LLaMA KV-cache pattern
+        cache[:, start:start+seqlen] = x relies on this: capture sees
+        start_pos=0, but the user calls with start_pos=8, 17, ... and
+        v2 has to thread the new value through.
+
+        Pre-fix: _build_recipe_specs put non-shape SymInts into pre_binds
+        and the captured value (e.g. 0) was used on every replay --
+        silently wrong outputs. Fix routes such SymInts as ("I", arg_idx)
+        runtime specs that read args[i] at call time."""
+        def fn(x, idx):
+            buf = torch.zeros(2, 32)
+            buf[:, idx : idx + x.shape[1]] = x
+            return buf.clone()
+
+        x = torch.randn(2, 4)
+        # wrapper=False: the aot_module path (wrapper=True) has a
+        # separate, unfixed problem with non-Tensor scalar args (AOT
+        # without Dynamo inlines them as literals and leaves an
+        # orphan placeholder); routing fix here covers the
+        # Dynamo path only.
+        captured = tdcv2.capture(fn, x, 0, wrapper=False)
+
+        for idx in (0, 4, 8, 17, 28):
+            ref = fn(x, idx)
+            out = captured(x, idx)
+            self.assertEqual(out.shape, ref.shape)
+            self.assertTrue(torch.allclose(out, ref),
+                            f"idx={idx} mismatch: max diff "
+                            f"{(out-ref).abs().max().item():.3e}")
+
+    def test_varied_int_and_varied_shape_together(self):
+        """Combine the two flavours of dynamic-spec routing: a Python
+        int arg AND a tensor with varying shape, in the same call.
+        Catches any interference between the user_scalar_queue and the
+        shape-SymInt routing in _build_recipe_specs."""
+        def fn(x, k):
+            return x[:k] * 2.0
+
+        x = torch.randn(8, 5)
+        captured = tdcv2.capture(fn, x, 3, wrapper=False)
+
+        for k in (1, 2, 3, 5, 7):
+            for shape in [(8, 5), (12, 5), (6, 5)]:
+                x = torch.randn(*shape)
+                if k > x.shape[0]:
+                    continue
+                ref = x[:k] * 2.0
+                out = captured(x, k)
+                self.assertEqual(out.shape, ref.shape)
+                self.assertTrue(torch.allclose(out, ref),
+                                f"k={k}, shape={shape} mismatch")
+
 
 if __name__ == "__main__":
     unittest.main()

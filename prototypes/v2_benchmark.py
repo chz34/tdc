@@ -432,7 +432,13 @@ def _export_capture(fn, example_inputs):
         dynamic_shapes = {}
         for name, a in zip(forward_arg_names, example_inputs):
             if isinstance(a, torch.Tensor) and a.dim() > 0:
-                dynamic_shapes[name] = {0: Dim.AUTO}
+                # Declare every dim as Dim.AUTO so export matches the
+                # dynamic=True behaviour the other backends use. AUTO
+                # specialises on constant dims and leaves varied dims
+                # symbolic, so this is strictly more permissive than
+                # the {0: Dim.AUTO} variant we used to set -- needed
+                # for dynamic-S workloads where dim 1 (seqlen) varies.
+                dynamic_shapes[name] = {i: Dim.AUTO for i in range(a.dim())}
             else:
                 dynamic_shapes[name] = None
         ep = torch.export.export(
@@ -822,4 +828,13 @@ if __name__ == "__main__":
     print(f"# modes: {' / '.join(_names)}")
     run_correctness_check()
     run_speed_table()
+    # Dynamic-shape suite lives in its own file so it can be run
+    # standalone; import lazily here to avoid a circular import
+    # (dynamic_benchmark imports primitives from this module at load).
+    from dynamic_benchmark import (
+        run_dynamic_correctness_check,
+        run_dynamic_speed_table,
+    )
+    run_dynamic_correctness_check()
+    run_dynamic_speed_table()
     run_profile(list(WORKLOADS)[-1])

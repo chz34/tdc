@@ -44,12 +44,57 @@ from .translator import translate_graph
 #
 #   ("T", user_arg_idx)            : Tensor placeholder
 #   ("S", user_arg_idx, dim)       : SymInt from a Tensor's shape
+#   ("I", user_arg_idx)            : Python scalar (int / bool) the user
+#                                    passed as a positional arg. Dynamo
+#                                    lifts it as a SymInt placeholder
+#                                    that flows into shape arith, slice
+#                                    bounds, etc. -- so a fresh call
+#                                    value must be plumbed through, not
+#                                    frozen at capture time.
 #   ("L", value)                   : literal (closure constant or concrete int)
 RecipeSpec = Union[
-    Tuple[str, int],         # ("T", i)
+    Tuple[str, int],         # ("T", i) / ("I", i)
     Tuple[str, int, int],    # ("S", i, d)
     Tuple[str, Any],         # ("L", value)
 ]
+
+
+def _check_no_python_scalar_args_for_wrapper(example_args, example_kwargs):
+    """Raise if any example arg is a Python scalar (int / bool / float).
+
+    Under wrapper=True we hand `fn` to aot_module/aot_function directly,
+    bypassing Dynamo. AOT bakes Python scalars into the FX graph as
+    literals at trace time; the corresponding placeholder is left with
+    num_users=0 and meta['val']=None, so any value the user passes at
+    replay is silently discarded. We refuse rather than capture into a
+    silently-wrong trace.
+
+    Tensor inputs (including 0-d / scalar tensors) are always fine.
+    """
+    def _bad_arg_iter():
+        for i, a in enumerate(example_args):
+            if not isinstance(a, torch.Tensor) and isinstance(a, (int, float)):
+                # bool is a subclass of int; covered by the above.
+                yield (f"positional arg #{i}", a)
+        for k, v in example_kwargs.items():
+            if not isinstance(v, torch.Tensor) and isinstance(v, (int, float)):
+                yield (f"keyword arg {k!r}", v)
+
+    bad = list(_bad_arg_iter())
+    if not bad:
+        return
+    details = "; ".join(f"{loc}={v!r}" for loc, v in bad)
+    raise RuntimeError(
+        "v2.capture(wrapper=True): refusing to capture because the "
+        "example args include Python scalar(s) that aot_module would "
+        "bake as literals -- subsequent calls with different values "
+        "would silently return stale results.\n"
+        f"  Offending args: {details}\n"
+        "  Fix: pass wrapper=False (Dynamo path) which routes scalar "
+        "args through a runtime spec, so they can vary at every replay. "
+        "If you genuinely want the scalar frozen at capture, wrap it as "
+        "a closure constant (move it out of the forward signature)."
+    )
 
 
 def capture(
@@ -117,6 +162,19 @@ def capture(
     # direct path so the user doesn't have to thread two flags.
     if allow_grad and wrapper:
         wrapper = False
+
+    # wrapper=True traces through aot_module/aot_function WITHOUT
+    # Dynamo. Without Dynamo's int-sym-ification, every Python scalar
+    # arg (start_pos, mask flags, ...) gets baked into the graph as a
+    # literal at capture time -- and the corresponding placeholder
+    # becomes an orphan (num_users=0, meta['val'] is None). Calling
+    # with a different scalar value silently uses the captured one.
+    # Refuse the capture loudly so users can't be bitten by this.
+    # The Dynamo-driven path (wrapper=False) handles scalar args
+    # correctly via ("I", arg_idx) runtime specs in
+    # _build_recipe_specs.
+    if wrapper:
+        _check_no_python_scalar_args_for_wrapper(example_args, example_kwargs)
 
     # If the user only passed positional args AND fn isn't keyword-only,
     # the existing positional-only path is enough.
@@ -774,6 +832,21 @@ def _build_recipe_specs(
         if isinstance(a, torch.Tensor)
     }
 
+    # Positional indices of Python scalar args (int / bool) the user
+    # passed. Under Dynamo+dynamic=True these get lifted as SymInt
+    # placeholders that participate in shape arith / slice bounds; we
+    # need to route a fresh value at every replay, not freeze the
+    # capture-time value. Consumed positionally (Dynamo preserves
+    # user-arg relative order in the placeholder list) and matched via
+    # value as a sanity check. Note: bool subclasses int in Python, so
+    # this covers both. Floats are not lifted by Dynamo into the
+    # captured graph in any way that varies the kernel call, so we
+    # don't include them.
+    user_scalar_queue: List[int] = [
+        i for i, a in enumerate(example_args)
+        if isinstance(a, int) and not isinstance(a, torch.Tensor)
+    ]
+
     # Pre-pass: classify each placeholder as user-input vs param/other.
     is_user_input: List[bool] = []
     for ph_idx, n in enumerate(placeholders):
@@ -832,12 +905,37 @@ def _build_recipe_specs(
         elif isinstance(val, torch.SymInt):
             key = str(val.node.expr)
             if key in symbol_source:
+                # SymInt derived from a user-input Tensor's shape.
                 ua_idx, dim = symbol_source[key]
                 runtime_specs.append(("S", ua_idx, dim))
+            elif (user_scalar_queue
+                  and observed_args[ph_idx] == example_args[user_scalar_queue[0]]):
+                # SymInt that maps to the next user-passed Python int.
+                # Value-equality with the queue head + positional order
+                # gives a stable mapping under Dynamo's arg-lifting:
+                # shape SymInts are lifted before scalar arg SymInts,
+                # and within each group the original positional order
+                # is preserved. The == check guards against the
+                # (theoretical) reorder.
+                user_idx = user_scalar_queue.pop(0)
+                runtime_specs.append(("I", user_idx))
+                # Intentionally NOT added to ph_to_user_input: that map
+                # routes bw outputs back to user-input GRADs, and ints
+                # don't carry grads.
             else:
+                # No matching user scalar -- it's a Dynamo-specialised
+                # closure constant or similar. Pre-bind it as before.
                 pre_binds.append((ph_idx, observed_args[ph_idx]))
         elif isinstance(val, int):
-            pre_binds.append((ph_idx, val))
+            # Concrete int placeholder (non-dynamic compile, or AOT
+            # specialised the int). Same routing as the SymInt branch:
+            # map to a user scalar if value matches, else pre-bind.
+            if (user_scalar_queue
+                    and val == example_args[user_scalar_queue[0]]):
+                user_idx = user_scalar_queue.pop(0)
+                runtime_specs.append(("I", user_idx))
+            else:
+                pre_binds.append((ph_idx, val))
         else:
             raise RuntimeError(
                 f"v2.capture: unsupported placeholder val type "
@@ -875,9 +973,16 @@ def _compile_flat_recipe(specs: List[RecipeSpec]) -> Callable[..., list]:
             expr_parts.append(f"args[{spec[1]}]")
         elif spec[0] == "S":
             expr_parts.append(f"args[{spec[1]}].size({spec[2]})")
+        elif spec[0] == "I":
+            # Same expression as T but the underlying slot in the trace
+            # is an int slot, not a tensor slot -- routing is set up
+            # in translator._translate_placeholder based on the FX
+            # node's meta['val'] type. flat_recipe just writes the
+            # value; the trace knows where it goes.
+            expr_parts.append(f"args[{spec[1]}]")
         else:
             raise AssertionError(
-                f"flat_recipe only handles T/S specs after pre-bind extraction; "
+                f"flat_recipe only handles T/S/I specs after pre-bind extraction; "
                 f"got {spec!r}")
 
     if not expr_parts:

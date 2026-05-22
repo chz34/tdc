@@ -91,8 +91,34 @@ class TestV2InPlaceMutation(unittest.TestCase):
     def test_kv_cache_slice_assign_wrapper_false(self):
         self._check_kv_cache_module(wrapper=False)
 
-    def test_kv_cache_slice_assign_wrapper_true(self):
-        self._check_kv_cache_module(wrapper=True)
+    def test_kv_cache_slice_assign_wrapper_true_rejects_int_arg(self):
+        """wrapper=True path goes through aot_module without Dynamo,
+        so a Python int arg (start_pos) would be baked as a graph
+        literal and varying it across calls would silently return
+        stale results. v2.capture refuses up front instead of
+        capturing a silently-wrong trace.
+
+        Users wanting the KV-cache pattern under v2 must pick
+        wrapper=False (Dynamo path) which routes the int via ("I",
+        arg_idx) runtime specs."""
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("cache", torch.zeros(2, 16, 4, 8))
+
+            def forward(self, x, start_pos):
+                seqlen = x.shape[1]
+                self.cache[:, start_pos:start_pos + seqlen] = x
+                return self.cache[:, :start_pos + seqlen].clone()
+
+        m_v2 = M().eval()
+        x = torch.randn(2, 4, 4, 8)
+        with self.assertRaises(RuntimeError) as ctx:
+            tdcv2.capture(m_v2, x, 2, wrapper=True)
+        # Message should mention wrapper=True and offer the fix.
+        msg = str(ctx.exception)
+        self.assertIn("wrapper=True", msg)
+        self.assertIn("wrapper=False", msg)
 
     # ---- Repeated calls accumulate state -----------------------------
 
