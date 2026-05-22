@@ -24,6 +24,7 @@ import os
 import sys
 import time
 import traceback
+import io
 
 import torch
 import torch.nn.functional as F
@@ -130,6 +131,89 @@ class TransformerBlock(nn.Module):
         return x + h2
 
 
+class LlamaAttentionWithKVCache(nn.Module):
+    """Self-attention block lifted from torchbench's LLaMA reference
+    (torchbenchmark/models/llama/model.py:Attention), reduced to the
+    KV-cache-relevant essentials so the workload exercises the exact
+    pattern v2's slice_scatter rewrite targets.
+
+    Each forward:
+      1. Q/K/V projection
+      2. ★ KV cache write:
+            self.cache_k[:bsz, start_pos:start_pos+seqlen] = xk
+            self.cache_v[:bsz, start_pos:start_pos+seqlen] = xv
+         AOT functionalize rewrites this as
+            slice + copy + slice_scatter + (copy_ writeback)
+         which without our rewrite would alloc + memcpy a fresh
+         [max_batch, max_seq, n_heads, head_dim] tensor every step.
+      3. ★ KV cache read for the current context:
+            keys   = self.cache_k[:bsz, : start_pos+seqlen]
+            values = self.cache_v[:bsz, : start_pos+seqlen]
+         Dynamic-shape slice that grows with start_pos.
+      4. Scaled dot-product attention (no mask; the upstream model
+         also disables mask for shape compatibility), then output
+         projection.
+
+    Differences from the upstream Attention (intentional, to keep
+    the workload focused on cache-pattern perf):
+      - No rotary embedding (apply_rotary_emb pulls in complex tensor
+        ops that aren't on the hot path we're measuring).
+      - No type_as round-trip in softmax (this is an fp32 path here).
+      - cache_k/cache_v as register_buffer instead of plain attrs
+        so dynamo/aot lift them via the buffer-input path.
+
+    What the workload validates:
+      - Correctness of the slice_scatter -> slice + copy_ rewrite.
+      - End-to-end speedup on a workload dominated by the rewritten
+        pattern (the per-step cost ratio of cache update vs matmul
+        is fairly close, so the rewrite should be visible).
+    """
+
+    def __init__(self, dim: int, n_heads: int, max_batch: int, max_seq: int):
+        super().__init__()
+        if dim % n_heads != 0:
+            raise ValueError("dim must be divisible by n_heads")
+        self.dim = dim
+        self.n_heads = n_heads
+        self.head_dim = dim // n_heads
+        self.scale = 1.0 / (self.head_dim ** 0.5)
+        self.wq = nn.Linear(dim, dim, bias=False)
+        self.wk = nn.Linear(dim, dim, bias=False)
+        self.wv = nn.Linear(dim, dim, bias=False)
+        self.wo = nn.Linear(dim, dim, bias=False)
+        self.register_buffer(
+            "cache_k", torch.zeros(max_batch, max_seq, n_heads, self.head_dim)
+        )
+        self.register_buffer(
+            "cache_v", torch.zeros(max_batch, max_seq, n_heads, self.head_dim)
+        )
+
+    def forward(self, x: torch.Tensor, start_pos: int) -> torch.Tensor:
+        bsz, seqlen, _ = x.shape
+
+        xq = self.wq(x).view(bsz, seqlen, self.n_heads, self.head_dim)
+        xk = self.wk(x).view(bsz, seqlen, self.n_heads, self.head_dim)
+        xv = self.wv(x).view(bsz, seqlen, self.n_heads, self.head_dim)
+
+        # KV cache update.
+        self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
+        self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
+
+        # KV cache read.
+        keys = self.cache_k[:bsz, : start_pos + seqlen]
+        values = self.cache_v[:bsz, : start_pos + seqlen]
+
+        # Scaled dot-product attention.
+        xq = xq.transpose(1, 2)
+        keys = keys.transpose(1, 2)
+        values = values.transpose(1, 2)
+        scores = torch.matmul(xq, keys.transpose(2, 3)) * self.scale
+        scores = torch.softmax(scores, dim=-1)
+        out = torch.matmul(scores, values)
+        out = out.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
+        return self.wo(out)
+
+
 def _rand(*shape):
     return torch.randn(*shape, device=DEVICE)
 
@@ -184,6 +268,13 @@ def _build_transformer_block(hidden, n_heads, ffn_inner):
     return TransformerBlock(hidden, n_heads, ffn_inner).to(DEVICE).eval()
 
 
+def _build_llama_attention(dim, n_heads, max_batch, max_seq):
+    """Instantiate a LlamaAttentionWithKVCache on DEVICE in eval mode."""
+    return LlamaAttentionWithKVCache(
+        dim, n_heads, max_batch, max_seq
+    ).to(DEVICE).eval()
+
+
 WORKLOADS = {
     "tiny (view+floordiv)":            (workload_tiny,      (_rand(8, 6),)),
     "pointwise (small 64x64)":         (workload_pointwise, (_rand(64, 64), _rand(64, 64))),
@@ -199,6 +290,17 @@ WORKLOADS = {
     "Transformer block (B=2,S=128,H=256,Hi=1024)": (
         _build_transformer_block(hidden=256, n_heads=8, ffn_inner=1024),
         (_rand(2, 128, 256),),
+    ),
+    # LLaMA-style attention with KV cache write+read. Specifically
+    # crafted to exercise the slice_scatter rewrite path (see
+    # compile.py:_rewrite_slice_scatter_to_inplace and DESIGN.md
+    # §17.6.9). The cache is sized [max_batch=4, max_seq=128, ...]
+    # = ~1MB so the rewrite's payoff is measurable but the workload
+    # stays quick. start_pos=4 leaves room for the read slice
+    # cache_k[:, :start_pos+seqlen] to grow with each retrace.
+    "LLaMA attn KV (B=2,S=32,dim=256,maxS=128)": (
+        _build_llama_attention(dim=256, n_heads=8, max_batch=4, max_seq=128),
+        (_rand(2, 32, 256), 4),
     ),
     # torchvision-direct: weights frozen at capture via v2.capture's
     # param-snapshot path.
@@ -391,10 +493,10 @@ def time_iters(callable_, inputs, n_warmup=10, n_iters=100):
     try:
         for _ in range(n_warmup):
             callable_(*inputs)
+            SYNC()
     except Exception:
         traceback.print_exc()
         return None
-    SYNC()
     samples = []
     for _ in range(n_iters):
         t0 = time.perf_counter()
@@ -519,10 +621,20 @@ def run_speed_table():
     Ratio columns relative to 'eager' are appended for every non-eager
     mode that's present. If 'eager' is not in the variant set, the
     ratio block is omitted entirely.
+
+    Errors during variant construction or timing are captured silently
+    and printed after the complete table so tracebacks never interrupt
+    the table layout.
     """
     # Discover the column structure once from a representative workload.
     sample_fn, sample_inputs = next(iter(WORKLOADS.values()))
-    sample_variants = build_variants(sample_fn, sample_inputs)
+    error_buf = io.StringIO()
+    orig_stderr = sys.stderr
+    sys.stderr = error_buf
+    try:
+        sample_variants = build_variants(sample_fn, sample_inputs)
+    finally:
+        sys.stderr = orig_stderr
     variant_names = list(sample_variants.keys())
     has_eager = "eager" in variant_names
     ratio_names = [n for n in variant_names if n != "eager"] if has_eager else []
@@ -535,19 +647,17 @@ def run_speed_table():
     else:
         header = f"{'workload':<33} {time_header}"
 
-    print(f"\n{header}")
-    sub = "(times in us"
-    if ratio_header:
-        sub += "; ratios relative to eager)"
-    else:
-        sub += ")"
-    print(sub)
-    print("-" * len(header))
+    # Collect all rows and errors first, then print everything together.
+    rows: list[tuple[str, dict]] = []  # (label, times)
 
     for label, (fn, inputs) in WORKLOADS.items():
         torch._dynamo.reset()
-        variants = build_variants(fn, inputs)
-        # Sanity: schema is expected to be stable across workloads.
+        orig_stderr = sys.stderr
+        sys.stderr = error_buf
+        try:
+            variants = build_variants(fn, inputs)
+        finally:
+            sys.stderr = orig_stderr
         if list(variants.keys()) != variant_names:
             raise RuntimeError(
                 f"build_variants returned different keys for workload "
@@ -559,8 +669,24 @@ def run_speed_table():
                 continue
             if name not in _CAPTURE_MODES:
                 torch._dynamo.reset()
-            times[name] = time_iters(callable_, inputs)
+            sys.stderr = error_buf
+            try:
+                times[name] = time_iters(callable_, inputs)
+            finally:
+                sys.stderr = orig_stderr
+        rows.append((label, times))
 
+    # Print the full table.
+    print(f"\n{header}")
+    sub = "(times in us"
+    if ratio_header:
+        sub += "; ratios relative to eager)"
+    else:
+        sub += ")"
+    print(sub)
+    print("-" * len(header))
+
+    for label, times in rows:
         def cell(t):
             return "     N/A" if t is None else fmt_us(t)
 
@@ -576,6 +702,14 @@ def run_speed_table():
             print(f"{label:<33} {time_strs} | {ratio_strs}")
         else:
             print(f"{label:<33} {time_strs}")
+
+    # Dump any errors captured during variant construction or timing.
+    errors = error_buf.getvalue()
+    if errors:
+        print(f"\n{'='*78}")
+        print("Errors during benchmark:")
+        print(f"{'='*78}")
+        print(errors)
 
 
 # ---------------------------------------------------------------------------
@@ -593,6 +727,8 @@ def _profile_activities():
         acts.append(ProfilerActivity.MPS)
     elif DEVICE.type == "privateuseone" and hasattr(ProfilerActivity, "PrivateUse1"):
         acts.append(ProfilerActivity.PrivateUse1)
+    elif DEVICE.type == "npu" and hasattr(ProfilerActivity, "NPU"):
+        acts.append(ProfilerActivity.NPU)
     return acts
 
 
@@ -605,7 +741,7 @@ def _profile_one(label, callable_, inputs, out_path, n_warmup=5, n_iters=30):
     the top events. Returns the prof object for caller introspection."""
     for _ in range(n_warmup):
         callable_(*inputs)
-    SYNC()
+        SYNC()
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with profile(
@@ -615,7 +751,7 @@ def _profile_one(label, callable_, inputs, out_path, n_warmup=5, n_iters=30):
     ) as prof:
         for _ in range(n_iters):
             callable_(*inputs)
-        SYNC()
+            SYNC()
     prof.export_chrome_trace(out_path)
 
     sort_key = "self_cuda_time_total" if DEVICE.type == "cuda" else "self_cpu_time_total"

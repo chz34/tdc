@@ -66,56 +66,150 @@ def _rewrite_slice_scatter_to_inplace(gm: fx.GraphModule) -> fx.GraphModule:
     slice_op = torch.ops.aten.slice.Tensor
     slice_scatter_op = torch.ops.aten.slice_scatter.default
     copy_inplace_op = torch.ops.aten.copy_.default
+
+    # AOT often emits *nested* slice_scatter for multi-dim assignments
+    # like `cache_k[:bsz, start:end] = val`:
+    #     outer_ss = slice_scatter(arg, inner_ss, outer_dim_args)
+    #     inner_ss = slice_scatter(slice(arg, outer), copy, inner_dim_args)
+    #     copy_(arg, outer_ss)
+    # One pass eliminates only the outer scatter. After that, the
+    # remaining copy_ has form (inner_slice_view, inner_ss) which
+    # matches pattern 2; the next iteration eliminates the inner
+    # scatter. Loop until no more rewrites fire.
+    any_changed = False
+    while True:
+        changed = _rewrite_slice_scatter_pass(
+            gm, slice_op, slice_scatter_op, copy_inplace_op,
+        )
+        any_changed = any_changed or changed
+        if not changed:
+            break
+    if any_changed:
+        gm.graph.lint()
+        gm.recompile()
+    return gm
+
+
+def _rewrite_slice_scatter_pass(
+    gm: fx.GraphModule,
+    slice_op,
+    slice_scatter_op,
+    copy_inplace_op,
+) -> bool:
+    """One pass of the slice_scatter rewrite. Returns True if any
+    rewrite was applied. Caller wraps with a fixed-point loop."""
+
+    def _ss_inner_args(src):
+        a = list(src.args) + [None] * (6 - len(src.args))
+        kw = dict(src.kwargs)
+        return (
+            a[1],
+            a[2] if a[2] is not None else kw.get("dim", 0),
+            a[3] if a[3] is not None else kw.get("start", None),
+            a[4] if a[4] is not None else kw.get("end", None),
+            a[5] if a[5] is not None else kw.get("step", 1),
+        )
+
+    def _is_slice_node(n):
+        return (
+            isinstance(n, fx.Node)
+            and n.op == "call_function"
+            and n.target is slice_op
+        )
+
+    def _slice_normalized(n):
+        """Return (base, dim, start, end, step) with schema defaults
+        applied so two semantically equivalent slice nodes match even
+        if one omits trailing args."""
+        a = list(n.args)
+        kw = dict(n.kwargs)
+        base = a[0]
+        tail = a[1:] + [None] * (4 - len(a[1:]))
+        return (
+            base,
+            tail[0] if tail[0] is not None else kw.get("dim", 0),
+            tail[1] if tail[1] is not None else kw.get("start", None),
+            tail[2] if tail[2] is not None else kw.get("end", None),
+            tail[3] if tail[3] is not None else kw.get("step", 1),
+        )
+
+    def _equivalent_slice(a, b):
+        if not (_is_slice_node(a) and _is_slice_node(b)):
+            return False
+        na = _slice_normalized(a)
+        nb = _slice_normalized(b)
+        # Compare base by identity, the rest by equality (literals or
+        # identical FX-node refs).
+        return na[0] is nb[0] and na[1:] == nb[1:]
+
     changed = False
     for node in list(gm.graph.nodes):
-        # Pattern: copy_(base, slice_scatter(base, val, dim, start, end, step), ...)
         if not (node.op == "call_function" and node.target is copy_inplace_op):
             continue
         if len(node.args) < 2:
             continue
-        base, src = node.args[0], node.args[1]
+        copy_dst = node.args[0]
+        src = node.args[1]
         if not (isinstance(src, fx.Node)
                 and src.op == "call_function"
                 and src.target is slice_scatter_op):
             continue
-        if src.args[0] is not base:
-            continue
-        # slice_scatter signature:
-        #   (Tensor self, Tensor src, int dim=0, SymInt? start=None,
-        #    SymInt? end=None, SymInt step=1)
-        # AOT often omits trailing default args; merge them in.
-        ss_args = list(src.args) + [None] * (6 - len(src.args))
-        ss_kw = dict(src.kwargs)
-        ss_val = ss_args[1]
-        ss_dim = ss_args[2] if ss_args[2] is not None else ss_kw.get("dim", 0)
-        ss_start = ss_args[3] if ss_args[3] is not None else ss_kw.get("start", None)
-        ss_end = ss_args[4] if ss_args[4] is not None else ss_kw.get("end", None)
-        ss_step = ss_args[5] if ss_args[5] is not None else ss_kw.get("step", 1)
+        ss_base = src.args[0] if src.args else None
+        ss_val, ss_dim, ss_start, ss_end, ss_step = _ss_inner_args(src)
 
-        # Build slice view of `base` with the same params.
+        # Two patterns AOT emits for `cache[outer][inner] = val` (or
+        # the 1-level variant `cache[inner] = val`):
+        #
+        #   1) copy_(base, slice_scatter(base, val, inner))
+        #      Single-dim in-place write to base.
+        #
+        #   2) copy_(slice(base, outer), slice_scatter(slice(base, outer), val, inner))
+        #      Two-dim in-place write: outer slice then inner slice.
+        #      The two slice nodes are semantically the same view (same
+        #      base, same outer params) but are distinct FX nodes.
+        #
+        # Rewrite goal in both cases: in-place write `val` into the
+        # appropriate slice view of the original base tensor.
+        if copy_dst is ss_base:
+            # Pattern 1: 1-level.
+            outer_slice = copy_dst
+        elif _equivalent_slice(copy_dst, ss_base):
+            # Pattern 2: 2-level. Use the existing outer-slice node
+            # already in copy_'s args (copy_dst) -- it's an outer-slice
+            # view of the original base.
+            outer_slice = copy_dst
+        else:
+            continue
+
+        # Inner slice into the outer view at the slice_scatter inner
+        # dim args. For pattern 1 this becomes the only slice; for
+        # pattern 2 it's the inner of a 2-level view (cache[:bsz][...]).
         with gm.graph.inserting_before(node):
-            new_slice = gm.graph.call_function(
+            inner_slice = gm.graph.call_function(
                 slice_op,
-                args=(base, ss_dim, ss_start, ss_end, ss_step),
+                args=(outer_slice, ss_dim, ss_start, ss_end, ss_step),
             )
-        # Rewire other consumers of slice_scatter result to read from
-        # `base` after the in-place write has happened. base is mutated
-        # in-place by the rewritten copy_; FX node ordering preserves
-        # the data dependency since we keep the new copy_ at the same
-        # graph position as the original.
-        src.replace_all_uses_with(base)
-        # Reset node's args: copy_(slice_view, val, [non_blocking]).
-        new_args = (new_slice, ss_val)
+        # Rewire other consumers of slice_scatter result to read
+        # through outer_slice. After the in-place copy_ runs, the
+        # outer slice view sees the mutated values. FX node ordering
+        # preserves the dependency since copy_ stays at its original
+        # graph position.
+        src.replace_all_uses_with(outer_slice)
+        # Rewrite copy_ to be the in-place write through inner_slice.
+        new_args = (inner_slice, ss_val)
         if len(node.args) > 2:
             new_args = new_args + tuple(node.args[2:])
         node.args = new_args
-        # slice_scatter is now unused -> remove.
+        # slice_scatter is now unused -> remove. The old outer-slice
+        # node feeding slice_scatter (ss_base under pattern 2) may
+        # still have other users; only erase if dead.
         gm.graph.erase_node(src)
+        if (isinstance(ss_base, fx.Node)
+                and ss_base is not copy_dst
+                and not ss_base.users):
+            gm.graph.erase_node(ss_base)
         changed = True
-    if changed:
-        gm.graph.lint()
-        gm.recompile()
-    return gm
+    return changed
 
 
 def _rewrite_prims_in_gm(gm: fx.GraphModule) -> fx.GraphModule:
