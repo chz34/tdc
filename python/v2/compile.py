@@ -269,6 +269,7 @@ def _capture_positional(fn, example_args, allow_grad: bool, wrapper: bool = True
         state["gm"], example_args, state["observed_args"])
     # Push frozen values (params / Dynamo-specialised constants) into
     # the trace once; subsequent replays skip those slots entirely.
+    pre_binds = _promote_scalar_pre_binds_to_device(pre_binds, example_args)
     for arg_idx, value in pre_binds:
         trace.v2_pre_bind(arg_idx, value)
     flat_recipe = _compile_flat_recipe(runtime_specs)
@@ -577,6 +578,7 @@ def _capture_with_backward(fn, example_args):
     fw_specs, fw_pre_binds, fw_ph_to_user_input = _build_recipe_specs(
         fw_state["gm"], example_args, fw_state["observed_args"])
     fw_trace_obj = fw_state["trace"]
+    fw_pre_binds = _promote_scalar_pre_binds_to_device(fw_pre_binds, example_args)
     for arg_idx, value in fw_pre_binds:
         fw_trace_obj.v2_pre_bind(arg_idx, value)
     fw_flat = _compile_flat_recipe(fw_specs)
@@ -684,6 +686,69 @@ def _capture_with_backward(fn, example_args):
     call.bw_trace = bw_trace                  # type: ignore[attr-defined]
     call.fw_recipe_specs = fw_specs           # type: ignore[attr-defined]
     return call
+
+
+def _infer_target_device(example_args) -> torch.device | None:
+    """Pick the device captured tensors should live on at replay time.
+    First Tensor in example_args wins. Returns None if the user passed
+    no Tensors (degenerate trace -- nothing to promote anyway)."""
+    for a in example_args:
+        if isinstance(a, torch.Tensor):
+            return a.device
+    return None
+
+
+def _promote_scalar_pre_binds_to_device(
+    pre_binds: List[Tuple[int, Any]],
+    example_args,
+) -> List[Tuple[int, Any]]:
+    """Move 0-d CPU pre-bind tensors to the user input's device.
+
+    Why: AOT functionalization lifts Python scalars (e.g. RMSNorm's
+    `self.eps = 1e-6`, attention's `math.sqrt(head_dim)`) into 0-d
+    Tensors as graph placeholders. `torch.tensor(1e-6)` defaults to
+    float64 / CPU. Without promotion, every replay sees an
+    `aten::add.Tensor(npu_t, cpu_scalar_t, 1)` and the NPU backend
+    forces a synchronous H2D copy of the scalar before running the
+    add -- ~500us per occurrence. LLaMA-class models hit this 30+
+    times per replay (DESIGN.md §17.6.9 quantifies it as ~15ms
+    device-side overhead vs eager).
+
+    Promote at capture time so the captured tensor in
+    `Trace::captured_tensors_` is already on the target device.
+    Replay then sees `aten::add.Tensor(npu_t, npu_scalar_t, 1)` --
+    pure on-device computation, no H2D sync.
+
+    Only 0-d tensors are promoted intentionally:
+      - They represent config constants (eps, scale, temperature, ...)
+        that are conceptually device-agnostic.
+      - Higher-rank CPU tensors might be the user's intentional CPU
+        data being passed in deliberately; we don't second-guess.
+
+    Caveat: after promotion, the captured 0-d tensor is a NEW
+    TensorImpl independent from any source the user might still hold.
+    If the user later does `module.layer.eps_buf.fill_(new)` on a
+    registered CPU Buffer, that mutation won't propagate to our
+    promoted NPU copy (DESIGN.md §17.6.9 走法 A). This is rare in
+    practice -- the common pattern is `self.eps = 1e-6` (Python float
+    which can't be mutated in-place anyway) or `register_buffer(...,
+    torch.tensor(eps, device=target_device))` (already on device, no
+    promotion needed). The mutation-reflection path C from §17.6.9
+    is deferred until a real use case asks for it.
+    """
+    target = _infer_target_device(example_args)
+    if target is None or target.type == "cpu":
+        return pre_binds
+    result: List[Tuple[int, Any]] = []
+    for arg_idx, value in pre_binds:
+        if (
+            isinstance(value, torch.Tensor)
+            and value.dim() == 0
+            and value.device.type == "cpu"
+        ):
+            value = value.to(device=target)
+        result.append((arg_idx, value))
+    return result
 
 
 def _build_recipe_specs(
