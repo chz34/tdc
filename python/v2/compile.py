@@ -272,10 +272,16 @@ def _capture_positional(fn, example_args, allow_grad: bool, wrapper: bool = True
     for arg_idx, value in pre_binds:
         trace.v2_pre_bind(arg_idx, value)
     flat_recipe = _compile_flat_recipe(runtime_specs)
+    # Persistent buffer reused across every replay -- zero per-call
+    # list allocation. flat_recipe writes into it in-place; we hand
+    # it to v2_replay which only reads. The slots get overwritten on
+    # every call, so the previous call's tensor references release
+    # exactly when the new call starts (matches eager lifetime).
+    flat_buf: list = [None] * flat_recipe._buf_len
 
     def direct_replay(*user_args):
-        flat = flat_recipe(user_args)
-        result = trace.v2_replay(flat)
+        flat_recipe(user_args, flat_buf)
+        result = trace.v2_replay(flat_buf)
         return output_shaper(result)
 
     # Expose internals for introspection / debug.
@@ -574,6 +580,9 @@ def _capture_with_backward(fn, example_args):
     for arg_idx, value in fw_pre_binds:
         fw_trace_obj.v2_pre_bind(arg_idx, value)
     fw_flat = _compile_flat_recipe(fw_specs)
+    # See _capture_positional for the rationale; persistent buffer
+    # reused across every forward replay invocation under autograd.
+    fw_flat_buf: list = [None] * fw_flat._buf_len
 
     n_user_inputs = len(example_args)
 
@@ -616,7 +625,8 @@ def _capture_with_backward(fn, example_args):
     class _CapturedFn(torch.autograd.Function):
         @staticmethod
         def forward(ctx, *user_args):
-            fw_outputs = fw_trace.v2_replay(fw_flat(user_args))
+            fw_flat(user_args, fw_flat_buf)
+            fw_outputs = fw_trace.v2_replay(fw_flat_buf)
             # Save the full fw_outputs list — split into tensors (via
             # save_for_backward, autograd requirement) + non-tensors
             # (stashed as ctx attributes), with positions preserved so
@@ -783,20 +793,29 @@ def _build_recipe_specs(
     return runtime_specs, pre_binds, ph_to_user_input
 
 
-def _compile_flat_recipe(specs: List[RecipeSpec]) -> Callable[[Tuple[Any, ...]], list]:
+def _compile_flat_recipe(specs: List[RecipeSpec]) -> Callable[..., list]:
     """Generate and exec() a single function that materialises all
-    NON-pre-bound placeholder values in one Python call.
+    NON-pre-bound placeholder values into a caller-provided buffer.
 
-    Output shape: `def _flat(args): return [<expr_0>, <expr_1>, ...]`
-    where each expression is either `args[i]` (T spec) or
-    `args[i].size(d)` (S spec). Pre-bound placeholders (param tensors,
-    Dynamo-specialised constants) are NOT in the list — they live in
-    the trace's persistent buffers, set once via v2_pre_bind.
+    Output signature: `def _flat(args, buf): buf[0] = ...; ... ; return buf`
+    where each line is either `args[i]` (T spec) or `args[i].size(d)`
+    (S spec). Pre-bound placeholders (param tensors, Dynamo-specialised
+    constants) are NOT touched — they live in the trace's persistent
+    buffers, set once via v2_pre_bind.
 
-    Why exec/eval: this collapses N lambda calls (one per placeholder)
-    into a single function invocation. On accelerators where kernel
-    time is amortised across calls and host-side Python overhead is
-    the bottleneck, this can save 1-3us per replay (≈ N * 300-500ns).
+    Why exec/eval: collapses N attribute / index ops into a single
+    function invocation. On accelerators where kernel time is
+    amortised across calls and host-side Python overhead is the
+    bottleneck, this can save 1-3us per replay (~N * 300-500ns).
+
+    Why writes-into-buf instead of returning a fresh list: in the hot
+    replay path we want zero list allocations per call. The caller
+    holds the buf across replays, hands the same object in each time;
+    we just overwrite the slots. Tensor slots churn through the user
+    Tensor objects (one ref each), int slots get the result of
+    .size() (cached for small ints by CPython). No new list, no new
+    tuple — only the .size() ints when sizes don't fit the small-int
+    cache (<= 256).
     """
     expr_parts: list[str] = []
     for spec in specs:
@@ -809,12 +828,25 @@ def _compile_flat_recipe(specs: List[RecipeSpec]) -> Callable[[Tuple[Any, ...]],
                 f"flat_recipe only handles T/S specs after pre-bind extraction; "
                 f"got {spec!r}")
 
-    src = (
-        "def _flat_recipe(args):\n"
-        f"    return [{', '.join(expr_parts)}]\n"
-    )
+    if not expr_parts:
+        # Degenerate case: nothing to materialise (no user-input slots).
+        # Still return the buffer for caller uniformity.
+        src = (
+            "def _flat_recipe(args, buf):\n"
+            "    return buf\n"
+        )
+    else:
+        body_lines = [
+            f"    buf[{i}] = {expr}" for i, expr in enumerate(expr_parts)
+        ]
+        src = (
+            "def _flat_recipe(args, buf):\n"
+            + "\n".join(body_lines)
+            + "\n    return buf\n"
+        )
     ns: dict = {}
     exec(src, ns)
     fn = ns["_flat_recipe"]
     fn._source = src                   # type: ignore[attr-defined]
+    fn._buf_len = len(expr_parts)      # type: ignore[attr-defined]
     return fn
