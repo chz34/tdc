@@ -33,6 +33,91 @@ from .translator import translate_graph
 # directly without touching high-level aten ops. See DESIGN.md §17.6.9.
 
 
+def _rewrite_slice_scatter_to_inplace(gm: fx.GraphModule) -> fx.GraphModule:
+    """De-functionalize KV-cache style writes:
+        slice_scatter(t, val, dim, start, end, step)
+        copy_(t, slice_scatter_result)
+    ->
+        slice_view = slice(t, dim, start, end, step)
+        copy_(slice_view, val)
+
+    Why: LLaMA / GPT-style decoders write into a KV cache via
+    `cache_k[:, start:end] = xk`. AOT functionalize transforms this
+    into `slice + slice_scatter`, which **allocates a full-size new
+    cache_k and memcpy's the unchanged portion** every replay -- on
+    a [64, 1024, 8, 64] cache (128 MB), that's 128 MB of pointless
+    copy per layer per replay. 8 layers x 2 (K+V) = 2 GB of memory
+    bandwidth wasted per replay (DESIGN.md §17.6.9 quantifies this
+    as ~17ms NPU device time vs eager's ~8ms).
+
+    keep_inference_input_mutations=True alone doesn't help -- it just
+    appends a final copy_(t, slice_scatter_result), so we now do TWO
+    full-tensor memcpys per cache update (the scatter + the writeback).
+
+    Inductor handles this via its `auto_functionalized_v2` pattern
+    matcher at lowering time. For non-inductor paths (us, aot_eager)
+    we need the same rewrite ourselves. This pass detects the exact
+    `slice_scatter -> copy_(base, scatter_result)` pair that AOT
+    emits and replaces it with `slice(base, ...) -> copy_(view, val)`,
+    matching eager's in-place behavior. Other consumers of the
+    slice_scatter result are rewired to read from `base` directly
+    (which is the base tensor's post-mutation value).
+    """
+    slice_op = torch.ops.aten.slice.Tensor
+    slice_scatter_op = torch.ops.aten.slice_scatter.default
+    copy_inplace_op = torch.ops.aten.copy_.default
+    changed = False
+    for node in list(gm.graph.nodes):
+        # Pattern: copy_(base, slice_scatter(base, val, dim, start, end, step), ...)
+        if not (node.op == "call_function" and node.target is copy_inplace_op):
+            continue
+        if len(node.args) < 2:
+            continue
+        base, src = node.args[0], node.args[1]
+        if not (isinstance(src, fx.Node)
+                and src.op == "call_function"
+                and src.target is slice_scatter_op):
+            continue
+        if src.args[0] is not base:
+            continue
+        # slice_scatter signature:
+        #   (Tensor self, Tensor src, int dim=0, SymInt? start=None,
+        #    SymInt? end=None, SymInt step=1)
+        # AOT often omits trailing default args; merge them in.
+        ss_args = list(src.args) + [None] * (6 - len(src.args))
+        ss_kw = dict(src.kwargs)
+        ss_val = ss_args[1]
+        ss_dim = ss_args[2] if ss_args[2] is not None else ss_kw.get("dim", 0)
+        ss_start = ss_args[3] if ss_args[3] is not None else ss_kw.get("start", None)
+        ss_end = ss_args[4] if ss_args[4] is not None else ss_kw.get("end", None)
+        ss_step = ss_args[5] if ss_args[5] is not None else ss_kw.get("step", 1)
+
+        # Build slice view of `base` with the same params.
+        with gm.graph.inserting_before(node):
+            new_slice = gm.graph.call_function(
+                slice_op,
+                args=(base, ss_dim, ss_start, ss_end, ss_step),
+            )
+        # Rewire other consumers of slice_scatter result to read from
+        # `base` after the in-place write has happened. base is mutated
+        # in-place by the rewritten copy_; FX node ordering preserves
+        # the data dependency since we keep the new copy_ at the same
+        # graph position as the original.
+        src.replace_all_uses_with(base)
+        # Reset node's args: copy_(slice_view, val, [non_blocking]).
+        new_args = (new_slice, ss_val)
+        if len(node.args) > 2:
+            new_args = new_args + tuple(node.args[2:])
+        node.args = new_args
+        # slice_scatter is now unused -> remove.
+        gm.graph.erase_node(src)
+        changed = True
+    if changed:
+        gm.graph.lint()
+        gm.recompile()
+    return gm
+
+
 def _rewrite_prims_in_gm(gm: fx.GraphModule) -> fx.GraphModule:
     """Replace prims.convert_element_type nodes with aten._to_copy.
 
@@ -222,6 +307,7 @@ def _capture_positional(fn, example_args, allow_grad: bool, wrapper: bool = True
 
     def grab_compiler(gm, sample_inputs):
         gm = _rewrite_prims_in_gm(gm)
+        gm = _rewrite_slice_scatter_to_inplace(gm)
         trace = translate_graph(gm)
         state = {
             "trace": trace,
@@ -244,7 +330,16 @@ def _capture_positional(fn, example_args, allow_grad: bool, wrapper: bool = True
     with torch.no_grad():
         compiled_fn = torch.compile(
             fn,
-            backend=aot_autograd(fw_compiler=grab_compiler),
+            backend=aot_autograd(
+                fw_compiler=grab_compiler,
+                # Inference-only: keep `x[..] = y` style buffer mutations
+                # (e.g. KV-cache writes in transformer decoders) as
+                # aten::copy_ / index_put_ instead of letting AOT
+                # functionalize them into slice + slice_scatter, which
+                # would force a full kv_cache realloc + memcpy of the
+                # unchanged portion every replay. See DESIGN.md §17.6.9.
+                keep_inference_input_mutations=True,
+            ),
             dynamic=True,
         )
         # AOT's runtime layer turns wrapping_cb's flat tuple into the
@@ -365,6 +460,7 @@ def _capture_via_aot_wrapper(fn, example_args):
 
     def grab_compiler(gm, example_inputs):
         gm = _rewrite_prims_in_gm(gm)
+        gm = _rewrite_slice_scatter_to_inplace(gm)
         trace = translate_graph(gm)
         captured.append({"trace": trace, "gm": gm})
         def run_via_trace(*flat_args):
@@ -394,10 +490,12 @@ def _capture_via_aot_wrapper(fn, example_args):
     if target is not None:
         aot_compiled = aot_module(
             target, fw_compiler=grab_compiler, dynamic=True,
+            keep_inference_input_mutations=True,
         )
     else:
         aot_compiled = aot_function(
             fn, fw_compiler=grab_compiler, dynamic=True,
+            keep_inference_input_mutations=True,
         )
 
     # Trigger AOT trace + RuntimeWrapper wiring. The first call also
@@ -535,6 +633,7 @@ def _capture_with_backward(fn, example_args):
 
     def grab_compiler(gm, sample_inputs):
         gm = _rewrite_prims_in_gm(gm)
+        gm = _rewrite_slice_scatter_to_inplace(gm)
         trace = translate_graph(gm)
         state = {"trace": trace, "gm": gm, "observed_args": None}
         captured.append(state)
