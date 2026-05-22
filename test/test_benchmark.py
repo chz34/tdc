@@ -30,7 +30,7 @@ from _device import DEVICE, SYNC, print_device_banner
 def bench(fn, iters=400, warmup=50):
     for _ in range(warmup):
         fn()
-    SYNC()
+        SYNC()
     samples = []
     for _ in range(iters):
         t0 = time.perf_counter_ns()

@@ -11,9 +11,12 @@ Compares wall-clock per call across six modes on the same function:
                    -- Full Dynamo + AOT + Inductor codegen (fused kernels)
     v1           : with tdc.capture(): ...; trace.replay()
                    -- Dispatcher-level capture, C++ callBoxed in a loop
-    v2           : v2.capture(fn, *example_args)
-                   -- AOT graph translated to C++ trace, direct replay
-                      (bypasses Dynamo at call time)
+    v2 (direct)  : v2.capture(fn, *example_args, wrapper=False)
+                   -- AOT graph translated to C++ trace, bare direct_replay
+                      (fastest, no AOT RuntimeWrapper overhead)
+    v2 (wrapper) : v2.capture(fn, *example_args, wrapper=True)
+                   -- direct_replay wrapped in aot_function for full eager
+                      semantics (input mutations, output alias rebuild)
 
 Device is controlled by TDC_DEVICE (default cpu). When running on an
 accelerator, tensors are allocated on DEVICE and each timed call is
@@ -339,10 +342,10 @@ if os.environ.get("TDC_TORCHBENCH", "0") == "1":
     # model — metadata.yaml marks CPU unsupported (OOM on CI), so on
     # cpu it skips via _load_torchbench's broad except.
     for _name, _bs in [
-        ("squeezenet1_1", 1),
-        ("BERT_pytorch",  1),
-        ("llama",         1),
-        ("llava",         1),
+        ("squeezenet1_1", 64),
+        ("BERT_pytorch",  64),
+        ("llama",         64),
+        ("llava",         64),
     ]:
         _label = f"torchbench:{_name} (B={_bs})"
         _loaded = _load_torchbench(_name, batch_size=_bs)
@@ -463,9 +466,10 @@ def build_variants(fn, example_inputs):
         ("dynamo",    lambda: torch.compile(fn, backend="eager", dynamic=True)),
         ("aot_eager", lambda: torch.compile(fn, backend="aot_eager", dynamic=True)),
         ("inductor",  lambda: torch.compile(fn, backend="inductor", dynamic=True)),
-        ("v1",        lambda: _v1_capture(fn, example_inputs)),
-        ("v2",        lambda: tdcv2.capture(fn, *example_inputs)),
-        ("export",    lambda: _export_capture(fn, example_inputs)),
+        ("v1",             lambda: _v1_capture(fn, example_inputs)),
+        ("v2 (direct)",    lambda: tdcv2.capture(fn, *example_inputs, wrapper=False)),
+        ("v2 (wrapper)",   lambda: tdcv2.capture(fn, *example_inputs, wrapper=True)),
+        ("export",         lambda: _export_capture(fn, example_inputs)),
     ]:
         try:
             variants[name] = builder()
