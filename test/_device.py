@@ -28,10 +28,6 @@ import torch
 
 def _resolve_device() -> torch.device:
     raw = os.environ.get("TDC_DEVICE", "cpu").lower()
-    # User-friendly aliases — let folks write `npu` without worrying
-    # whether the backend is registered as PrivateUse1.
-    aliases = {"npu": "privateuseone"}
-    raw = aliases.get(raw, raw)
     dev = torch.device(raw)
     if dev.type == "cuda":
         assert torch.cuda.is_available(), "TDC_DEVICE=cuda but no CUDA"
@@ -40,10 +36,7 @@ def _resolve_device() -> torch.device:
             "TDC_DEVICE=xpu but no XPU"
     elif dev.type == "mps":
         assert torch.backends.mps.is_available(), "TDC_DEVICE=mps but no MPS"
-    elif dev.type == "privateuseone":
-        # The actual backend module (torch_npu, etc.) must already have
-        # registered PrivateUse1 at import time. We don't verify here —
-        # let the first kernel call surface the missing backend.
+    elif dev.type == "npu":
         pass
     return dev
 
@@ -59,14 +52,10 @@ def _make_sync() -> Callable[[], None]:
         return torch.xpu.synchronize
     if DEVICE.type == "mps":
         return torch.mps.synchronize
-    if DEVICE.type == "privateuseone":
-        if hasattr(torch, "npu"):
+    if DEVICE.type == "npu":
+        if hasattr(torch, "npu") and hasattr(torch.npu, "synchronize"):
             return torch.npu.synchronize
-        try:
-            import torch_npu  # type: ignore
-            return torch_npu.npu.synchronize
-        except ImportError:
-            return lambda: None
+        return lambda: None
     return lambda: None
 
 
