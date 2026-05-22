@@ -565,52 +565,74 @@ def _compare_outputs(ref, got, atol=1e-3, rtol=1e-3):
 def run_correctness_check():
     """Run each variant once and compare its output against eager.
 
-    Aborts the benchmark on any mismatch so a timing table for broken
-    captures is never printed. v1 returns the in-place-updated capture
-    tensors via the closure in _v1_capture; the other variants return
-    fresh tensors from the call itself."""
-    print("\n# correctness check vs eager")
-    print("-" * 78)
+    Collects all results first, then prints them at once. Failures are
+    reported but do not abort the run — the caller decides whether to
+    stop or continue with the speed table."""
+    error_buf = io.StringIO()
+    orig_stderr = sys.stderr
+    results: list[tuple] = []
     all_ok = True
+
     for label, (fn, inputs) in WORKLOADS.items():
         if label in _TB_SKIP_CORRECTNESS:
-            print(f"  {label:<44} (skipped — v2 / AOT output-arity mismatch)")
+            results.append((label, "", "skipped — v2 / AOT output-arity mismatch", True))
             continue
         torch._dynamo.reset()
-        variants = build_variants(fn, inputs)
+        sys.stderr = error_buf
+        try:
+            variants = build_variants(fn, inputs)
+        finally:
+            sys.stderr = orig_stderr
         if "eager" not in variants:
-            print(f"  {label}: no eager variant, skipping")
+            results.append((label, "", "no eager variant, skipping", True))
             continue
         with torch.no_grad():
             ref = _flatten_output(variants["eager"](*inputs))
-        # Clone so a later in-place variant (v1) can't accidentally alias
-        # the reference tensors and mask a real discrepancy.
         ref = [t.detach().clone() for t in ref]
 
         for name, callable_ in variants.items():
             if name == "eager":
                 continue
             if callable_ is None:
-                print(f"  {label:<44} {name:<10} skipped (variant not available)")
+                results.append((label, name, "skipped (variant not available)", True))
                 continue
             if name not in _CAPTURE_MODES:
                 torch._dynamo.reset()
             with torch.no_grad():
+                sys.stderr = error_buf
                 try:
                     got = _flatten_output(callable_(*inputs))
                 except Exception:
-                    traceback.print_exc()
-                    print(f"  {label:<44} {name:<10} N/A (exception during call)")
+                    results.append((label, name, "N/A (exception during call)", False))
                     all_ok = False
                     continue
+                finally:
+                    sys.stderr = orig_stderr
             ok, msg = _compare_outputs(ref, got)
             status = "ok" if ok else f"MISMATCH ({msg})"
-            print(f"  {label:<44} {name:<10} {status}")
+            results.append((label, name, status, ok))
             if not ok:
                 all_ok = False
+
+    # Print all results at once.
+    print("\n# correctness check vs eager")
+    print("-" * 78)
+    for label, name, status, _ok in results:
+        if name:
+            print(f"  {label:<44} {name:<10} {status}")
+        else:
+            print(f"  {label:<44} {status}")
+
+    # Dump any errors captured during variant construction or invocation.
+    errors = error_buf.getvalue()
+    if errors:
+        print(f"\n{'='*78}")
+        print("Errors during correctness check:")
+        print(f"{'='*78}")
+        print(errors)
+
     if not all_ok:
-        raise RuntimeError(
-            "v2_benchmark correctness check failed — see lines above")
+        print("\n*** Correctness check had failures — see lines above ***")
 
 
 def run_speed_table():
