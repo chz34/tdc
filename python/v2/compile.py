@@ -397,8 +397,10 @@ def _capture_positional(fn, example_args, allow_grad: bool, wrapper: bool = True
     captured: list = []
 
     def grab_compiler(gm, sample_inputs):
+        # disable_functionalization=True (passed to aot_autograd below)
+        # already keeps in-place ops as-is, so slice_scatter never
+        # appears in the graph -- no need for the rewrite here.
         gm = _rewrite_prims_in_gm(gm)
-        gm = _rewrite_slice_scatter_to_inplace(gm)
         trace = translate_graph(gm)
         state = {
             "trace": trace,
@@ -556,8 +558,10 @@ def _capture_via_aot_wrapper(fn, example_args):
     captured: list = []
 
     def grab_compiler(gm, example_inputs):
+        # disable_functionalization=True (passed to aot_function /
+        # aot_module below) keeps in-place ops as-is, so the
+        # slice_scatter rewrite isn't needed here.
         gm = _rewrite_prims_in_gm(gm)
-        gm = _rewrite_slice_scatter_to_inplace(gm)
         trace = translate_graph(gm)
         captured.append({"trace": trace, "gm": gm})
         def run_via_trace(*flat_args):
@@ -733,6 +737,12 @@ def _capture_with_backward(fn, example_args):
     captured: list = []
 
     def grab_compiler(gm, sample_inputs):
+        # backward path: autograd's partition_fn needs a pure-
+        # functional graph to split fw/bw, so we CAN'T pass
+        # disable_functionalization here. slice_scatter shows up
+        # in this graph -- _rewrite_slice_scatter_to_inplace
+        # de-functionalises it back to in-place form before we
+        # translate.
         gm = _rewrite_prims_in_gm(gm)
         gm = _rewrite_slice_scatter_to_inplace(gm)
         trace = translate_graph(gm)
