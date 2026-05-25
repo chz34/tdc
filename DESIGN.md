@@ -1192,3 +1192,226 @@ backward 路径仍然保留 `_rewrite_slice_scatter_to_inplace` 作为兜底,等
 | `aten::copy_` 紧邻 `slice` 出现 | 这是**正确的 in-place 写**,跟 eager 一致,**不要去除**。 |
 
 可以作为接入新模型时的标准 sanity check。
+
+#### 17.6.10 已知性能缺陷:nn.Dropout(eval) 被 AOT 展开为 aten::clone
+
+在 timm_vision_transformer 等含大量 `nn.Dropout` 的模型上(eval 模式),实测
+v2 trace 出现每个 transformer block 重复约 3 次的 `aten::clone` 序列。
+`TDC_TRACE_DEBUG=1` 抓到的真实 dump(NPU,ViT-B,B=64,S=197,dim=384):
+
+```
+[v2][24] aten::addmm.            → Tensor(float,[12608, 384],npu:0)   # WO 投影
+[v2][25] aten::view.             → Tensor(float,[64, 197, 384],npu:0)
+[v2][26] aten::clone.    stack=[Tensor(float,[64, 197, 384],npu:0), None]   ← !!
+[v2][27] aten::add.Tensor                                                # residual
+
+[v2][33] aten::gelu.             → Tensor(float,[64, 197, 1536],npu:0)  # MLP 激活
+[v2][34] aten::clone.    stack=[Tensor(float,[64, 197, 1536],npu:0), None]  ← !!
+[v2][35] aten::view.             → ...                                  # FC2 输入
+
+[v2][38] aten::view.             → Tensor(float,[64, 197, 384],npu:0)  # FC2 输出
+[v2][39] aten::clone.    stack=[Tensor(float,[64, 197, 384],npu:0), None]  ← !!
+[v2][40] aten::add.Tensor                                                # residual
+```
+
+ViT-B 12 个 block × 3 个 clone + 入口 pos_embed dropout = **~38 个多余 clone
+step**,每个 `64*197*384*4 ≈ 19 MB`,**单次 forward 累计 ~720 MB 多余 HBM
+流量**。在 NPU 这种 dispatch 不是瓶颈的设备上,完全可以让 replay 比 eager 慢
+(eager 走 dropout C++ fast-path,带宽开销是另一个数量级)。
+
+**根因**
+
+PyTorch autograd 契约要求 `aten::dropout(input, p, train)` 在 `train=False`
+/ `p=0` 时**也要返回一个新的 Tensor**(有独立 grad_fn),否则用户做
+`y = dropout(x); y.add_(1)` 会悄悄改到 `x`。eager 路径下这个契约由 C++
+dropout 实现内部 fast-path 兑现(一次 cheap kernel 调用,clone 与 autograd
+no-op 融合);AOT trace 阶段则把"clone(input)"暴露成一个独立的 FX 节点,
+我们 v2 翻译时变成独立 Step,带宽 + dispatch 都成本翻倍。
+
+`drop_path` / `nn.Identity` / `F.dropout(... p=0.0)` 等同款问题。
+
+**修复方案**
+
+落地一个 FX pass `eliminate_dead_clones`(`python/v2/fx_passes.py`),在
+translate_graph 之前清理掉**`memory_format=None` 且所有用户都不写入它**的
+`aten::clone` 节点。判别"用户不写入"靠 op schema 的 `alias_info.is_write`
+位:
+
+```python
+clone(x, memory_format=None) → x       # 当 user.schema_arg.alias_info.is_write 全为 False
+clone(x, memory_format=contiguous) → keep    # 真要 materialize,eager 也会做
+clone(x, memory_format=None) → keep    # 当任一 user 写它(copy_ / add_ / ...)
+```
+
+FX `output` 节点视为安全 read-only(它就是把值传给调用方,没有 mutation 语义)。
+`operator.getitem` 同理。
+
+**实测收益**(timm_vit B=4 CPU,见 prototypes/timm_vit_smoketest.py)
+
+| 指标 | 改前 | 改后 |
+|---|---|---|
+| trace step 数 | 410 | 372(-38) |
+| `aten::clone` step 数 | 38 | 0 |
+| v2 (direct) replay vs eager | 1.13x | **1.01x** |
+
+NPU 上 720MB 带宽减少,预期收益放大若干倍,可让 v2 (direct) 反超 eager。
+
+**该缺陷的诊断方法**
+
+设 `TDC_TRACE_DEBUG=1`,在 trace 中出现以下模式:
+
+| 看到 | 含义 |
+|---|---|
+| `aten::clone. stack=[..., None]` 紧跟 addmm/view/gelu,后接 add/view/native_layer_norm | **dead clone** —— pass 没生效或没覆盖到此 op |
+| `aten::clone. stack=[..., 0]`(或非 None 的 memory_format) | **必要的 materialize** —— eager 也做,不要删 |
+| `aten::clone. stack=[..., None]` 紧跟 `aten::copy_` / `aten::add_` 之类 in-place op | **alias 写入目标** —— pass 已通过 alias_info.is_write 保留,正确 |
+
+#### 17.6.11 已知正确性缺陷:Optional[Tensor]=None 触发 IValue::toScalar
+
+在 timm_vision_transformer 这类使用 `F.scaled_dot_product_attention` 的模型
+上,实测 v2 在 capture 阶段(AOT 的第一次 example call)直接 raise:
+
+```
+RuntimeError: IValue is not a Scalar
+  ... in trace.v2_replay(...)
+  ... in wrapping_cb
+  ... in aot_compiled(...)
+```
+
+trace 翻译本身**全部成功**(整个 ViT 的 447 个 call_function 节点都翻译到了
+trace step);失败在 C++ replay 阶段的 IValue 类型校验。
+
+**根因**
+
+CPU 上 `F.scaled_dot_product_attention` 被 lower 为
+`aten::_scaled_dot_product_flash_attention_for_cpu`,schema:
+
+```
+_scaled_dot_product_flash_attention_for_cpu(
+    Tensor query, Tensor key, Tensor value,
+    float dropout_p=0.0, bool is_causal=False,
+    *, Tensor? attn_mask=None, float? scale=None
+) -> (Tensor output, Tensor logsumexp)
+```
+
+`attn_mask` 是 `Optional[Tensor]`,默认 None。timm 的 Attention 不传 mask,
+所以 graph 里这个 slot 拿到 `lit(None)`。translator 旧版 `_compute_coercions`
+的处理(简化):
+
+```python
+sa_type = schema_args[k].type
+if sa_type.kind() == "OptionalType":
+    sa_type = sa_type.getElementType()    # 解包成 TensorType
+if sa_type.kind() == "TensorType":
+    if kind == "tensor":
+        out.append(NONE)
+    elif kind in ("int", "float", "bool", "other"):    # ← 把 None 当成 "other"
+        out.append(SCALAR_TO_TENSOR)
+    ...
+```
+
+`_predict_value_kind(None)` 旧版落到 `return "other"` 兜底分支。**"other"
+被错误地归入 SCALAR_TO_TENSOR**:replay 时 `apply_coercion` 的 `kScalarToTensor`
+分支调 `iv.toScalar()`,对 None IValue 触发 "IValue is not a Scalar"。
+
+任何带 `Tensor?` 参数且实际传 None 的 op 都触发,SDPA 只是首先暴露的典型。
+
+**修复方案**
+
+translator 两处改动:
+
+1. `_predict_value_kind` 增加单独的 `"none"` 分类,与 "other" 区分:
+   ```python
+   if value is None:
+       return "none"
+   ```
+2. `_compute_coercions` 在 schema 是 `OptionalType` 且 value kind 是 `"none"`
+   时,**直接 NONE coercion 短路掉**,不再解包内层 type:
+   ```python
+   is_optional = sa_type.kind() == "OptionalType"
+   if is_optional and kind == "none":
+       out.append(NONE)
+       continue
+   if is_optional:
+       sa_type = sa_type.getElementType()
+   ...
+   ```
+
+`float?` / `int?` 之类的 Optional[Scalar] 传 None 不受影响 —— 原代码在解包后
+不会进 TensorType 分支,所以是 NONE coercion;改动后行为一致。
+
+**该缺陷的诊断方法**
+
+| 看到 | 含义 |
+|---|---|
+| `RuntimeError: IValue is not a Scalar` 出现在 wrapping_cb 调用栈 | **可能是 Optional[Tensor] + None 的本 bug**;先查 trace 中是否有 `Tensor?` 参数收到 lit(None) |
+| 同样错误但 trace 里没有 None 参数 | 别的 SCALAR_TO_TENSOR 误标 —— 检查 `_compute_coercions` 是否覆盖此 op 的所有 arg 类型 |
+
+#### 17.6.12 支持矩阵:torch.library.triton_op 自定义算子
+
+v2 与 v1 都**原生支持** `@torch.library.triton_op` 注册的 Triton kernel,
+零额外适配代码。这一节记录"为什么支持是免费的"以及环境约束。
+
+**机制**
+
+`@torch.library.triton_op("namespace::name", mutates_args={...})` 把 Triton
+kernel 包装成一个 dispatcher-可见的 `torch._ops.OpOverload`,kwarg 之外的
+arity 就是用户函数的签名(`(x, y, ...) -> Tensor`)。
+
+- **v2 路径**:AOT trace 把 triton_op call 当成单个 OpOverload 节点保留
+  (不会展开成 wrap_triton + empty_like 等内部细节)。translator 走通用
+  `_translate_call_function` → `aten/<custom-ns>::name` step,**与普通 aten op
+  同一条路径**。
+- **v1 路径**:`TESTING_ONLY_GenericMode` boxed fallback 在 op 进入实现之前
+  拦截(优先级 #411,高于所有 backend key)。redispatch 后内部的
+  `wrap_triton` / `empty_like` 因为 `ExcludeDispatchKeyGuard` 不再被二次记录,
+  整个 triton_op 作为单个 Step 落到 trace,**完全 opaque**。
+
+**replay 调用链(两条路径相同)**
+
+```
+trace step → op.callBoxed(stack) → dispatcher
+                                      ↓
+                       triton_op 实现(Python wrapper)
+                                      ↓
+                                 wrap_triton(grid)
+                                      ↓
+                                  triton kernel launch
+```
+
+triton 的 JIT 缓存 / autotune / grid lambda 都在 wrapper 内,与 v2 解耦。
+`BLOCK_SIZE: tl.constexpr` 这类只在 grid 求值时用的常量不会进入 trace 的
+参数列表。
+
+**v2 与 v1 的细微差异**
+
+| 方面 | v1 | v2 (wrapper=False) |
+|---|---|---|
+| capture 是否需要 GPU | **需要**(fallback redispatch 必须真启动 kernel 拿输出 TensorImpl id) | 不需要(FakeTensorMode trace,kernel 不真启动) |
+| replay 是否需要 GPU | 需要 | 需要 |
+| 是否需要 `@register_fake` | 不需要(走真 backend) | 需要(AOT 走 FakeTensorMode 推导输出形状/dtype) |
+| 动态 shape | wrapper 内 `output.numel()` 每次 replay 重算,grid 跟随 | SymInt 经 `("S", arg_idx, dim)` 路由,grid 同样跟随 |
+| BLOCK_SIZE / constexpr | 不进 trace | 不进 trace |
+
+**测试覆盖**
+
+`test/test_v2_triton.py` 通过 module-load 时探测 `triton.runtime.driver.active`
+来 device-conditional skip:CPU-only torch build 自动 skip 全部 6 个用例,
+CUDA / NPU / XPU 上启用 end-to-end real launch。覆盖:
+
+- 单 OpOverload 节点结构断言(`test_v2_triton_opaque_in_fx_graph`)
+- v2 (direct) + v2 (wrapper) end-to-end correctness
+- v1 capture + replay,验证输入修改后输出跟随
+- triton_op + 变更 int 参数(组合 `("I", arg_idx)` 标量路由 + opaque op step)
+
+**已知限制**
+
+- 必须用 `@torch.library.triton_op` 注册而**不是**直接调用 `@triton.jit` kernel。
+  裸 `add_kernel[grid](...)` 不是 dispatcher 可见的 op,会在 Dynamo 启动点
+  graph-break。
+- 必须配合 `@triton_op.register_fake` 提供输出形状推导(v2 走 FakeTensorMode
+  必需;v1 可省略)。
+- v2 (wrapper=True) 在 Python 标量入参的 case 下会被入口 loud-fail 拦截
+  (§17.6.11 的 sibling 问题:aot_module 无 Dynamo,scalar 会被烤死)。
+  triton kernel 自身的 constexpr 不算 —— 它们在 wrapper 内不进入用户 fn
+  的 example_args。
