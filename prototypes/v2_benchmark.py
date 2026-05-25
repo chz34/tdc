@@ -306,10 +306,25 @@ def _build_alexnet():
 
 def _load_torchbench(name: str, batch_size=None, test: str = "eval"):
     """Load a torchbench model via its standardised Model API. Returns
-    (model, example_inputs) on success or None if anything goes wrong
+    (fn, example_inputs) on success or None if anything goes wrong
     (torchbench not installed, weight-download failure, model init
     error, incompatibility with the local torch version, ...). Failures
     are logged but never raise — the workload is just skipped.
+
+    Uses `bench.eval` as the captured callable -- the same zero-arg
+    entry point torchbench's own benchmarks use. All three framework
+    bases (HuggingFaceModel / TimmModel / TorchVisionModel) expose
+    eval() with the same signature: `eval(self) -> Tuple[Tensor]`
+    (vision returns the raw Tensor for some models). The method
+    handles the kwarg expansion (model(**self.example_inputs)) and
+    output post-processing (HF strips .logits) internally, so we
+    don't need to thread the dict/tuple/kwarg distinction through
+    our own pipeline. Returning `(bench.eval, ())` keeps the rest
+    of the benchmark loop's `fn(*inputs)` convention intact.
+
+    Trade-off: inputs are baked into `bench.example_inputs` at
+    construction; we can't replace them per call (which the dynamic-
+    shape benchmark doesn't need anyway).
 
     Expects the `torchbenchmark` package on sys.path (e.g. installed
     from the pytorch/benchmark repo via `pip install .`)."""
@@ -320,37 +335,10 @@ def _load_torchbench(name: str, batch_size=None, test: str = "eval"):
         if batch_size is not None:
             kwargs["batch_size"] = batch_size
         bench = mod.Model(**kwargs)
-        model, example_inputs = bench.get_module()
-        model.eval()
-        # torchbench's HuggingFaceModel returns example_inputs as a dict
-        # ({"input_ids": tensor, ...}); the timm/torchvision wrappers
-        # return tuples/lists. We must preserve the dict's keyword
-        # binding -- a naive `tuple(d.values())` would call
-        # `model(*tuple(d.values()))`, which passes the dict's values
-        # in DICT-INSERTION order to the model's forward signature in
-        # POSITIONAL order. Those rarely match: torchbench produces
-        # {"input_ids": ..., "decoder_input_ids": ...} for T5, whose
-        # forward signature is
-        # (input_ids, attention_mask=None, ..., decoder_input_ids=None);
-        # the decoder_input_ids tensor would silently land in
-        # attention_mask, producing wrong results.
-        #
-        # Wrap the model in a thin closure that re-keys positional
-        # args back to kwargs at call time. The closure variable
-        # `model` is detectable by v2's _scan_closure_modules, so
-        # parameter lifting (wrapper=True path) and Dynamo tracing
-        # (wrapper=False path) both work as if the user had passed
-        # the underlying nn.Module directly.
-        if isinstance(example_inputs, dict):
-            keys = tuple(example_inputs.keys())
-            values = tuple(example_inputs.values())
-            base = model
-            def call_with_kwargs(*positional):
-                return base(**dict(zip(keys, positional)))
-            call_with_kwargs.__name__ = (
-                f"{type(model).__name__}__kw({','.join(keys)})")
-            return call_with_kwargs, values
-        return model, tuple(example_inputs)
+        # bench.eval is a bound method; capture/replay paths only call
+        # it as fn(); v2's closure-scan / Dynamo tracing follows
+        # __self__ into bench's .model attribute to lift parameters.
+        return bench.eval, ()
     except Exception as e:
         print(f"# torchbench: skipping {name!r} ({type(e).__name__}: {str(e)[:160]})")
         return None
