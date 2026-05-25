@@ -231,6 +231,96 @@ class TestV2Capture(unittest.TestCase):
         self.assertTrue(torch.allclose(got.loss, ref.loss))
         self.assertTrue(torch.allclose(got.logits, ref.logits))
 
+    # ---- scaled_dot_product_attention (Optional[Tensor] arg routing)  ----
+    # SDPA is the canonical case where Tensor? args reach the C++ replay
+    # as None: attn_mask is Optional[Tensor]; on CPU SDPA lowers to
+    # aten::_scaled_dot_product_flash_attention_for_cpu whose schema has
+    # Tensor? attn_mask and float? scale. _compute_coercions used to
+    # mark None at a Tensor? slot as SCALAR_TO_TENSOR, then apply_coercion
+    # called iv.toScalar() on a None IValue and raised "IValue is not a
+    # Scalar". The fix in _predict_value_kind + _compute_coercions
+    # surfaces None as a distinct "none" kind and skips coercion when
+    # the schema is Optional[T] and value is None.
+
+    def test_sdpa_without_mask(self):
+        """F.scaled_dot_product_attention with no attn_mask -- the
+        attn_mask=None Optional[Tensor] arg is what used to break."""
+        import torch.nn.functional as F
+
+        def fn(q, k, v):
+            return F.scaled_dot_product_attention(q, k, v)
+
+        q = torch.randn(2, 4, 16, 8)
+        k = torch.randn(2, 4, 16, 8)
+        v = torch.randn(2, 4, 16, 8)
+        ref = fn(q, k, v)
+        captured = tdcv2.capture(fn, q, k, v)
+        with torch.no_grad():
+            got = captured(q, k, v)
+        self.assertTrue(torch.allclose(got, ref, atol=1e-4))
+
+    def test_sdpa_with_explicit_none(self):
+        """Mirror timm's call site: attn_mask=None passed explicitly,
+        dropout_p=0.0, is_causal=False. AOT lowers this to a graph
+        where the SDPA op's Optional[Tensor] slot is fed a None IValue
+        from a literal, exercising the None+OptionalType coercion path."""
+        import torch.nn.functional as F
+
+        def fn(q, k, v):
+            return F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=False,
+            )
+
+        q = torch.randn(2, 4, 32, 8)
+        k = torch.randn(2, 4, 32, 8)
+        v = torch.randn(2, 4, 32, 8)
+        ref = fn(q, k, v)
+        captured = tdcv2.capture(fn, q, k, v)
+        with torch.no_grad():
+            got = captured(q, k, v)
+        self.assertTrue(torch.allclose(got, ref, atol=1e-4))
+
+    def test_sdpa_inside_attention_module(self):
+        """Reproduce timm.models.vision_transformer.Attention's shape,
+        which exercises SDPA + reshape + linear sequence end-to-end.
+        Catches any future regression where wrapping SDPA inside an
+        nn.Module + param lift changes how AOT emits the Optional[T]
+        literals."""
+        import torch.nn as nn
+        import torch.nn.functional as F
+
+        class Attention(nn.Module):
+            def __init__(self, dim, n_heads):
+                super().__init__()
+                self.n_heads = n_heads
+                self.head_dim = dim // n_heads
+                self.qkv = nn.Linear(dim, dim * 3, bias=False)
+                self.proj = nn.Linear(dim, dim, bias=False)
+
+            def forward(self, x):
+                B, N, C = x.shape
+                qkv = self.qkv(x).reshape(
+                    B, N, 3, self.n_heads, self.head_dim
+                ).permute(2, 0, 3, 1, 4)
+                q, k, v = qkv.unbind(0)
+                # The SDPA call with Optional[Tensor] attn_mask=None.
+                out = F.scaled_dot_product_attention(q, k, v)
+                out = out.transpose(1, 2).reshape(B, N, C)
+                return self.proj(out)
+
+        m = Attention(dim=64, n_heads=4).eval()
+        x = torch.randn(2, 16, 64)
+        with torch.no_grad():
+            ref = m(x)
+        captured = tdcv2.capture(m, x)
+        with torch.no_grad():
+            got = captured(x)
+        self.assertTrue(torch.allclose(got, ref, atol=1e-4),
+                        f"max diff {(got-ref).abs().max().item():.3e}")
+
     def test_output_none_mixed_with_tensor(self):
         """None leaves intermixed with Tensors are preserved by the
         shaper without consuming a trace_out slot."""

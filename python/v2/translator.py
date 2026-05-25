@@ -219,10 +219,16 @@ def _node_arg_to_ref(value, node_to_ref):
 def _predict_value_kind(value, node_to_kind) -> str:
     """Predicted runtime IValue kind for a node-arg value.
 
-    Returns one of: tensor, int, float, bool, list, tuple, other.
+    Returns one of: tensor, int, float, bool, list, tuple, none, other.
     """
     if isinstance(value, fx.Node):
         return node_to_kind.get(value, "other")
+    # None must be a distinct kind: callers depend on it to detect
+    # Optional[T] arguments passed None and skip coercion (otherwise
+    # a Tensor? slot with None gets erroneously tagged SCALAR_TO_TENSOR
+    # and apply_coercion's iv.toScalar() raises at replay).
+    if value is None:
+        return "none"
     # bool must come before int (bool is int subclass)
     if isinstance(value, bool):
         return "bool"
@@ -355,8 +361,16 @@ def _compute_coercions(op, positional_kinds) -> List[Any]:
             out.append(NONE)
             continue
         sa_type = schema_args[k].type
-        # Unwrap Optional[T] -- coercion follows the inner type.
-        if sa_type.kind() == "OptionalType":
+        is_optional = sa_type.kind() == "OptionalType"
+        # Unwrap Optional[T] -- coercion follows the inner type, EXCEPT
+        # when the runtime value is actually None: then any coercion
+        # would dereference a None IValue (e.g. SCALAR_TO_TENSOR's
+        # iv.toScalar() raises "IValue is not a Scalar"). Pass None
+        # through unchanged.
+        if is_optional and kind == "none":
+            out.append(NONE)
+            continue
+        if is_optional:
             sa_type = sa_type.getElementType()
         kind_str = sa_type.kind()
         if kind_str == "TensorType":
