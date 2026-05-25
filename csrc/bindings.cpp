@@ -240,10 +240,11 @@ PYBIND11_MODULE(_C, m) {
     // -------------------------------------------------------------
 
     py::enum_<tdc::ArgCoercion>(m, "ArgCoercion")
-        .value("NONE",                tdc::ArgCoercion::kNone)
-        .value("SCALAR_TO_TENSOR",    tdc::ArgCoercion::kScalarToTensor)
-        .value("LIST_TO_INT_LIST",    tdc::ArgCoercion::kListToIntList)
-        .value("LIST_TO_TENSOR_LIST", tdc::ArgCoercion::kListToTensorList);
+        .value("NONE",                         tdc::ArgCoercion::kNone)
+        .value("SCALAR_TO_TENSOR",             tdc::ArgCoercion::kScalarToTensor)
+        .value("LIST_TO_INT_LIST",             tdc::ArgCoercion::kListToIntList)
+        .value("LIST_TO_TENSOR_LIST",          tdc::ArgCoercion::kListToTensorList)
+        .value("LIST_TO_OPTIONAL_TENSOR_LIST", tdc::ArgCoercion::kListToOptionalTensorList);
 
     py::enum_<tdc::BuiltinKind>(m, "BuiltinKind")
         .value("FLOORDIV", tdc::BuiltinKind::kFloorDiv)

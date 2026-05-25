@@ -136,10 +136,11 @@ namespace {
 
 const char* coercion_tag(ArgCoercion c) {
     switch (c) {
-        case ArgCoercion::kNone:             return "N";
-        case ArgCoercion::kScalarToTensor:   return "S>T";
-        case ArgCoercion::kListToIntList:    return "L>I";
-        case ArgCoercion::kListToTensorList: return "L>T";
+        case ArgCoercion::kNone:                      return "N";
+        case ArgCoercion::kScalarToTensor:            return "S>T";
+        case ArgCoercion::kListToIntList:             return "L>I";
+        case ArgCoercion::kListToTensorList:          return "L>T";
+        case ArgCoercion::kListToOptionalTensorList:  return "L>T?";
     }
     return "?";
 }

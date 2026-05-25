@@ -449,6 +449,44 @@ class TestV2Capture(unittest.TestCase):
                          f"expected Long, got {got.dtype}")
         self.assertTrue(torch.equal(got, ref))
 
+    # ---- aten::index.Tensor with Tensor?[] indices (Optional list) ---
+    # The schema is `aten::index.Tensor(Tensor self, Tensor?[] indices)`.
+    # `Tensor?[]` is `List<Optional<Tensor>>`; without
+    # LIST_TO_OPTIONAL_TENSOR_LIST coercion the boxed dispatcher
+    # raises "Tried to cast a List<Any> to a List<Tensor?>".
+
+    def test_index_with_tensor_indices(self):
+        """Fancy indexing with a tensor: x[idx]. AOT lowers this to
+        aten::index.Tensor whose `indices` arg expects
+        List<Optional<Tensor>>. The translator must emit
+        LIST_TO_OPTIONAL_TENSOR_LIST so apply_coercion builds the
+        strongly-typed list at replay."""
+        def fn(x, idx):
+            return x[idx]
+
+        x = torch.randn(10, 4)
+        idx = torch.tensor([0, 2, 5])
+        ref = fn(x, idx)
+        captured = tdcv2.capture(fn, x, idx)
+        with torch.no_grad():
+            got = captured(x, idx)
+        self.assertTrue(torch.allclose(got, ref))
+
+    def test_index_with_none_in_indices_list(self):
+        """x[:, idx] form passes a None alongside a Tensor in the
+        indices list. The Optional<Tensor> list must accept both,
+        with None resolving to std::nullopt in C++ apply_coercion."""
+        def fn(x, idx):
+            return x[:, idx]
+
+        x = torch.randn(6, 8)
+        idx = torch.tensor([1, 3, 7])
+        ref = fn(x, idx)
+        captured = tdcv2.capture(fn, x, idx)
+        with torch.no_grad():
+            got = captured(x, idx)
+        self.assertTrue(torch.allclose(got, ref))
+
     def test_output_none_mixed_with_tensor(self):
         """None leaves intermixed with Tensors are preserved by the
         shaper without consuming a trace_out slot."""

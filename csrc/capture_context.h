@@ -86,6 +86,14 @@ enum class ArgCoercion : uint8_t {
     kScalarToTensor,    // Scalar (int/float/bool) -> 0-d Tensor
     kListToIntList,     // GenericList<IValue<int>> -> c10::List<int64_t>
     kListToTensorList,  // GenericList<IValue<Tensor>> -> c10::List<at::Tensor>
+    // For schemas like `aten::index.Tensor(Tensor self, Tensor?[] indices)`
+    // where the element type is Optional[Tensor]. PyTorch's boxed call
+    // expects the IValue to be a c10::List<std::optional<at::Tensor>>;
+    // a plain List<at::Tensor> won't cast and a raw List<IValue> raises
+    // "Tried to cast a List<Any> to a List<Tensor?>". Element-wise: a
+    // None IValue becomes std::nullopt, a Tensor IValue becomes the
+    // tensor wrapped in an optional.
+    kListToOptionalTensorList,
 };
 
 // Tag for kPyCall steps. The few Python builtin / torch.sym helpers

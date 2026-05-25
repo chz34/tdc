@@ -188,6 +188,25 @@ inline c10::IValue apply_coercion(c10::IValue iv, ArgCoercion tag) {
             }
             return c10::IValue(std::move(tensors));
         }
+        case ArgCoercion::kListToOptionalTensorList: {
+            // For schemas like aten::index.Tensor's Tensor?[] indices:
+            // walk a GenericList<IValue> and build the strongly-typed
+            // c10::List<std::optional<at::Tensor>> the boxed call site
+            // expects. None elements -> std::nullopt; Tensor elements
+            // -> wrapped Tensor.
+            const auto& generic = iv.toList();
+            c10::List<std::optional<at::Tensor>> opts;
+            opts.reserve(generic.size());
+            for (const auto& e : generic) {
+                c10::IValue elem(e);
+                if (elem.isNone()) {
+                    opts.push_back(std::nullopt);
+                } else {
+                    opts.push_back(elem.toTensor());
+                }
+            }
+            return c10::IValue(std::move(opts));
+        }
     }
     return iv;
 }

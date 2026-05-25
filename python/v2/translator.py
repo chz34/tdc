@@ -390,6 +390,7 @@ def _compute_coercions(op, positional_kinds) -> List[Any]:
     SCALAR_T = _C.ArgCoercion.SCALAR_TO_TENSOR
     LIST_I = _C.ArgCoercion.LIST_TO_INT_LIST
     LIST_T = _C.ArgCoercion.LIST_TO_TENSOR_LIST
+    LIST_OPT_T = _C.ArgCoercion.LIST_TO_OPTIONAL_TENSOR_LIST
 
     out: List[Any] = []
     for k, kind in enumerate(positional_kinds):
@@ -425,12 +426,21 @@ def _compute_coercions(op, positional_kinds) -> List[Any]:
                 out.append(NONE)
         elif kind_str == "ListType":
             if kind == "list":
-                elem_kind = sa_type.getElementType().kind()
+                elem_type = sa_type.getElementType()
+                elem_kind = elem_type.kind()
                 # SymInt[] / int[] both surface as IntType at this layer.
                 if elem_kind in ("IntType", "SymIntType"):
                     out.append(LIST_I)
                 elif elem_kind == "TensorType":
                     out.append(LIST_T)
+                elif (elem_kind == "OptionalType"
+                      and elem_type.getElementType().kind() == "TensorType"):
+                    # Tensor?[] -- e.g. aten::index.Tensor's `indices`.
+                    # Boxed call expects c10::List<std::optional<at::Tensor>>;
+                    # without this branch we emit a List<IValue> and
+                    # PyTorch raises "Tried to cast a List<Any> to a
+                    # List<Tensor?>" at replay.
+                    out.append(LIST_OPT_T)
                 else:
                     out.append(NONE)
             else:
