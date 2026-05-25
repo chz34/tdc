@@ -249,7 +249,19 @@ def _load_torchbench(name: str, batch_size=None, test: str = "eval"):
         bench = mod.Model(**kwargs)
         model, example_inputs = bench.get_module()
         model.eval()
-        return model, tuple(example_inputs)
+        # torchbench's HuggingFaceModel returns example_inputs as a dict
+        # ({"input_ids": tensor, ...}); the timm/torchvision wrappers
+        # return tuples/lists. Naively `tuple(example_inputs)` on a
+        # dict yields the KEYS (strings) and discards the tensors --
+        # the downstream `model(*inputs)` then passes "input_ids" as
+        # the first positional arg and hits AttributeError: 'str'
+        # object has no attribute 'size'. Dispatch on type so both
+        # input shapes work.
+        if isinstance(example_inputs, dict):
+            example_inputs = tuple(example_inputs.values())
+        else:
+            example_inputs = tuple(example_inputs)
+        return model, example_inputs
     except Exception as e:
         print(f"# torchbench: skipping {name!r} ({type(e).__name__}: {str(e)[:160]})")
         return None
