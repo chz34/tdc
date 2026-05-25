@@ -43,7 +43,80 @@ from _device import DEVICE, SYNC, print_device_banner  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
-# Workloads — three sizes, intentionally CPU-only so timing is reproducible.
+# Triton softmax kernel + torch.library.triton_op registration.
+# Mirrors test/test_v2_triton.py: defines a row-wise softmax kernel and
+# registers it as a dispatcher-visible op so v1/v2 can capture/replay it
+# like any other OpOverload. The op appears as a single call_function
+# node in the FX graph (no decomposition), so the translator emits one
+# kTensorOp Step per kernel call -- dispatch overhead is the same whether
+# the kernel is aten or triton.
+#
+# Sizes are chosen so one block covers the whole row (n_cols <= 1024),
+# avoiding multi-block reductions. 512 -> BLOCK_SIZE=512, 1024 ->
+# BLOCK_SIZE=1024.
+# ---------------------------------------------------------------------------
+def _detect_triton_available():
+    try:
+        import triton
+    except ImportError as e:
+        return False, f"triton not installed ({e})"
+    try:
+        target = triton.runtime.driver.active.get_current_target()
+        return True, f"target={target}"
+    except Exception as e:
+        return False, (
+            f"triton has no active driver for {DEVICE.type} "
+            f"({type(e).__name__}: {str(e)[:80]})"
+        )
+
+
+TRITON_AVAILABLE, TRITON_REASON = _detect_triton_available()
+
+if TRITON_AVAILABLE:
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _softmax_kernel(
+        x_ptr, output_ptr, n_cols,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        offsets = row * n_cols + tl.arange(0, BLOCK_SIZE)
+        mask = tl.arange(0, BLOCK_SIZE) < n_cols
+        x = tl.load(x_ptr + offsets, mask=mask, other=-float("inf"))
+        x_max = tl.max(x, axis=0)
+        x = x - x_max
+        num = tl.exp(x)
+        den = tl.sum(num, axis=0)
+        tl.store(output_ptr + offsets, num / den, mask=mask)
+
+    @torch.library.triton_op("tdc_bench::softmax_triton", mutates_args={})
+    def softmax_triton(x: torch.Tensor) -> torch.Tensor:
+        output = torch.empty_like(x)
+        n_rows, n_cols = x.shape
+        BLOCK_SIZE = triton.next_power_of_2(n_cols)
+        grid = (n_rows,)
+        torch.library.wrap_triton(_softmax_kernel)[grid](
+            x, output, n_cols, BLOCK_SIZE=BLOCK_SIZE,
+        )
+        return output
+
+    @softmax_triton.register_fake
+    def _(x):
+        return torch.empty_like(x)
+
+    def workload_triton_softmax(x):
+        """Triton softmax -> scale + bias (attention post-processing)."""
+        return softmax_triton(x) * 1.5 + 0.1
+
+else:
+    softmax_triton = None           # type: ignore[assignment]
+    workload_triton_softmax = None  # type: ignore[assignment]
+
+
+# ---------------------------------------------------------------------------
+# Workloads -- three sizes, intentionally CPU-only so timing is reproducible.
 # ---------------------------------------------------------------------------
 def workload_tiny(x):
     """Smallest case: 1 sym arith + 1 aten op."""
@@ -340,6 +413,23 @@ WORKLOADS = {
         (_rand(64, 3, 224, 224),),
     ),
 }
+# Triton softmax workloads: exercised only when TRITON_AVAILABLE is True
+# (GPU required). Each entry runs a triton softmax kernel followed by a
+# small aten post-processing chain, comparing eager vs dynamo/aot_eager/
+# inductor/v1/v2. The triton_op appears as a single opaque OpOverload in
+# the graph, so the dispatch-to-compute ratio is high -- v2's C++ replay
+# should show the largest relative speedup here.
+if TRITON_AVAILABLE:
+    WORKLOADS.update({
+        "triton softmax (512x512)": (
+            workload_triton_softmax,
+            (_rand(512, 512),),
+        ),
+        "triton softmax (1024x1024)": (
+            workload_triton_softmax,
+            (_rand(1024, 1024),),
+        ),
+    })
 
 
 # ---------------------------------------------------------------------------
