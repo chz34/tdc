@@ -35,6 +35,7 @@ from torch import fx
 __all__ = [
     "rewrite_prims_in_gm",
     "rewrite_slice_scatter_to_inplace",
+    "eliminate_dead_clones",
 ]
 
 
@@ -269,3 +270,112 @@ def _rewrite_slice_scatter_pass(
             gm.graph.erase_node(ss_base)
         changed = True
     return changed
+
+
+# ---------------------------------------------------------------------------
+# aten::clone(x, memory_format=None) elimination
+# ---------------------------------------------------------------------------
+def eliminate_dead_clones(gm: fx.GraphModule) -> fx.GraphModule:
+    """Remove `aten::clone(x, memory_format=None)` nodes that AOT
+    decomposes nn.Dropout (and similar identity-in-inference modules)
+    into, when no downstream user mutates the clone's result.
+
+    Why these clones exist: PyTorch's autograd contract requires
+    dropout/dropoutXd/drop_path to return a NEW tensor with its own
+    grad_fn even when train=False / p=0 (so user code that does
+    `y = dropout(x); y.add_(1)` doesn't silently mutate x). The
+    decomposition therefore emits `aten::clone(x, None)` in inference
+    mode -- a full-tensor memcpy with no semantic effect. timm ViT
+    eval triggers ~3 of these per transformer block (proj_drop,
+    act_drop, mlp_drop), each ~19MB on a (B=64, S=197, dim=384) fp32
+    tensor. On accelerators where dispatch isn't the bottleneck (NPU,
+    big-batch GPU) this becomes a 700MB+ extra HBM traffic per
+    forward and makes replay slower than eager (eager calls the
+    dropout C++ op directly, which fuses the clone with the autograd
+    no-op into one cheap kernel; we expand it into a free-standing
+    clone Step).
+
+    Safety: only eliminate when ALL of
+      - memory_format kwarg is None / absent (don't drop
+        format-conversion clones used to materialize a contiguous
+        copy before _unsafe_view -- those are real work eager would
+        also do via reshape)
+      - every user is a non-mutating OpOverload (no schema arg with
+        alias_info.is_write referencing the clone). copy_, add_,
+        mul_, etc. with the clone result as the mutated slot keep
+        the clone.
+
+    Idempotent.
+    """
+    clone_op = torch.ops.aten.clone.default
+    changed = False
+    for node in list(gm.graph.nodes):
+        if not (node.op == "call_function" and node.target is clone_op):
+            continue
+        # Resolve memory_format from positional/kwarg.
+        mem_fmt = None
+        if len(node.args) >= 2:
+            mem_fmt = node.args[1]
+        elif "memory_format" in node.kwargs:
+            mem_fmt = node.kwargs["memory_format"]
+        if mem_fmt is not None:
+            continue
+        if not node.args:
+            continue
+        src = node.args[0]
+        # Audit every user: refuse to eliminate if any consumer takes
+        # the clone result into a mutated slot. Be defensive about
+        # non-OpOverload targets (operator.getitem etc.) -- those
+        # don't mutate but we still want a schema to inspect, so we
+        # accept them only when their behaviour is read-only by
+        # construction.
+        if not _all_users_treat_as_read_only(node):
+            continue
+        node.replace_all_uses_with(src)
+        gm.graph.erase_node(node)
+        changed = True
+    if changed:
+        gm.graph.lint()
+        gm.recompile()
+    return gm
+
+
+def _all_users_treat_as_read_only(node: fx.Node) -> bool:
+    import operator
+    for user in node.users:
+        # The graph's `output` node is just "yield this value to the
+        # caller" -- read-only by construction. Recognise it before
+        # the schema dispatch (its .target is the string "output", not
+        # an OpOverload).
+        if user.op == "output":
+            continue
+        tgt = user.target
+        if tgt is operator.getitem:
+            continue
+        if not isinstance(tgt, torch._ops.OpOverload):
+            # Unknown callable -- be safe and keep the clone.
+            return False
+        schema_args = tgt._schema.arguments
+        # Find every positional slot in `user.args` that points at
+        # `node`. If the corresponding schema arg has alias_info.is_write
+        # set, this user mutates the clone's result.
+        for slot, arg in enumerate(user.args):
+            if arg is not node:
+                continue
+            if slot >= len(schema_args):
+                # Variadic / out-of-schema -- be safe.
+                return False
+            sa = schema_args[slot]
+            if sa.alias_info is not None and sa.alias_info.is_write:
+                return False
+        # kwargs path: check kwargs that reference the clone.
+        for name, arg in user.kwargs.items():
+            if arg is not node:
+                continue
+            # Find schema arg by name.
+            matched = next((sa for sa in schema_args if sa.name == name), None)
+            if matched is None:
+                return False
+            if matched.alias_info is not None and matched.alias_info.is_write:
+                return False
+    return True

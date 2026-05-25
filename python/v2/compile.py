@@ -21,6 +21,7 @@ from torch import fx
 from torch._dynamo.backends.common import aot_autograd
 
 from .fx_passes import (
+    eliminate_dead_clones,
     rewrite_prims_in_gm,
     rewrite_slice_scatter_to_inplace,
 )
@@ -240,6 +241,11 @@ def _capture_positional(fn, example_args, allow_grad: bool, wrapper: bool = True
         # already keeps in-place ops as-is, so slice_scatter never
         # appears in the graph -- no need for the rewrite here.
         gm = rewrite_prims_in_gm(gm)
+        # Drop dead clones (nn.Dropout in eval, etc.) before translation.
+        # These are real per-call memcpys on accelerator devices; without
+        # this pass timm ViT replay is dominated by ~37 spurious 19MB
+        # tensor copies (DESIGN: docstring of eliminate_dead_clones).
+        gm = eliminate_dead_clones(gm)
         trace = translate_graph(gm)
         state = {
             "trace": trace,
@@ -401,6 +407,7 @@ def _capture_via_aot_wrapper(fn, example_args):
         # aot_module below) keeps in-place ops as-is, so the
         # slice_scatter rewrite isn't needed here.
         gm = rewrite_prims_in_gm(gm)
+        gm = eliminate_dead_clones(gm)
         trace = translate_graph(gm)
         captured.append({"trace": trace, "gm": gm})
         def run_via_trace(*flat_args):
@@ -575,6 +582,7 @@ def _capture_with_backward(fn, example_args):
         # translate.
         gm = rewrite_prims_in_gm(gm)
         gm = rewrite_slice_scatter_to_inplace(gm)
+        gm = eliminate_dead_clones(gm)
         trace = translate_graph(gm)
         state = {"trace": trace, "gm": gm, "observed_args": None}
         captured.append(state)

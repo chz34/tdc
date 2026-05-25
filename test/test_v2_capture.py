@@ -321,6 +321,80 @@ class TestV2Capture(unittest.TestCase):
         self.assertTrue(torch.allclose(got, ref, atol=1e-4),
                         f"max diff {(got-ref).abs().max().item():.3e}")
 
+    # ---- dead-clone elimination (eliminate_dead_clones FX pass) ------
+    # nn.Dropout in eval mode (and other identity-in-inference modules)
+    # decomposes to aten::clone(x, None) under AOT. The clone is a real
+    # per-replay memcpy with no semantic effect. eliminate_dead_clones
+    # removes these but must KEEP aten::clone(x, contiguous_format)
+    # used to materialize a non-contiguous view (e.g. after transpose
+    # before _unsafe_view).
+
+    def test_dead_clone_from_dropout_in_eval_is_removed(self):
+        """nn.Dropout in eval mode should not contribute any clone Step
+        to the captured trace. Without the pass the dropout decomp
+        leaves an aten::clone(x, None) in the graph."""
+        import torch.nn as nn
+
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = nn.Linear(16, 16, bias=False)
+                self.drop = nn.Dropout(p=0.1)
+
+            def forward(self, x):
+                return self.drop(self.linear(x))
+
+        m = M().eval()
+        x = torch.randn(4, 16)
+        captured = tdcv2.capture(m, x)
+        # Trace exposes its repr; assert no aten::clone step survived.
+        s = repr(captured.trace)
+        self.assertNotIn(
+            "aten::clone", s,
+            f"unexpected clone in trace (dropout decomp not eliminated):\n{s}"
+        )
+        with torch.no_grad():
+            self.assertTrue(torch.allclose(captured(x), m(x), atol=1e-5))
+
+    def test_clone_with_contiguous_format_is_preserved(self):
+        """A clone(memory_format=torch.contiguous_format) is real work
+        the eager path also does (it's what `.contiguous()` lowers to).
+        The pass must keep it; removing it would break downstream
+        _unsafe_view operations that require contiguous storage."""
+        def fn(x):
+            # transpose is a view, contiguous() forces a copy, reshape
+            # then does the layout the kernel needs. AOT typically
+            # lowers this to view + clone(contiguous) + _unsafe_view.
+            return x.transpose(0, 1).contiguous().reshape(-1)
+
+        x = torch.randn(4, 5)
+        captured = tdcv2.capture(fn, x)
+        with torch.no_grad():
+            ref = fn(x)
+            got = captured(x)
+        self.assertTrue(torch.allclose(got, ref))
+
+    def test_clone_whose_result_is_mutated_in_place_is_preserved(self):
+        """A clone whose result is the destination of an in-place op
+        cannot be removed -- removing it would forward the mutation
+        onto the source tensor. The pass's per-user schema check
+        (alias_info.is_write) is what catches this."""
+        def fn(x):
+            y = x.clone()
+            y.add_(1.0)
+            return y
+
+        x = torch.randn(8)
+        x_before = x.clone()
+        captured = tdcv2.capture(fn, x)
+        with torch.no_grad():
+            y = captured(x)
+        # x must NOT have been mutated -- if the clone were elided,
+        # the in-place add_ would have flowed onto x.
+        self.assertTrue(torch.allclose(x, x_before),
+                        "source x was mutated, indicating the clone was wrongly elided")
+        self.assertTrue(torch.allclose(y, x_before + 1.0))
+
     def test_output_none_mixed_with_tensor(self):
         """None leaves intermixed with Tensors are preserved by the
         shaper without consuming a trace_out slot."""
