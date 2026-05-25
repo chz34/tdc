@@ -75,7 +75,26 @@ void Trace::replay() {
                 case StepInputRef::Kind::kPrevStepOutput: {
                     TORCH_INTERNAL_ASSERT(ref.prev_step < i);
                     TORCH_INTERNAL_ASSERT(ref.prev_slot < outputs[ref.prev_step].size());
-                    const auto& iv = outputs[ref.prev_step][ref.prev_slot];
+                    const auto& parent = outputs[ref.prev_step][ref.prev_slot];
+                    c10::IValue iv;
+                    if (ref.prev_list_sub_slot < 0) {
+                        iv = parent;
+                    } else {
+                        // Tensor is element [sub_slot] of a List[Tensor]
+                        // output (unbind / split / chunk / ...).
+                        TORCH_CHECK(parent.isList(),
+                            "v1 replay: step ", ref.prev_step, " slot ",
+                            ref.prev_slot, " is not a list IValue but a "
+                            "PrevStepListElement ref expects one");
+                        auto list = parent.toList();
+                        TORCH_CHECK(
+                            static_cast<size_t>(ref.prev_list_sub_slot)
+                                < list.size(),
+                            "v1 replay: list sub_slot ",
+                            ref.prev_list_sub_slot, " out of range (list size ",
+                            list.size(), ")");
+                        iv = list[ref.prev_list_sub_slot];
+                    }
                     if (ref.is_out && iv.isTensor()) {
                         iv.toTensor().unsafeGetTensorImpl()->set_sizes_contiguous({0});
                     }

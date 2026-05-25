@@ -254,6 +254,55 @@ class TestCorrectness(unittest.TestCase):
             trace.replay()
             torch.testing.assert_close(obs, torch.full((2, 3), 3.0, device=DEVICE))
 
+    def test_unbind_outputs_tracked_through_replay(self):
+        """ops returning List[Tensor] (unbind/split/chunk/...) put their
+        results in a list IValue, and Python-level destructure
+        (`q, k, v = qkv.unbind(0)`) doesn't go through the dispatcher.
+        The capture fallback walks the list at output time and records
+        each element's TensorImpl identity with a sub_slot, so a later
+        op that consumes q/k/v finds them via PrevStepListElement refs.
+
+        Without this, the test_unbind_outputs_* tensors are misclassified
+        as captured (frozen at capture-time values) and any later mutation
+        of the source tensor is ignored at replay -- the prior failure
+        on timm_vision_transformer's Attention block."""
+        with torch.no_grad():
+            qkv = torch.randn(3, 4, 8, device=DEVICE)
+            out = torch.empty(4, 8, device=DEVICE)
+
+            with tdc.capture() as trace:
+                q, k, v = qkv.unbind(0)
+                out.copy_(q + k + v)
+
+            # After capture, out should equal q + k + v at capture-time.
+            torch.testing.assert_close(out, qkv[0] + qkv[1] + qkv[2])
+
+            # Mutate qkv and replay. The unbind outputs must be picked
+            # up live from the re-executed unbind step, not frozen to
+            # capture-time values.
+            qkv.copy_(torch.randn(3, 4, 8, device=DEVICE))
+            trace.replay()
+            torch.testing.assert_close(out, qkv[0] + qkv[1] + qkv[2])
+
+    def test_split_outputs_tracked_through_replay(self):
+        """Same principle as unbind, exercising aten::split.Tensor
+        (returns Tensor[]) to be sure the list-walk covers the
+        whole split/chunk family, not just unbind."""
+        with torch.no_grad():
+            x = torch.randn(12, device=DEVICE)
+            out = torch.empty(4, device=DEVICE)
+
+            with tdc.capture() as trace:
+                # split into three 4-element chunks
+                a, b, c = torch.split(x, 4, dim=0)
+                out.copy_(a + b + c)
+
+            torch.testing.assert_close(out, x[:4] + x[4:8] + x[8:])
+
+            x.copy_(torch.randn(12, device=DEVICE))
+            trace.replay()
+            torch.testing.assert_close(out, x[:4] + x[4:8] + x[8:])
+
     def test_view_with_inferred_dim(self):
         """view(-1, N) — the -1 is computed at kernel time, so it follows
         whatever size the input currently has. This is the dynamic-shape

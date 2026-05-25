@@ -45,6 +45,16 @@ struct StepInputRef {
     size_t captured_idx{0};                     // kCapturedTensor / kCapturedInt
     size_t prev_step{0};                        // kPrevStepOutput
     size_t prev_slot{0};                        // kPrevStepOutput
+    // For ops that return a List[Tensor] (unbind, split, chunk, ...) the
+    // single positional output IValue at (prev_step, prev_slot) is itself
+    // a list of tensors. prev_list_sub_slot >= 0 selects an element of
+    // that list at replay time; -1 means the IValue at (prev_step,
+    // prev_slot) IS the value we want (the common case for scalar /
+    // single-Tensor / Tuple[Tensor] returns). See classify_input in
+    // capture_fallback.cpp for why this matters: the Python-level
+    // `q, k, v = qkv.unbind(0)` doesn't go through the dispatcher, so
+    // v1 has no other way to track each sub-tensor's identity.
+    int prev_list_sub_slot{-1};                 // kPrevStepOutput (-1 if none)
     c10::IValue literal;                        // kLiteral
     std::vector<StepInputRef> list_elements;    // kList
     // If true, this arg is a schema-declared `out=` tensor (pure write).
@@ -56,6 +66,11 @@ struct StepInputRef {
 
     static StepInputRef CapturedTensor(size_t idx, bool is_out = false);
     static StepInputRef PrevStepOutput(size_t step, size_t slot, bool is_out = false);
+    // Same as PrevStepOutput but resolves to the (sub_slot)-th element of
+    // a list IValue at (step, slot). Used by v1 to track tensors that
+    // came out of list-returning ops like unbind / split / chunk.
+    static StepInputRef PrevStepListElement(size_t step, size_t slot, int sub_slot,
+                                            bool is_out = false);
     static StepInputRef Literal(c10::IValue v);
     static StepInputRef CapturedInt(size_t idx);
     static StepInputRef List(std::vector<StepInputRef> elements);
@@ -183,14 +198,25 @@ public:
     }
 
     // ---- v1-only: capture-time TensorImpl identity tracking ----
-    void register_output_identity(c10::TensorImpl* impl, size_t step, size_t slot) {
-        tensor_to_step_[impl] = {step, slot};
+    // sub_slot == -1: tensor IS the IValue at outputs[step][slot]
+    // sub_slot >= 0:  tensor is at outputs[step][slot][sub_slot]
+    //                 (the parent IValue is a List[Tensor], e.g. from unbind)
+    struct OutputLoc {
+        size_t step;
+        size_t slot;
+        int sub_slot;
+    };
+    void register_output_identity(c10::TensorImpl* impl, size_t step, size_t slot,
+                                  int sub_slot = -1) {
+        tensor_to_step_[impl] = OutputLoc{step, slot, sub_slot};
     }
-    bool lookup_output_identity(c10::TensorImpl* impl, size_t& step, size_t& slot) const {
+    bool lookup_output_identity(c10::TensorImpl* impl, size_t& step, size_t& slot,
+                                int& sub_slot) const {
         auto it = tensor_to_step_.find(impl);
         if (it == tensor_to_step_.end()) return false;
-        step = it->second.first;
-        slot = it->second.second;
+        step = it->second.step;
+        slot = it->second.slot;
+        sub_slot = it->second.sub_slot;
         return true;
     }
 
@@ -241,7 +267,7 @@ private:
     // means placeholder k is pre-bound — skipped during arg routing.
     std::vector<bool> v2_arg_pre_bound_;
     // v1 capture-time bookkeeping: TensorImpl* -> (step, output slot).
-    std::unordered_map<c10::TensorImpl*, std::pair<size_t, size_t>> tensor_to_step_;
+    std::unordered_map<c10::TensorImpl*, OutputLoc> tensor_to_step_;
 
     // ---- v2 fields ----
     // Captured ints come from Dynamo prelude (call_size etc.) at replay

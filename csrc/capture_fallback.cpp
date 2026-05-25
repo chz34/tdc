@@ -38,8 +38,14 @@ StepInputRef classify_input(c10::IValue iv, Trace& trace, bool is_out) {
         const auto& t = iv.toTensor();
         auto* impl = t.unsafeGetTensorImpl();
         size_t step, slot;
-        if (trace.lookup_output_identity(impl, step, slot)) {
-            return StepInputRef::PrevStepOutput(step, slot, is_out);
+        int sub_slot;
+        if (trace.lookup_output_identity(impl, step, slot, sub_slot)) {
+            if (sub_slot < 0) {
+                return StepInputRef::PrevStepOutput(step, slot, is_out);
+            }
+            // Tensor came from a list-returning op (unbind / split / chunk
+            // / meshgrid). Resolve to (step, slot)[sub_slot] at replay.
+            return StepInputRef::PrevStepListElement(step, slot, sub_slot, is_out);
         }
         size_t idx = trace.append_captured_tensor(t);
         return StepInputRef::CapturedTensor(idx, is_out);
@@ -101,6 +107,23 @@ void capture_fallback(const c10::OperatorHandle& op,
         if (iv.isTensor()) {
             auto* impl = iv.toTensor().unsafeGetTensorImpl();
             trace->register_output_identity(impl, step_idx, slot);
+        } else if (iv.isList()) {
+            // List-returning ops (unbind / split / chunk / meshgrid /
+            // tensor_split) put a c10::List<IValue> at this slot. The
+            // Python-level destructure `q, k, v = ...` doesn't go
+            // through the dispatcher, so v1 has no other chance to
+            // register each element's TensorImpl identity. Walk the
+            // list and register each tensor with its sub_slot so a
+            // later op that consumes q / k / v can find them.
+            auto list = iv.toList();
+            for (size_t k = 0; k < list.size(); ++k) {
+                c10::IValue elem = list[k];
+                if (elem.isTensor()) {
+                    auto* impl = elem.toTensor().unsafeGetTensorImpl();
+                    trace->register_output_identity(
+                        impl, step_idx, slot, static_cast<int>(k));
+                }
+            }
         }
     }
 

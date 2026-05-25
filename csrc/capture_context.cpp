@@ -31,6 +31,17 @@ StepInputRef StepInputRef::PrevStepOutput(size_t step, size_t slot, bool is_out)
     return r;
 }
 
+StepInputRef StepInputRef::PrevStepListElement(
+    size_t step, size_t slot, int sub_slot, bool is_out) {
+    StepInputRef r;
+    r.kind = Kind::kPrevStepOutput;
+    r.prev_step = step;
+    r.prev_slot = slot;
+    r.prev_list_sub_slot = sub_slot;
+    r.is_out = is_out;
+    return r;
+}
+
 StepInputRef StepInputRef::Literal(c10::IValue v) {
     StepInputRef r;
     r.kind = Kind::kLiteral;
@@ -89,6 +100,9 @@ std::string Trace::dump() const {
                     break;
                 case StepInputRef::Kind::kPrevStepOutput:
                     os << "step" << ref.prev_step << ":" << ref.prev_slot;
+                    if (ref.prev_list_sub_slot >= 0) {
+                        os << "[" << ref.prev_list_sub_slot << "]";
+                    }
                     break;
                 case StepInputRef::Kind::kLiteral:
                     os << "lit(" << ref.literal.tagKind() << ")";
