@@ -1597,3 +1597,113 @@ functionalize 让 scalar 进入 IR。那一节的修复是 device-promote(把 cp
 tensor 在 capture 时挪到目标 device,消除每次 replay 的 H2D 同步);本节的修复
 是 dtype-preserve(让 0-d tensor 的 dtype 准确反映 Scalar 来源)。两个修复**正交**,
 都已落地。
+
+#### 17.6.15 已知翻译缺陷:Tensor?[] schema 无对应 coercion
+
+在 hf_GPT2 等用 fancy tensor indexing 的模型上,v2 在 capture 阶段的第一次
+example call 直接 raise:
+
+```
+RuntimeError: Tried to cast a List<Any> to a List<Tensor?>. Types mismatch.
+```
+
+trace 翻译本身**完全成功**,失败在 C++ boxed dispatch 试图把 IValue 装回
+op 的 schema 参数列表那一步。
+
+**根因**
+
+`aten::index.Tensor` 的 schema 是 `(Tensor self, Tensor?[] indices) -> Tensor`,
+其中 `Tensor?[]` 在 C++ 端是 `c10::List<std::optional<at::Tensor>>`。PyTorch
+的 boxed dispatcher 解 IValue → 实际 C++ 参数时**类型严格**:必须看到这个
+具体的强类型 list。
+
+translator 的 `_compute_coercions` 旧版对 ListType 只识别三种 element kind:
+
+```python
+elif kind_str == "ListType":
+    if kind == "list":
+        elem_kind = sa_type.getElementType().kind()
+        if elem_kind in ("IntType", "SymIntType"):
+            out.append(LIST_I)
+        elif elem_kind == "TensorType":
+            out.append(LIST_T)
+        else:
+            out.append(NONE)    # ← Tensor?[] 落到这里,不做 coercion
+```
+
+`Tensor?` 的 kind 是 `OptionalType`,不是 `TensorType`,所以一直走到
+`else: NONE`。trace 里这个 slot 留着 `List<IValue>`(`kList` ref kind 默认产出
+generic list),replay 时 boxed cast 检查"`List<IValue>` 能装进 `List<Tensor?>`
+吗?" → 不能,raise 上面的错误。
+
+任何带 `Tensor?[]` 参数的 op 都会触发,只是 `aten::index.Tensor` 是最常见
+出现点。HF GPT2 attention 的因果 mask 路径(`x[:, :, :seq, :seq]` 之类)
+每个 block 用一次,12 层就是 12 个调用点。
+
+**为什么 List<Tensor> 不够**
+
+`LIST_TO_TENSOR_LIST` 已经存在,但它生成的是 `c10::List<at::Tensor>` —— 跟
+schema 要的 `c10::List<std::optional<at::Tensor>>` 是**两个完全不同的 C++
+类型**(后者每个元素带 optional wrapper,且允许 None)。PyTorch 不做隐式
+转换,所以必须有专门的 coercion 对应 Optional<Tensor> 这个内层类型。
+
+**修复方案**
+
+跨四层的小改动:
+
+1. C++ enum `ArgCoercion` 加 `kListToOptionalTensorList`
+2. `apply_coercion` 新 case:
+   ```cpp
+   case ArgCoercion::kListToOptionalTensorList: {
+       const auto& generic = iv.toList();
+       c10::List<std::optional<at::Tensor>> opts;
+       opts.reserve(generic.size());
+       for (const auto& e : generic) {
+           c10::IValue elem(e);
+           if (elem.isNone()) opts.push_back(std::nullopt);
+           else               opts.push_back(elem.toTensor());
+       }
+       return c10::IValue(std::move(opts));
+   }
+   ```
+3. binding 暴露 `LIST_TO_OPTIONAL_TENSOR_LIST`;debug tag 加 `L>T?`
+4. translator `_compute_coercions` 加新分支:
+   ```python
+   elif (elem_kind == "OptionalType"
+         and elem_type.getElementType().kind() == "TensorType"):
+       out.append(LIST_OPT_T)
+   ```
+
+**为什么需要单独 case 而非复用 LIST_TO_TENSOR_LIST**
+
+两个原因:
+
+1. `c10::List<at::Tensor>` 和 `c10::List<std::optional<at::Tensor>>` 是
+   **不同模板实例化**,IValue 类型 tag 不同,boxed dispatcher 严格区分。
+2. `Tensor?[]` 允许某些元素为 None(常见用例:`x[:, idx]` 表示第 0 维
+   全选 + 第 1 维按 idx 索引,Dynamo 把"第 0 维全选"编码为 `None` 列表
+   元素)。`List<Tensor>` 不能装 None,会在 `elem.toTensor()` raise。
+
+**性能影响**
+
+`apply_coercion` 的新 case 是 O(list_size) 的 IValue 处理,**每次 replay
+都跑一遍**。对 aten::index.Tensor 这种 list 长度通常 1~4 的 op,开销 < 100ns。
+未来如果发现这是热点,可以仿照 `frozen_list` 优化(translation 时把所有元素
+都是 fx.Node 引用的 list 转成 typed list)对 `Tensor?[]` 也做 freezing,
+但目前看不需要。
+
+**实测**
+
+| 模型 | 改前 | 改后 |
+|---|---|---|
+| hf_GPT2 (124M, B=2, S=256) | `cast List<Any> to List<Tensor?>` raise | ✅ 端到端,max_diff = 0.000e+00 |
+| timm_vision_transformer | ok | ok(无影响) |
+| alexnet | ok | ok(无影响) |
+
+**该缺陷的诊断方法**
+
+| 看到 | 含义 |
+|---|---|
+| `RuntimeError: Tried to cast a List<Any> to a List<Tensor?>` | 直接命中本节,升级到含 `LIST_TO_OPTIONAL_TENSOR_LIST` 的 translator + apply_coercion 即可 |
+| `TDC_TRACE_DEBUG=1` 中某 step 的 arg 出现 `<L>T?` tag | coercion 已正确路由 |
+| 错误信息提到其他 `List<X?>` 类型(`List<int?>` / `List<float?>` 等) | 是同类问题,但需要为该内层类型单独加 coercion case;`int?[]` 和 `float?[]` 在 aten schema 中非常罕见,目前没必要预先支持 |
