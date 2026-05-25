@@ -251,17 +251,33 @@ def _load_torchbench(name: str, batch_size=None, test: str = "eval"):
         model.eval()
         # torchbench's HuggingFaceModel returns example_inputs as a dict
         # ({"input_ids": tensor, ...}); the timm/torchvision wrappers
-        # return tuples/lists. Naively `tuple(example_inputs)` on a
-        # dict yields the KEYS (strings) and discards the tensors --
-        # the downstream `model(*inputs)` then passes "input_ids" as
-        # the first positional arg and hits AttributeError: 'str'
-        # object has no attribute 'size'. Dispatch on type so both
-        # input shapes work.
+        # return tuples/lists. We must preserve the dict's keyword
+        # binding -- a naive `tuple(d.values())` would call
+        # `model(*tuple(d.values()))`, which passes the dict's values
+        # in DICT-INSERTION order to the model's forward signature in
+        # POSITIONAL order. Those rarely match: torchbench produces
+        # {"input_ids": ..., "decoder_input_ids": ...} for T5, whose
+        # forward signature is
+        # (input_ids, attention_mask=None, ..., decoder_input_ids=None);
+        # the decoder_input_ids tensor would silently land in
+        # attention_mask, producing wrong results.
+        #
+        # Wrap the model in a thin closure that re-keys positional
+        # args back to kwargs at call time. The closure variable
+        # `model` is detectable by v2's _scan_closure_modules, so
+        # parameter lifting (wrapper=True path) and Dynamo tracing
+        # (wrapper=False path) both work as if the user had passed
+        # the underlying nn.Module directly.
         if isinstance(example_inputs, dict):
-            example_inputs = tuple(example_inputs.values())
-        else:
-            example_inputs = tuple(example_inputs)
-        return model, example_inputs
+            keys = tuple(example_inputs.keys())
+            values = tuple(example_inputs.values())
+            base = model
+            def call_with_kwargs(*positional):
+                return base(**dict(zip(keys, positional)))
+            call_with_kwargs.__name__ = (
+                f"{type(model).__name__}__kw({','.join(keys)})")
+            return call_with_kwargs, values
+        return model, tuple(example_inputs)
     except Exception as e:
         print(f"# torchbench: skipping {name!r} ({type(e).__name__}: {str(e)[:160]})")
         return None
