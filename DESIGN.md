@@ -1415,3 +1415,185 @@ CUDA / NPU / XPU 上启用 end-to-end real launch。覆盖:
   (§17.6.11 的 sibling 问题:aot_module 无 Dynamo,scalar 会被烤死)。
   triton kernel 自身的 constexpr 不算 —— 它们在 wrapper 内不进入用户 fn
   的 example_args。
+
+#### 17.6.13 已知翻译缺陷:AOT 嵌 Tensor 常量为 get_attr 节点
+
+在 HuggingFace GPT2(以及多数有 KV-cache 概念的 transformer 模型)上,实测 v2
+translate_graph 在第一次 example call 之前就 raise:
+
+```
+NotImplementedError: v2 does not support FX node.op='get_attr'
+  (node=_tensor_constant0, target=_tensor_constant0)
+```
+
+GPT2-base 的 FX graph 里有 **24 个 `_tensor_constant<N>` get_attr 节点**
+(12 层 × 2 KV cache),每个被 `aten::lift_fresh_copy` 消费后参与 `aten::cat`:
+
+```
+[189] op=get_attr        target=_tensor_constant0
+[190] aten::lift_fresh_copy(_tensor_constant0)
+[191] op=get_attr        target=_tensor_constant1
+[192] aten::lift_fresh_copy(_tensor_constant1)
+[193] aten::cat([lift_fresh_copy, transpose], -2)
+```
+
+**根因**
+
+HuggingFace GPT2 attention 在 `past_key_values is None` 时用 `torch.empty(0)`
+作为初始 KV cache,与新的 k/v 沿 seq dim 拼接。AOT trace 看到这两个 `torch.empty(0)`
+是字面量 tensor —— FakeTensorMode 能正常推导出 (0,) 形状 + dtype —— 但**值是
+trace 时就确定的**,不依赖 graph 输入。AOT 把它们当作 **graph 常量** 处理,
+不放进 placeholder,而是把真实 tensor 挂到 `gm._tensor_constant<N>` 属性上,在
+graph 节点用 `op="get_attr"` 引用。
+
+translator 旧版 `translate_graph` 主循环对 `node.op == "get_attr"` 直接
+NotImplementedError:
+
+```python
+elif node.op in ("call_method", "call_module", "get_attr"):
+    raise NotImplementedError(...)
+```
+
+注释还乐观地说 "AOT graphs rarely emit these" —— **HF GPT2 是反例**,任何用到
+"trace 时确定值的小 tensor 常量"的代码都会触发(空 cache 初始化、padding mask、
+预计算的 sinusoidal pos_embed 等)。
+
+**修复方案**
+
+`_translate_get_attr` 函数 + `v2_add_constant_tensor` C++ binding:
+
+```python
+def _translate_get_attr(node, gm, trace, node_to_ref, node_to_kind):
+    target_value = getattr(gm, node.target, None)
+    if isinstance(target_value, torch.Tensor):
+        idx = trace.v2_add_constant_tensor(target_value)
+        node_to_ref[node] = _C.v2_ref_captured_tensor(idx)
+        node_to_kind[node] = "tensor"
+        return
+    raise NotImplementedError(...)   # 非 Tensor 属性(目前不支持)
+```
+
+`v2_add_constant_tensor` = 直接 `captured_tensors_.emplace_back(t)` 并返回新 slot
+索引,**不在 `placeholder_routing_` 添加条目** —— 这个 slot 是冻在常量值上的,
+不会被 v2_replay 用 args 覆盖。引用类型仍是 `kCapturedTensor`,replay 路径无任何
+变化。
+
+**安全性**
+
+- 翻译顺序:FX 节点遍历是按 placeholder → 中间 call_function / get_attr 混排 →
+  output 这样进行的。`_translate_get_attr` 在第一个 get_attr 出现时(GPT2 是 idx
+  189,所有 152 个 placeholder 已经处理完)首次调用,新常量插入到 slot 150 之后,
+  与 placeholder slot 完全不冲突。
+- 替换路径:目前只支持 `target_value` 是 Tensor 的情形;遇到 Module 片段 /
+  ScriptModule fragment / Python literal 等其他类型 raise 明确错误,留给未来扩展。
+
+**该缺陷的诊断方法**
+
+| 看到 | 含义 |
+|---|---|
+| `NotImplementedError: v2 does not support FX node.op='get_attr'` | 命中本节;升级到含 `_translate_get_attr` 的 translator 即可 |
+| `get_attr` 数量等于 layer × 2 (k+v cache) 或 layer × 3 (q+k+v 都缓存) | 是 KV-cache 初始化模式;典型 HF transformer |
+| `get_attr` 数量 ≈ layer 数 | 是 per-layer attention mask / sinusoidal pos_embed 类常量 |
+| `get_attr` 数量为奇数或杂数 | 可能是用户代码里的 `torch.tensor([...])` 字面量;无害 |
+
+#### 17.6.14 已知正确性缺陷:SCALAR_TO_TENSOR coercion 丢 dtype
+
+在 HF GPT2 上,即便修复了 §17.6.13 的 get_attr,v2 capture 仍然在第一次
+example call 时 raise:
+
+```
+RuntimeError: Expected tensor for argument #1 'indices' to have one of
+the following scalar types: Long, Int; but got torch.FloatTensor instead
+(while checking arguments for embedding)
+```
+
+错误位点(embedding 的 indices 收到 Float)**与污染源相距数步**。`TDC_TRACE_DEBUG=1`
+抓到的关键片段:
+
+```
+[2] aten::arange.       stack=[64, None, None, cpu, False]                  → Long[64]
+[3] aten::add.Tensor    stack=[Tensor(long,[64]), Tensor(float,[])<S>T, 1]  ← !!
+[4] aten::unsqueeze.    stack=[Tensor(float,[64]), 0]                        ← 已变 Float
+[5] aten::embedding.    stack=[Tensor(float,[1024,768]), Tensor(float,[1,64]), ...]
+                                                       ^^^^^^^^^^^^^^^^^^^
+                                                       拒收非 Long indices
+```
+
+step 3 的第二个入参标了 `<S>T` 后缀(SCALAR_TO_TENSOR coercion),但 stack 显示
+dtype 是 `float` —— **literal `0` 被烤成了 fp32 0-d tensor**。Long + Float 经
+PyTorch 类型推导广播成 Float,后续 unsqueeze / embedding 看到的就是 Float
+indices。
+
+**根因**
+
+源代码层是 GPT2 的位置编码路径:
+
+```python
+position_ids = torch.arange(seq_len, dtype=torch.long, device=device).unsqueeze(0)
+# 等价于
+position_ids = (torch.arange(seq_len) + 0).long()   # AOT 简化路径
+```
+
+AOT 看到 `arange + 0` 中的 `0` 是 Python int 字面量,但 `aten::add.Tensor` schema
+的 `other` 参数是 `Tensor`(不是 `Scalar`),所以 translator 标
+`SCALAR_TO_TENSOR` coercion。C++ 端 `apply_coercion`:
+
+```cpp
+case ArgCoercion::kScalarToTensor:
+    if (iv.isTensor()) return iv;
+    return c10::IValue(at::scalar_tensor(iv.toScalar()));   // ← 无 dtype hint
+```
+
+`at::scalar_tensor(scalar)` 无 dtype 参数时,**落到全局默认 dtype = fp32**,
+不管 Scalar 自己的类型(kLong vs kDouble vs kBool ...)。`Int(0)` 因此被烤成
+`Tensor(float, [], cpu)`,Long arange + Float scalar 经 PyTorch 标准类型推导广
+播到 Float,后续整条链路 dtype 错误传播。
+
+**为什么 eager 没事**
+
+eager 走 dispatcher overload resolution,`tensor + 0` 在 Python 层会 dispatch
+到 `aten::add.Scalar(Tensor self, Scalar other, Scalar alpha=1)` 而不是
+`add.Tensor` —— scalar 直接以 `c10::Scalar` 留在 IValue 里,kernel 内部按
+self 的 dtype 处理,不会触发任何类型转换。AOT 的 functionalize 强制 IR
+是"全 Tensor 边",才把 `0` 升级为 Tensor,触发了 coercion 路径。
+
+**修复方案**
+
+`apply_coercion` 在 `kScalarToTensor` case 中传 Scalar 自己的 dtype 给
+`scalar_tensor`:
+
+```cpp
+case ArgCoercion::kScalarToTensor: {
+    if (iv.isTensor()) return iv;
+    const auto s = iv.toScalar();
+    return c10::IValue(
+        at::scalar_tensor(s, at::TensorOptions().dtype(s.type())));
+}
+```
+
+`Scalar.type()` 是 IValue 内置追踪的类型(kInt / kLong / kDouble / kBool),
+能准确反映"用户原本是 Python int 还是 float"。修复后:
+
+- `Int(0)` → `Tensor(long, [], cpu)`(Scalar.type() = kLong,Python int 在 C++
+  Scalar 中默认是 kLong)
+- `Float(0.5)` → `Tensor(double, [], cpu)`(后续若需要再走类型推导降到 fp32)
+
+PyTorch 自己的类型推导规则现在能正确工作:
+- `Long + Long(0d) → Long` ✓ (arange + 0 保持 Long)
+- `Float + Long(0d) → Float` ✓ (PyTorch 让 Float 赢类型推导)
+
+**该缺陷的诊断方法**
+
+| 看到 | 含义 |
+|---|---|
+| `TDC_TRACE_DEBUG=1` dump 中 `<S>T` 后跟 `Tensor(float,[]...)`,但源代码是 int 字面量 | 命中本节 |
+| embedding / scatter / index 等 Long-only op 在 v2 replay 报 "got FloatTensor" 错,但 trace 起始几步看着正常 | 大概率 dtype 污染从某个 SCALAR_TO_TENSOR 开始;翻几步 stack 找 `<S>T` 标记 |
+| 错误信息说的"参数 N"不是真正的污染点 | dtype 错误的传播链可能有 5~10 步距离,从 op 出错位置反向找 |
+
+**与 §17.6.9 的关系**
+
+§17.6.9 的"Python scalar 被 lift 成 0-d Tensor"问题是同一个根源 ——
+functionalize 让 scalar 进入 IR。那一节的修复是 device-promote(把 cpu 0-d
+tensor 在 capture 时挪到目标 device,消除每次 replay 的 H2D 同步);本节的修复
+是 dtype-preserve(让 0-d tensor 的 dtype 准确反映 Scalar 来源)。两个修复**正交**,
+都已落地。
