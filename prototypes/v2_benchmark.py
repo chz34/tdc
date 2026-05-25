@@ -345,7 +345,8 @@ if os.environ.get("TDC_TORCHBENCH", "0") == "1":
         ("squeezenet1_1", 64),
         ("BERT_pytorch",  64),
         ("llama",         64),
-        ("llava",         64),
+        # ("llava",         64),
+        ("timm_vision_transformer",         64),
     ]:
         _label = f"torchbench:{_name} (B={_bs})"
         _loaded = _load_torchbench(_name, batch_size=_bs)
