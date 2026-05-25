@@ -828,13 +828,4 @@ if __name__ == "__main__":
     print(f"# modes: {' / '.join(_names)}")
     run_correctness_check()
     run_speed_table()
-    # Dynamic-shape suite lives in its own file so it can be run
-    # standalone; import lazily here to avoid a circular import
-    # (dynamic_benchmark imports primitives from this module at load).
-    from dynamic_benchmark import (
-        run_dynamic_correctness_check,
-        run_dynamic_speed_table,
-    )
-    run_dynamic_correctness_check()
-    run_dynamic_speed_table()
     run_profile(list(WORKLOADS)[-1])

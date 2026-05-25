@@ -157,6 +157,95 @@ class TestV2Capture(unittest.TestCase):
                 self.assertTrue(torch.allclose(out, ref),
                                 f"k={k}, shape={shape} mismatch")
 
+    # ---- pytree output structure preservation ------------------------
+    # _build_output_shaper uses torch.utils._pytree to flatten the
+    # user's return value into leaves + treespec and rebuild it on
+    # every replay. These tests lock in the supported shapes; adding
+    # a custom container is a matter of pytree.register_pytree_node
+    # at the call site, no v2 code change.
+
+    def test_output_dict(self):
+        def fn(x):
+            return {"loss": x.sum(), "scaled": x * 2.0}
+        captured = tdcv2.capture(fn, torch.randn(3, 4))
+        x = torch.randn(3, 4)
+        got = captured(x)
+        ref = fn(x)
+        self.assertIsInstance(got, dict)
+        self.assertEqual(set(got), {"loss", "scaled"})
+        self.assertTrue(torch.allclose(got["loss"], ref["loss"]))
+        self.assertTrue(torch.allclose(got["scaled"], ref["scaled"]))
+
+    def test_output_nested_dict_list_tuple(self):
+        def fn(x, y):
+            return {"a": [x.sin(), x.cos()], "b": (y.tan(),)}
+        captured = tdcv2.capture(fn, torch.randn(3), torch.randn(3))
+        x = torch.randn(3); y = torch.randn(3)
+        got = captured(x, y)
+        ref = fn(x, y)
+        self.assertIsInstance(got, dict)
+        self.assertIsInstance(got["a"], list)
+        self.assertIsInstance(got["b"], tuple)
+        self.assertTrue(torch.allclose(got["a"][0], ref["a"][0]))
+        self.assertTrue(torch.allclose(got["a"][1], ref["a"][1]))
+        self.assertTrue(torch.allclose(got["b"][0], ref["b"][0]))
+
+    def test_output_namedtuple(self):
+        from collections import namedtuple
+        Result = namedtuple("Result", ["mean", "std"])
+
+        def fn(x):
+            return Result(mean=x.mean(), std=x.std())
+        captured = tdcv2.capture(fn, torch.randn(8))
+        x = torch.randn(8)
+        got = captured(x)
+        ref = fn(x)
+        # pytree preserves the namedtuple subclass exactly.
+        self.assertIsInstance(got, Result)
+        self.assertTrue(torch.allclose(got.mean, ref.mean))
+        self.assertTrue(torch.allclose(got.std, ref.std))
+
+    def test_output_dataclass_after_pytree_register(self):
+        """dataclass requires explicit registration with pytree (PyTorch
+        doesn't auto-register user dataclasses). Once registered, v2's
+        output_shaper threads it through transparently."""
+        from dataclasses import dataclass
+        import torch.utils._pytree as pytree
+
+        @dataclass
+        class Outputs:
+            loss: torch.Tensor
+            logits: torch.Tensor
+
+        if not hasattr(pytree, "register_dataclass"):
+            self.skipTest("pytree.register_dataclass not in this PyTorch")
+        pytree.register_dataclass(Outputs)
+
+        def fn(x):
+            return Outputs(loss=x.sum(), logits=x * 2.0)
+        captured = tdcv2.capture(fn, torch.randn(3, 4))
+        x = torch.randn(3, 4)
+        got = captured(x)
+        ref = fn(x)
+        self.assertIsInstance(got, Outputs)
+        self.assertTrue(torch.allclose(got.loss, ref.loss))
+        self.assertTrue(torch.allclose(got.logits, ref.logits))
+
+    def test_output_none_mixed_with_tensor(self):
+        """None leaves intermixed with Tensors are preserved by the
+        shaper without consuming a trace_out slot."""
+        def fn(x):
+            return (x.sum(), None, x.mean())
+        captured = tdcv2.capture(fn, torch.randn(4))
+        x = torch.randn(4)
+        got = captured(x)
+        ref = fn(x)
+        self.assertIsInstance(got, tuple)
+        self.assertEqual(len(got), 3)
+        self.assertIsNone(got[1])
+        self.assertTrue(torch.allclose(got[0], ref[0]))
+        self.assertTrue(torch.allclose(got[2], ref[2]))
+
 
 if __name__ == "__main__":
     unittest.main()

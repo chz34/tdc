@@ -101,42 +101,46 @@ def capture(
     fn,
     *example_args,
     allow_grad: bool = False,
-    wrapper: bool = True,
+    wrapper: bool = False,
     **example_kwargs,
 ):
     """Run `fn(*example_args, **example_kwargs)` once through torch.compile
     to extract a Trace, then return a callable that replays the trace
     on fresh args.
 
-    `wrapper` (default True) controls how the replay callable handles
+    `wrapper` (default False) controls how the replay callable handles
     the AOT runtime layer:
 
-      - `wrapper=True`  (default): wrap the trace with
+      - `wrapper=False` (default, recommended): return our direct_replay
+        callable (flat_recipe + param pre-bind + pytree-based
+        output_shaper). The captured trace goes through Dynamo + AOT,
+        so Python scalar args get sym-ified and route through
+        ("I", arg_idx) recipe specs (varying start_pos and similar
+        works correctly). No AOT RuntimeWrapper on the call path:
+        smallest possible per-call overhead.
+
+      - `wrapper=True`: wrap the trace with
         `torch._functorch.aot_autograd.aot_function`. The returned
         callable goes through PyTorch's native RuntimeWrapper on every
-        call — input mutations get written back, output aliases get
-        rebuilt, the user-visible pytree is restored automatically.
-        Adds ~5-15us per call vs the bare path but matches eager
-        semantics exactly. Required for training (optimizer.step,
-        any in-place parameter / KV-cache mutation).
-
-      - `wrapper=False`: return our direct_replay callable
-        (flat_recipe + param pre-bind + id()-based output_shaper). No
-        AOT RuntimeWrapper on the call path: fastest possible per-call
-        overhead (~5-10us total) but the caller is responsible for
-        anything mutation-related. Suitable for pure inference with
-        no in-place side effects.
+        call. Useful for narrow scenarios where direct_replay can't
+        cover the user's semantics:
+          * Tensor subclasses (DTensor, custom __torch_dispatch__)
+            that need AOT's runtime layer for metadata propagation.
+        Adds ~3-100us per call (more for small workloads) vs the
+        bare path. Refuses to capture if the example args include
+        Python scalars (aot_module without Dynamo bakes them as
+        graph literals and would silently return stale results).
 
     Caveats for `wrapper=True`:
+      - Refused if `example_args` / `example_kwargs` contain Python
+        scalars (int, bool, float): aot_module bakes them at trace
+        time. Use wrapper=False (the default) for KV-cache and
+        similar patterns with int args.
       - Functions that reference nn.Modules through a non-Module
         container (list, dict, dataclass, plain object attr-chain)
-        aren't detected by our closure-scan shim. The error message
-        will tell you to use wrapper=False or restructure. Modules
-        held directly in closure cells, globals, or as an outer
-        Module's attribute *are* handled.
+        aren't detected by our closure-scan shim.
       - Models with tied weights (e.g. BERT's shared attention) hit
-        aot_module's `_reparametrize_module` tied-key error; use
-        wrapper=False for those.
+        aot_module's `_reparametrize_module` tied-key error.
       - Combined with allow_grad=True we silently downgrade to
         wrapper=False (aot_function carries its own autograd path).
 
@@ -491,72 +495,63 @@ def _build_output_shaper(user_visible_out, trace_out):
     so direct_replay must drop / reorder / repack them to match what
     the user got out of compiled_fn(*example_args).
 
-    Matching is by tensor `id()` — AOT's runtime layer aliases (does
-    not clone) when packaging outputs, so a Tensor in user_visible_out
-    is the *same* Python object as the corresponding entry in
-    trace_out. We record (kind, index) tuples that direct_replay
-    consumes against a fresh trace_out list."""
+    Pytree-based: we hand user_visible_out to torch.utils._pytree to
+    flatten into leaves + a treespec. This handles all built-in
+    containers (tuple, list, dict, OrderedDict), namedtuples,
+    dataclasses (when registered), and any custom type the user
+    registered via pytree.register_pytree_node -- without us writing
+    per-container code. The treespec is reapplied at every call to
+    rebuild the same nested structure.
+
+    Tensor leaves match against trace_out by `id()` — AOT's runtime
+    layer aliases (does not clone) when packaging outputs, so a
+    Tensor in user_visible_out is the *same* Python object as the
+    corresponding entry in trace_out. Non-Tensor leaves (None,
+    scalars, strings) are snapshotted by value into the plan."""
+    import torch.utils._pytree as pytree
+
     id_to_idx = {
         id(v): i for i, v in enumerate(trace_out) if isinstance(v, torch.Tensor)
     }
 
-    def _plan(v):
-        if isinstance(v, torch.Tensor):
-            idx = id_to_idx.get(id(v))
-            if idx is None:
-                # AOT cloned/derived a tensor we never returned to it
-                # — fall back to keeping all trace outputs as a flat
-                # tuple. Loses the user-visible structure but keeps
-                # correctness; warn so this is visible.
-                raise _OutputShaperBail(
-                    f"AOT returned a Tensor (shape={tuple(v.shape)}) that "
-                    "doesn't match any trace output by id(); AOT may have "
-                    "cloned/aliased an output, which v2.capture's id()-based "
-                    "matching doesn't handle.")
-            return ("T", idx)
-        if isinstance(v, tuple):
-            return ("tuple", [_plan(e) for e in v])
-        if isinstance(v, list):
-            return ("list", [_plan(e) for e in v])
-        if v is None:
-            return ("none",)
-        # Scalars, etc. — best to pass-through as a literal-by-value
-        # snapshot. Rare in AOT outputs.
-        return ("literal", v)
-
-    try:
-        plan = _plan(user_visible_out)
-    except _OutputShaperBail as e:
-        print(f"# v2.capture: output_shaper fallback ({e})")
+    def _fallback_shaper(reason: str):
+        # Lossy fallback: keep all trace outputs as a flat tuple. Loses
+        # the user-visible structure but keeps correctness; surface the
+        # reason so the user can decide whether to wrap in wrapper=True
+        # or register their custom type with pytree.
+        print(f"# v2.capture: output_shaper fallback ({reason})")
         n = len(trace_out)
         def fallback(result):
             return result[0] if len(result) == 1 else tuple(result[:n])
         return fallback
 
-    def apply(plan, result):
-        kind = plan[0]
-        if kind == "T":
-            return result[plan[1]]
-        if kind == "tuple":
-            return tuple(apply(p, result) for p in plan[1])
-        if kind == "list":
-            return [apply(p, result) for p in plan[1]]
-        if kind == "none":
-            return None
-        if kind == "literal":
-            return plan[1]
-        raise AssertionError(f"unhandled plan kind: {kind}")
+    try:
+        leaves, treespec = pytree.tree_flatten(user_visible_out)
+    except Exception as e:
+        return _fallback_shaper(f"pytree.tree_flatten failed: {e}")
+
+    # Per-leaf plan: ("T", idx) for tensors mapped to a trace_out slot,
+    # ("L", value) for snapshotted literals (None, scalars, strings, ...).
+    leaf_plans: list = []
+    for leaf in leaves:
+        if isinstance(leaf, torch.Tensor):
+            idx = id_to_idx.get(id(leaf))
+            if idx is None:
+                return _fallback_shaper(
+                    f"unmatched Tensor leaf (shape={tuple(leaf.shape)}); "
+                    "AOT may have cloned/aliased an output, which "
+                    "v2.capture's id()-based matching doesn't handle")
+            leaf_plans.append(("T", idx))
+        else:
+            leaf_plans.append(("L", leaf))
 
     def shaper(result):
-        return apply(plan, result)
+        materialized = [
+            result[p[1]] if p[0] == "T" else p[1]
+            for p in leaf_plans
+        ]
+        return pytree.tree_unflatten(materialized, treespec)
     return shaper
-
-
-class _OutputShaperBail(Exception):
-    """Sentinel signalling that the id()-based output mapping couldn't
-    cover the user-visible structure. Caught by _build_output_shaper
-    which then returns a flat-passthrough fallback shaper."""
-    pass
 
 
 def _capture_with_backward(fn, example_args):
