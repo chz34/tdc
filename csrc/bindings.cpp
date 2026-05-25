@@ -109,6 +109,12 @@ PYBIND11_MODULE(_C, m) {
         // ---- v2 builder surface ----
         .def("v2_add_placeholder_tensor", &tdc::Trace::append_placeholder_tensor)
         .def("v2_add_placeholder_int", &tdc::Trace::append_placeholder_int)
+        .def("v2_add_constant_tensor", &tdc::Trace::append_captured_tensor,
+             "Append a constant tensor (from an FX get_attr node) to "
+             "captured_tensors_ and return its slot index. Differs from "
+             "v2_add_placeholder_tensor in that no placeholder_routing_ "
+             "entry is created -- the slot is frozen at the captured "
+             "value, not overwritten from args at every replay.")
         .def("v2_add_tensor_op_step",
              [](tdc::Trace& self,
                 const std::string& full_name,

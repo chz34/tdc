@@ -232,7 +232,9 @@ class TestV2Triton(unittest.TestCase):
         triton_nodes = [
             n for n in gm.graph.nodes
             if n.op == "call_function"
-            and str(n.target).startswith("tdc_triton_test::")
+            #and str(n.target).startswith("tdc_triton_test::")
+            and ("tdc_triton_test::" in str(n.target)
+                 or "tdc_triton_test." in str(n.target))
         ]
         self.assertEqual(
             len(triton_nodes), 1,

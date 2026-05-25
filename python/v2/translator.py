@@ -88,7 +88,9 @@ def translate_graph(gm: fx.GraphModule) -> _C.Trace:
                 node, trace, node_to_ref, node_to_kind, multi_output_step)
         elif node.op == "output":
             _translate_output(node, trace, node_to_ref)
-        elif node.op in ("call_method", "call_module", "get_attr"):
+        elif node.op == "get_attr":
+            _translate_get_attr(node, gm, trace, node_to_ref, node_to_kind)
+        elif node.op in ("call_method", "call_module"):
             raise NotImplementedError(
                 f"v2 does not support FX node.op='{node.op}' "
                 f"(node={node.name}, target={node.target}). "
@@ -99,6 +101,45 @@ def translate_graph(gm: fx.GraphModule) -> _C.Trace:
             raise AssertionError(f"unknown FX node.op: {node.op}")
 
     return trace
+
+
+def _translate_get_attr(node, gm, trace, node_to_ref, node_to_kind):
+    """Resolve a get_attr node to a captured-tensor ref.
+
+    AOT inlines small/constant tensors (typically literals from user
+    code that survive FakeTensorMode propagation as concrete tensors)
+    as attributes on the GraphModule, accessed via FX `get_attr`
+    nodes. Examples:
+
+      - HuggingFace GPT2's KV-cache concat path: when `past_kv is
+        None`, the code concatenates `torch.empty(0)` with the new
+        k/v -- AOT freezes those 0-element placeholders as
+        `_tensor_constant<N>` get_attrs (12 layers x 2 = 24 nodes
+        per model).
+      - Any `aten.lift_fresh_copy(constant)` pattern Dynamo uses to
+        snapshot literal tensors into the graph.
+
+    The value is fixed across the trace's lifetime, so we route it
+    through the same captured_tensors_ buffer used for module
+    parameters / buffers. Non-Tensor attributes (e.g. a Module
+    fragment, or a Python literal smuggled in) raise -- they'd need
+    a different ref kind we don't currently have."""
+    target_value = getattr(gm, node.target, None)
+    if target_value is None:
+        raise RuntimeError(
+            f"v2 get_attr: gm has no attribute {node.target!r} "
+            f"(node {node.name}). Possibly a renamed FX node."
+        )
+    if isinstance(target_value, torch.Tensor):
+        idx = trace.v2_add_constant_tensor(target_value)
+        node_to_ref[node] = _C.v2_ref_captured_tensor(idx)
+        node_to_kind[node] = "tensor"
+        return
+    raise NotImplementedError(
+        f"v2 get_attr: target {node.target!r} is not a Tensor "
+        f"(got {type(target_value).__name__}); FX get_attr to "
+        f"non-Tensor attributes isn't supported yet."
+    )
 
 
 def _translate_placeholder(node, trace, node_to_ref, node_to_kind):

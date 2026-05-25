@@ -395,6 +395,60 @@ class TestV2Capture(unittest.TestCase):
                         "source x was mutated, indicating the clone was wrongly elided")
         self.assertTrue(torch.allclose(y, x_before + 1.0))
 
+    # ---- AOT get_attr nodes (FX-baked Tensor constants) -------------
+    # AOT sometimes emits FX get_attr nodes for tensor literals that
+    # survive FakeTensorMode -- e.g. HuggingFace GPT2's KV-cache concat
+    # path uses torch.empty(0) as initial cache when past_kv is None,
+    # which AOT freezes as `_tensor_constant<N>` get_attr nodes.
+    # _translate_get_attr routes these through v2_add_constant_tensor.
+
+    def test_get_attr_tensor_constant(self):
+        """An FX get_attr node referring to a Tensor attribute must
+        flow through the trace's captured_tensors_ as a constant slot.
+        Repros GPT2's `cat([torch.empty(0), x], dim=...)` pattern: a
+        zero-element tensor is inlined as a graph constant; the cat
+        with x then returns x unchanged."""
+        const = torch.empty(0, dtype=torch.float32)
+
+        def fn(x):
+            # AOT typically routes a tensor literal seen by Dynamo
+            # through a get_attr on the gm. Force the same path by
+            # closing over `const`.
+            return torch.cat([const, x], dim=0)
+
+        x = torch.randn(8, 4)
+        ref = fn(x)
+        captured = tdcv2.capture(fn, x)
+        with torch.no_grad():
+            got = captured(x)
+        self.assertTrue(torch.allclose(got, ref))
+
+    # ---- SCALAR_TO_TENSOR coercion preserves scalar dtype ------------
+    # at::scalar_tensor(scalar) without an explicit dtype defaults to
+    # fp32. That breaks dtype propagation: `arange(seq).long() + 0`
+    # where 0 is an Int literal would otherwise widen Long arange to
+    # Float, silently flipping a later embedding lookup's indices
+    # dtype. GPT2's positional embedding hit this; the kernel rejected
+    # Float indices with "argument #1 'indices' ... got FloatTensor".
+
+    def test_scalar_to_tensor_preserves_long_dtype(self):
+        """`Long arange + Int 0` must stay Long. Without the dtype-
+        preserving fix in apply_coercion's kScalarToTensor case the
+        result is Float (default dtype) and downstream Long-only ops
+        like embedding fail."""
+        def fn(seq):
+            r = torch.arange(seq, dtype=torch.long)
+            return r + 0       # the 0 is an Int Python literal
+
+        seq = 8
+        ref = fn(seq)
+        captured = tdcv2.capture(fn, seq)
+        with torch.no_grad():
+            got = captured(seq)
+        self.assertEqual(got.dtype, torch.long,
+                         f"expected Long, got {got.dtype}")
+        self.assertTrue(torch.equal(got, ref))
+
     def test_output_none_mixed_with_tensor(self):
         """None leaves intermixed with Tensors are preserved by the
         shaper without consuming a trace_out slot."""

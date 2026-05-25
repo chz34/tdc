@@ -158,9 +158,18 @@ inline c10::IValue apply_coercion(c10::IValue iv, ArgCoercion tag) {
     switch (tag) {
         case ArgCoercion::kNone:
             return iv;
-        case ArgCoercion::kScalarToTensor:
+        case ArgCoercion::kScalarToTensor: {
             if (iv.isTensor()) return iv;
-            return c10::IValue(at::scalar_tensor(iv.toScalar()));
+            const auto s = iv.toScalar();
+            // Preserve the scalar's intrinsic type so Long(0) doesn't
+            // become Float(0.0) and silently flip downstream dtype
+            // promotion. Without this, GPT2's `arange(seq) + 0` (where
+            // 0 is an Int literal lifted by AOT into a Tensor) widens
+            // arange's Long output to Float, which then poisons the
+            // position embedding's indices arg several steps later.
+            return c10::IValue(
+                at::scalar_tensor(s, at::TensorOptions().dtype(s.type())));
+        }
         case ArgCoercion::kListToIntList: {
             const auto& generic = iv.toList();
             c10::List<int64_t> ints;
