@@ -151,12 +151,104 @@ def _make_transformer():
     return model, x, y
 
 
+# ---------------------------------------------------------------------------
+# torchbench integration (opt-in via TDC_TORCHBENCH=1)
+#
+# Mirrors v2_benchmark._load_torchbench's pattern: import the model's
+# torchbenchmark.models.<name> module, construct its Model wrapper with
+# test='train', and surface the bench as the workload's "model". The
+# variant builders detect spec.is_torchbench and dispatch to bench's
+# own forward()/backward()/optimizer (bench.forward() returns the loss
+# tensor directly).
+# ---------------------------------------------------------------------------
+def _load_torchbench_train(name: str, batch_size: int):
+    """Load a torchbench model in train mode. Returns the bench object
+    on success or None on any failure (missing dep, OOM on cpu, etc.)
+    so the rest of the suite isn't blocked."""
+    try:
+        import importlib
+        mod = importlib.import_module(f"torchbenchmark.models.{name}")
+        bench = mod.Model(
+            test="train", device=DEVICE.type, batch_size=batch_size,
+        )
+        bench.model.train()
+        return bench
+    except Exception as e:
+        print(f"# torchbench: skipping {name!r} train "
+              f"({type(e).__name__}: {str(e)[:160]})")
+        return None
+
+
+class WorkloadSpec:
+    """Captures everything a variant builder needs for one workload.
+
+    Two flavours, kept in one struct so the iterator in run_correctness
+    / run_speed stays uniform:
+
+      - is_torchbench=False: make_model() returns (nn.Module, x, y)
+        where the variant builder runs `F.cross_entropy(model(x), y)`
+        as the loss.
+      - is_torchbench=True: make_model() returns (bench, None, None)
+        where the variant builder runs `bench.forward()` for the
+        loss. x, y are sentinel None values; we never pass them to
+        anything.
+    """
+    def __init__(self, name, label, make_model, *, is_torchbench=False):
+        self.name = name
+        self.label = label
+        self.make_model = make_model
+        self.is_torchbench = is_torchbench
+
+
 WORKLOADS = {
-    "mlp": ("MLP (B=8, in=64, hidden=128, out=10)", _make_mlp),
-    "transformer": (
-        "Transformer (B=4, S=16, H=128, ffn=256)", _make_transformer,
+    "mlp": WorkloadSpec(
+        name="mlp",
+        label="MLP (B=8, in=64, hidden=128, out=10)",
+        make_model=_make_mlp,
+    ),
+    "transformer": WorkloadSpec(
+        name="transformer",
+        label="Transformer (B=4, S=16, H=128, ffn=256)",
+        make_model=_make_transformer,
     ),
 }
+
+
+def _bench_lazy_loader(name, bs):
+    """Returns a factory that loads the bench on every call. Each
+    variant gets its own bench instance so optimizer/state don't
+    cross-contaminate."""
+    def factory():
+        bench = _load_torchbench_train(name, bs)
+        return bench, None, None
+    return factory
+
+
+if os.environ.get("TDC_TORCHBENCH", "0") == "1":
+    # Same model list as v2_benchmark.py's torchbench rotation; small
+    # batch sizes because training is slower than inference and our
+    # n_iters loop sees each batch many times.
+    for _tb_name, _bs in [
+        ("squeezenet1_1", 8),
+        ("alexnet",       8),
+        ("BERT_pytorch",  2),
+        ("hf_GPT2",       2),
+        ("timm_vision_transformer", 4),
+    ]:
+        # Probe-load once at import time so unavailable models don't
+        # populate the registry. The variant builders re-load to get
+        # an independent bench per variant.
+        _probe = _load_torchbench_train(_tb_name, _bs)
+        if _probe is None:
+            continue
+        del _probe   # discard; per-variant builders will load their own
+        _key = f"torchbench:{_tb_name}"
+        WORKLOADS[_key] = WorkloadSpec(
+            name=_key,
+            label=f"torchbench:{_tb_name} (B={_bs}, train)",
+            make_model=_bench_lazy_loader(_tb_name, _bs),
+            is_torchbench=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -170,77 +262,102 @@ WORKLOADS = {
 # if include_optimizer was set at build time), and returns the loss
 # value as a detached scalar so the benchmark can record convergence.
 # ---------------------------------------------------------------------------
-def _snapshot_params(model):
+def _real_model(spec, model_or_bench):
+    """Resolve to the actual nn.Module. For in-house workloads
+    spec.is_torchbench=False and we get the model directly; for
+    torchbench we unwrap bench.model."""
+    return model_or_bench.model if spec.is_torchbench else model_or_bench
+
+
+def _compute_loss(spec, model_or_bench, x, y):
+    """Run forward+loss under the workload's convention. For
+    in-house: F.cross_entropy(model(x), y). For torchbench:
+    bench.forward() (which uses bench.example_inputs internally and
+    returns the loss tensor directly)."""
+    if spec.is_torchbench:
+        return model_or_bench.forward()
+    return F.cross_entropy(model_or_bench(x), y)
+
+
+def _snapshot_params(spec, model_or_bench):
     """Return a dict of cloned parameter tensors -- used to reset
     every variant back to the same initial weights after any
     capture-time warmup or example-call mutations."""
-    return {n: p.detach().clone() for n, p in model.named_parameters()}
+    m = _real_model(spec, model_or_bench)
+    return {n: p.detach().clone() for n, p in m.named_parameters()}
 
 
-def _restore_params(model, snapshot):
+def _restore_params(spec, model_or_bench, snapshot):
     """In-place copy snapshot values back into the model's parameters
     and clear .grad. Identity is preserved so any captured trace
     that references model.parameters() by TensorImpl identity
     keeps working against the reset values."""
+    m = _real_model(spec, model_or_bench)
     with torch.no_grad():
-        for n, p in model.named_parameters():
+        for n, p in m.named_parameters():
             p.copy_(snapshot[n])
-        for p in model.parameters():
+        for p in m.parameters():
             p.grad = None
 
 
-def build_eager(model, x_ex, y_ex, *, lr, include_optimizer):
+def build_eager(spec, model, x_ex, y_ex, *, lr, include_optimizer):
     # Eager has no "capture", so --include-optimizer is a no-op here:
     # the optimizer always runs in Python.
-    opt = torch.optim.SGD(model.parameters(), lr=lr)
+    opt = torch.optim.SGD(_real_model(spec, model).parameters(), lr=lr)
 
     def step(x, y):
         opt.zero_grad()
-        loss = F.cross_entropy(model(x), y)
+        loss = _compute_loss(spec, model, x, y)
         loss.backward()
         opt.step()
         return loss.detach()
     return step
 
 
-def build_compiled(model, x_ex, y_ex, *, backend, lr, include_optimizer):
+def build_compiled(spec, model, x_ex, y_ex, *, backend, lr, include_optimizer):
     """torch.compile-based variant (dynamo / aot_eager / inductor).
 
     Compile the forward; backward is autograd-driven, optimizer
     runs in eager Python. --include-optimizer has no effect on
     these modes (would require torch.compile(opt.step) which is a
-    separate gesture)."""
-    compiled_forward = torch.compile(model, backend=backend, dynamic=True)
-    opt = torch.optim.SGD(model.parameters(), lr=lr)
+    separate gesture).
+
+    For torchbench: monkey-patch bench.model with a compiled wrapper
+    so bench.forward()'s internal `self.model(**self.example_inputs)`
+    call hits the compiled path. This is the standard pattern
+    torchbench itself uses for its --torchdynamo runs."""
+    real = _real_model(spec, model)
+    if spec.is_torchbench:
+        model.model = torch.compile(real, backend=backend, dynamic=True)
+        callable_for_loss = model  # bench, whose .forward() runs compiled
+    else:
+        callable_for_loss = torch.compile(model, backend=backend, dynamic=True)
+    opt = torch.optim.SGD(real.parameters(), lr=lr)
 
     def step(x, y):
         opt.zero_grad()
-        loss = F.cross_entropy(compiled_forward(x), y)
+        loss = _compute_loss(spec, callable_for_loss, x, y)
         loss.backward()
         opt.step()
         return loss.detach()
     return step
 
 
-def build_v1(model, x_ex, y_ex, *, lr, include_optimizer):
+def build_v1(spec, model, x_ex, y_ex, *, lr, include_optimizer):
     """v1 captures fw+bw (and optimizer.step() under
     --include-optimizer) via the dispatcher fallback.
 
-    Pattern from test_backward.py: warmup with one eager fw+bw to
-    allocate .grad on every parameter (AccumulateGrad's first call
-    bypasses dispatch); then capture; then replay re-runs everything.
-    The build_v1 builder dirties the weights through the warmup +
-    capture-time example call; the benchmark's outer loop resets
-    the weights via _restore_params before timing/correctness so
-    every variant starts from the same initial state."""
-    opt = torch.optim.SGD(model.parameters(), lr=lr)
+    For torchbench workloads we capture `bench.forward() +
+    bench_loss.backward()` inside the context manager. bench.forward()
+    internally calls bench.model(**bench.example_inputs), so the
+    dispatcher fallback sees the full forward + backward op sequence."""
+    real = _real_model(spec, model)
+    opt = torch.optim.SGD(real.parameters(), lr=lr)
 
     # Warmup: eager fw+bw+step. Needed so AccumulateGrad's special-
-    # first-call path doesn't appear inside the capture, and so any
-    # SGD-internal lazy allocation (e.g. momentum buffers, if we add
-    # them later) is done before the capture window.
+    # first-call path doesn't appear inside the capture.
     opt.zero_grad()
-    loss = F.cross_entropy(model(x_ex), y_ex)
+    loss = _compute_loss(spec, model, x_ex, y_ex)
     loss.backward()
     opt.step()
     opt.zero_grad()
@@ -249,44 +366,54 @@ def build_v1(model, x_ex, y_ex, *, lr, include_optimizer):
         # Capture fw + bw + optimizer.step() -- the SGD update's
         # aten::add_ on each parameter is dispatched and recorded.
         with tdc.capture(allow_grad=True) as trace:
-            captured_loss = F.cross_entropy(model(x_ex), y_ex)
+            captured_loss = _compute_loss(spec, model, x_ex, y_ex)
             captured_loss.backward()
             opt.step()
     else:
         with tdc.capture(allow_grad=True) as trace:
-            captured_loss = F.cross_entropy(model(x_ex), y_ex)
+            captured_loss = _compute_loss(spec, model, x_ex, y_ex)
             captured_loss.backward()
     opt.zero_grad()
 
     def step(x, y):
         opt.zero_grad()
-        # v1 replays against the captured input tensors; copy the
-        # caller-supplied batch into them in place.
-        x_ex.detach().copy_(x)
-        y_ex.copy_(y)
+        if not spec.is_torchbench:
+            # v1 replays against the captured input tensors; copy
+            # the caller-supplied batch into them in place. For
+            # torchbench, bench.example_inputs lives inside the
+            # bench object -- the user batch isn't separately fed.
+            x_ex.detach().copy_(x)
+            y_ex.copy_(y)
         trace.replay()
         if not include_optimizer:
-            # opt.step() runs in eager Python outside the trace.
             opt.step()
         return captured_loss.detach().clone()
     return step
 
 
-def build_v2(model, x_ex, y_ex, *, lr, include_optimizer):
+def build_v2(spec, model, x_ex, y_ex, *, lr, include_optimizer):
     """v2 + idiomatic nn.Module training.
 
     v2's _CapturedFn.backward only routes gradients for tensors that
     appeared as USER-INPUT positional args at capture time. To
     keep the user's model code idiomatic (nn.Module + parameters),
     we wrap the forward in torch.func.functional_call and thread
-    parameters positionally inside the wrapper. .grad lands on the
-    same Tensor objects model.parameters() returns, so the eager
-    optimizer.step() outside the trace mutates the model correctly.
+    parameters positionally inside the wrapper.
 
-    --include-optimizer is not currently supported on v2 -- the
-    autograd.Function-based wrapper only owns fw + bw graphs and
-    folding the optimizer would need a different capture API. We
-    fall back to eager-step and emit a notice."""
+    --include-optimizer is not currently supported on v2; the
+    autograd.Function-based wrapper only owns fw + bw graphs.
+
+    torchbench workloads aren't currently supported on v2 either:
+    bench.forward() takes no positional Tensors (its example_inputs
+    are baked into the bench instance), so we can't expose them as
+    requires_grad=True user-input args for v2's allow_grad path.
+    """
+    if spec.is_torchbench:
+        print(f"   v2          NOTICE     torchbench workloads "
+              f"(bench.forward has no positional Tensor args) not "
+              f"supported on v2's allow_grad path; skipping")
+        return None
+
     from torch.func import functional_call
 
     if include_optimizer:
@@ -338,27 +465,34 @@ VARIANTS = [
 ]
 
 
-def _safe_build(builder, model, x_ex, y_ex, *, lr, include_optimizer):
+def _safe_build(builder, spec, model, x_ex, y_ex, *, lr, include_optimizer):
     """Invoke a variant builder, printing the traceback and returning
     None on failure so the rest of the run can continue."""
     try:
         return builder(
-            model, x_ex, y_ex, lr=lr, include_optimizer=include_optimizer)
+            spec, model, x_ex, y_ex,
+            lr=lr, include_optimizer=include_optimizer)
     except Exception:
         traceback.print_exc()
         return None
 
 
-def _fresh_model_and_batch(make_model_fn, seed=42):
-    """Build a fresh (model, x, y) triple for one variant. Seeds the
-    global torch RNG so each variant's model gets identical initial
-    weights -- without this the random init for nn.Linear differs
-    between variants and the correctness check sees init-noise, not
-    backward-correctness. Also resets Dynamo's cache so previous
-    compilations from other variants don't leak in."""
+def _fresh_model_and_batch(spec, seed=42):
+    """Build a fresh (model_or_bench, x, y) triple for one variant.
+    Seeds the global torch RNG so each variant's model gets identical
+    initial weights -- without this the random init for nn.Linear
+    differs between variants and the correctness check sees
+    init-noise, not backward-correctness. Also resets Dynamo's cache
+    so previous compilations from other variants don't leak in.
+
+    For torchbench specs, make_model() loads a fresh bench instance
+    and returns (bench, None, None). The bench's own init pulls
+    weights from torchbench's stored checkpoints (not from the
+    torch.manual_seed), so two variants of the same torchbench
+    workload start identical by construction."""
     torch._dynamo.reset()
     torch.manual_seed(seed)
-    return make_model_fn()
+    return spec.make_model()
 
 
 # ---------------------------------------------------------------------------
@@ -386,27 +520,26 @@ def _params_close(model_ref, model_var, atol=1e-4, rtol=1e-4):
 
 
 def run_correctness(model_key, *, n_iters, lr, include_optimizer):
-    label, make_model = WORKLOADS[model_key]
-    print(f"\n## correctness: {label}")
+    spec = WORKLOADS[model_key]
+    print(f"\n## correctness: {spec.label}")
     print(f"#  n_iters={n_iters}, lr={lr}, include_optimizer={include_optimizer}")
 
     # One canonical initial snapshot drives every variant -- this way
     # variants whose build dirties weights (v1's warmup + capture-time
     # example call, v2's example call's .backward) get reset to the
     # same initial state before the timed loop starts.
-    ref_model_for_snapshot, _, _ = _fresh_model_and_batch(make_model)
-    init_snapshot = _snapshot_params(ref_model_for_snapshot)
+    ref_obj, _, _ = _fresh_model_and_batch(spec)
+    init_snapshot = _snapshot_params(spec, ref_obj)
 
-    # Eager reference: builds + runs N iterations from the initial
-    # snapshot. eager doesn't need a snapshot reset because its build
-    # doesn't dirty weights.
     eager_builder = dict(VARIANTS)["eager"]
-    model_ref, x, y = _fresh_model_and_batch(make_model)
-    _restore_params(model_ref, init_snapshot)
+    ref_obj, x, y = _fresh_model_and_batch(spec)
+    _restore_params(spec, ref_obj, init_snapshot)
     ref_step = _safe_build(
-        eager_builder, model_ref, x.clone(), y.clone(),
+        eager_builder, spec, ref_obj,
+        x.clone() if x is not None else None,
+        y.clone() if y is not None else None,
         lr=lr, include_optimizer=include_optimizer)
-    _restore_params(model_ref, init_snapshot)
+    _restore_params(spec, ref_obj, init_snapshot)
     ref_losses = []
     for _ in range(n_iters):
         loss = ref_step(x, y)
@@ -418,9 +551,11 @@ def run_correctness(model_key, *, n_iters, lr, include_optimizer):
     for name, builder in VARIANTS:
         if name == "eager":
             continue
-        model_var, x_v, y_v = _fresh_model_and_batch(make_model)
+        var_obj, x_v, y_v = _fresh_model_and_batch(spec)
         step = _safe_build(
-            builder, model_var, x_v.clone(), y_v.clone(),
+            builder, spec, var_obj,
+            x_v.clone() if x_v is not None else None,
+            y_v.clone() if y_v is not None else None,
             lr=lr, include_optimizer=include_optimizer)
         if step is None:
             print(f"   {name:<11} BUILD FAILED")
@@ -428,7 +563,7 @@ def run_correctness(model_key, *, n_iters, lr, include_optimizer):
         # Reset weights AFTER build (v1's warmup / v2's example call
         # both mutate the model). Captured traces keep their TensorImpl
         # references; in-place .copy_ preserves identity.
-        _restore_params(model_var, init_snapshot)
+        _restore_params(spec, var_obj, init_snapshot)
         try:
             losses = []
             for _ in range(n_iters):
@@ -439,7 +574,9 @@ def run_correctness(model_key, *, n_iters, lr, include_optimizer):
             print(f"   {name:<11} STEP FAILED  ({type(e).__name__}: "
                   f"{str(e)[:120]})")
             continue
-        ok, msg = _params_close(model_ref, model_var)
+        ok, msg = _params_close(
+            _real_model(spec, ref_obj), _real_model(spec, var_obj),
+        )
         loss_match = abs(losses[-1] - ref_losses[-1]) < max(
             1e-4, abs(ref_losses[-1]) * 1e-3
         )
@@ -477,26 +614,28 @@ def _time_one(step_fn, x, y, *, n_warmup=5, n_iters=50):
 
 
 def run_speed(model_key, *, lr, include_optimizer):
-    label, make_model = WORKLOADS[model_key]
+    spec = WORKLOADS[model_key]
 
     # Use the same canonical snapshot every variant resets to so
     # timing isn't biased by post-build dirty weight state.
-    ref_model_for_snapshot, _, _ = _fresh_model_and_batch(make_model)
-    init_snapshot = _snapshot_params(ref_model_for_snapshot)
+    ref_obj, _, _ = _fresh_model_and_batch(spec)
+    init_snapshot = _snapshot_params(spec, ref_obj)
 
     times = {}
     for name, builder in VARIANTS:
-        model, x, y = _fresh_model_and_batch(make_model)
+        obj, x, y = _fresh_model_and_batch(spec)
         step = _safe_build(
-            builder, model, x.clone(), y.clone(),
+            builder, spec, obj,
+            x.clone() if x is not None else None,
+            y.clone() if y is not None else None,
             lr=lr, include_optimizer=include_optimizer)
         if step is not None:
-            _restore_params(model, init_snapshot)
+            _restore_params(spec, obj, init_snapshot)
         times[name] = None if step is None else _time_one(step, x, y)
 
     col_w = 9
     names = [n for n, _ in VARIANTS]
-    print(f"\n## per-iteration training speed: {label} (median, us)")
+    print(f"\n## per-iteration training speed: {spec.label} (median, us)")
     sub = (
         "(optimizer.step() in the captured trace; v1 only)"
         if include_optimizer
