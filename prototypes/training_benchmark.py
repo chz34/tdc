@@ -320,39 +320,33 @@ def build_v2(model, x_ex, y_ex, *, lr, include_optimizer):
     return step
 
 
-# Variant ordering -- also the column order in the speed table.
-VARIANT_NAMES = ["eager", "dynamo", "aot_eager", "inductor", "v1", "v2"]
+# Variant registry. Each entry is (name, builder) where builder has
+# the signature (model, x_ex, y_ex, *, lr, include_optimizer) -> step.
+# Order doubles as the column order in the speed table. The three
+# compile-backend variants share build_compiled via functools.partial
+# so adding a new backend (or a new variant entirely) is a single
+# line here -- no separate dispatch function to update.
+from functools import partial
+
+VARIANTS = [
+    ("eager",     build_eager),
+    ("dynamo",    partial(build_compiled, backend="eager")),
+    ("aot_eager", partial(build_compiled, backend="aot_eager")),
+    ("inductor",  partial(build_compiled, backend="inductor")),
+    ("v1",        build_v1),
+    ("v2",        build_v2),
+]
 
 
-def build_variant(name, model, x_ex, y_ex, *, lr, include_optimizer):
-    """Dispatch to the right builder for one variant. Returns the
-    step closure, or None on build failure (variant is skipped)."""
+def _safe_build(builder, model, x_ex, y_ex, *, lr, include_optimizer):
+    """Invoke a variant builder, printing the traceback and returning
+    None on failure so the rest of the run can continue."""
     try:
-        if name == "eager":
-            return build_eager(
-                model, x_ex, y_ex, lr=lr, include_optimizer=include_optimizer)
-        if name == "dynamo":
-            return build_compiled(
-                model, x_ex, y_ex, backend="eager",
-                lr=lr, include_optimizer=include_optimizer)
-        if name == "aot_eager":
-            return build_compiled(
-                model, x_ex, y_ex, backend="aot_eager",
-                lr=lr, include_optimizer=include_optimizer)
-        if name == "inductor":
-            return build_compiled(
-                model, x_ex, y_ex, backend="inductor",
-                lr=lr, include_optimizer=include_optimizer)
-        if name == "v1":
-            return build_v1(
-                model, x_ex, y_ex, lr=lr, include_optimizer=include_optimizer)
-        if name == "v2":
-            return build_v2(
-                model, x_ex, y_ex, lr=lr, include_optimizer=include_optimizer)
+        return builder(
+            model, x_ex, y_ex, lr=lr, include_optimizer=include_optimizer)
     except Exception:
         traceback.print_exc()
         return None
-    return None
 
 
 def _fresh_model_and_batch(make_model_fn, seed=42):
@@ -406,10 +400,11 @@ def run_correctness(model_key, *, n_iters, lr, include_optimizer):
     # Eager reference: builds + runs N iterations from the initial
     # snapshot. eager doesn't need a snapshot reset because its build
     # doesn't dirty weights.
+    eager_builder = dict(VARIANTS)["eager"]
     model_ref, x, y = _fresh_model_and_batch(make_model)
     _restore_params(model_ref, init_snapshot)
-    ref_step = build_variant(
-        "eager", model_ref, x.clone(), y.clone(),
+    ref_step = _safe_build(
+        eager_builder, model_ref, x.clone(), y.clone(),
         lr=lr, include_optimizer=include_optimizer)
     _restore_params(model_ref, init_snapshot)
     ref_losses = []
@@ -420,12 +415,12 @@ def run_correctness(model_key, *, n_iters, lr, include_optimizer):
     print("   eager final loss: {:.4f}  (path: {})".format(
         ref_losses[-1], " -> ".join(f"{l:.3f}" for l in ref_losses)))
 
-    for name in VARIANT_NAMES:
+    for name, builder in VARIANTS:
         if name == "eager":
             continue
         model_var, x_v, y_v = _fresh_model_and_batch(make_model)
-        step = build_variant(
-            name, model_var, x_v.clone(), y_v.clone(),
+        step = _safe_build(
+            builder, model_var, x_v.clone(), y_v.clone(),
             lr=lr, include_optimizer=include_optimizer)
         if step is None:
             print(f"   {name:<11} BUILD FAILED")
@@ -490,16 +485,17 @@ def run_speed(model_key, *, lr, include_optimizer):
     init_snapshot = _snapshot_params(ref_model_for_snapshot)
 
     times = {}
-    for name in VARIANT_NAMES:
+    for name, builder in VARIANTS:
         model, x, y = _fresh_model_and_batch(make_model)
-        step = build_variant(
-            name, model, x.clone(), y.clone(),
+        step = _safe_build(
+            builder, model, x.clone(), y.clone(),
             lr=lr, include_optimizer=include_optimizer)
         if step is not None:
             _restore_params(model, init_snapshot)
         times[name] = None if step is None else _time_one(step, x, y)
 
     col_w = 9
+    names = [n for n, _ in VARIANTS]
     print(f"\n## per-iteration training speed: {label} (median, us)")
     sub = (
         "(optimizer.step() in the captured trace; v1 only)"
@@ -507,16 +503,15 @@ def run_speed(model_key, *, lr, include_optimizer):
         else "(optimizer.step() in eager after captured fw+bw replay)"
     )
     print(f"#  {sub}")
-    header_cols = " ".join(f"{n:>{col_w}}" for n in VARIANT_NAMES)
+    header_cols = " ".join(f"{n:>{col_w}}" for n in names)
     ratio_cols = " ".join(
-        f"{(n + '/eager'):>{col_w + 1}}"
-        for n in VARIANT_NAMES if n != "eager"
+        f"{(n + '/eager'):>{col_w + 1}}" for n in names if n != "eager"
     )
     print(f"   {header_cols} | {ratio_cols}")
 
     def cell(t):
         return "     N/A" if t is None else f"{t:8.2f}"
-    time_strs = " ".join(f"{cell(times[n]):>{col_w}}" for n in VARIANT_NAMES)
+    time_strs = " ".join(f"{cell(times[n]):>{col_w}}" for n in names)
     eg = times["eager"]
     def ratio(n):
         t = times[n]
@@ -524,7 +519,7 @@ def run_speed(model_key, *, lr, include_optimizer):
             return "    N/A "
         return f"{(t/eg):>{col_w}.2f}x"
     ratio_strs = " ".join(
-        f"{ratio(n):>{col_w}}" for n in VARIANT_NAMES if n != "eager"
+        f"{ratio(n):>{col_w}}" for n in names if n != "eager"
     )
     print(f"   {time_strs} | {ratio_strs}")
 
@@ -581,7 +576,7 @@ def main():
 
     print("# training benchmark")
     print_device_banner()
-    print(f"# variants: {' / '.join(VARIANT_NAMES)}")
+    print(f"# variants: {' / '.join(n for n, _ in VARIANTS)}")
 
     models_to_run = [args.model] if args.model else list(WORKLOADS.keys())
     for key in models_to_run:
