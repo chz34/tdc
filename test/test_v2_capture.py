@@ -449,6 +449,57 @@ class TestV2Capture(unittest.TestCase):
                          f"expected Long, got {got.dtype}")
         self.assertTrue(torch.equal(got, ref))
 
+    # ---- ops with bool[] schema (LayerNorm backward, etc.) -----------
+    # `aten::native_layer_norm_backward`'s `output_mask: bool[3]` is the
+    # canonical surface; any training workload with LayerNorm hits it
+    # the moment .backward() runs. Without LIST_TO_BOOL_LIST the boxed
+    # dispatcher's iv.toBoolList() raises an INTERNAL ASSERT
+    # "Expected BoolList but got GenericList".
+
+    def test_native_layer_norm_backward(self):
+        """LayerNorm + .backward() exercises native_layer_norm_backward's
+        `output_mask: bool[3]` schema. The captured backward graph
+        emits the bool[True, True, True] literal that needs
+        LIST_TO_BOOL_LIST coercion; without it the boxed dispatcher's
+        iv.toBoolList() raises an INTERNAL ASSERT
+        ("Expected BoolList but got GenericList")."""
+        import torch.nn as nn
+        import torch.nn.functional as F
+        from torch.func import functional_call
+
+        torch.manual_seed(0)
+        ln = nn.LayerNorm(8)
+        params = list(ln.parameters())
+        names = list(dict(ln.named_parameters()).keys())
+
+        def fn(x, *p):
+            # .sum() picks one path through the bw graph that
+            # exercises native_layer_norm_backward.
+            return functional_call(ln, dict(zip(names, p)), x).sum()
+
+        x = torch.randn(4, 8, requires_grad=True)
+        captured = tdcv2.capture(fn, x, *params, allow_grad=True)
+        # capture-time example call already did a .backward(); clear
+        # grads so v2_grads reflects exactly one replay's accumulation.
+        for p in params:
+            p.grad = None
+        loss = captured(x, *params)
+        loss.backward()
+        v2_grads = [p.grad.clone() for p in params]
+        # Eager reference: clear grads, re-run, compare.
+        for p in params:
+            p.grad = None
+        ref_loss = fn(x, *params)
+        ref_loss.backward()
+        for p, v2_grad in zip(params, v2_grads):
+            self.assertTrue(
+                p.grad is not None
+                and torch.allclose(p.grad, v2_grad, atol=1e-4),
+                f"grad mismatch on shape {tuple(p.shape)}: max diff "
+                f"{(p.grad - v2_grad).abs().max().item():.3e}"
+            )
+        self.assertTrue(torch.allclose(ref_loss, loss, atol=1e-4))
+
     # ---- aten::index.Tensor with Tensor?[] indices (Optional list) ---
     # The schema is `aten::index.Tensor(Tensor self, Tensor?[] indices)`.
     # `Tensor?[]` is `List<Optional<Tensor>>`; without

@@ -244,7 +244,8 @@ PYBIND11_MODULE(_C, m) {
         .value("SCALAR_TO_TENSOR",             tdc::ArgCoercion::kScalarToTensor)
         .value("LIST_TO_INT_LIST",             tdc::ArgCoercion::kListToIntList)
         .value("LIST_TO_TENSOR_LIST",          tdc::ArgCoercion::kListToTensorList)
-        .value("LIST_TO_OPTIONAL_TENSOR_LIST", tdc::ArgCoercion::kListToOptionalTensorList);
+        .value("LIST_TO_OPTIONAL_TENSOR_LIST", tdc::ArgCoercion::kListToOptionalTensorList)
+        .value("LIST_TO_BOOL_LIST",            tdc::ArgCoercion::kListToBoolList);
 
     py::enum_<tdc::BuiltinKind>(m, "BuiltinKind")
         .value("FLOORDIV", tdc::BuiltinKind::kFloorDiv)

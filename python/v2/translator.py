@@ -391,6 +391,7 @@ def _compute_coercions(op, positional_kinds) -> List[Any]:
     LIST_I = _C.ArgCoercion.LIST_TO_INT_LIST
     LIST_T = _C.ArgCoercion.LIST_TO_TENSOR_LIST
     LIST_OPT_T = _C.ArgCoercion.LIST_TO_OPTIONAL_TENSOR_LIST
+    LIST_B = _C.ArgCoercion.LIST_TO_BOOL_LIST
 
     out: List[Any] = []
     for k, kind in enumerate(positional_kinds):
@@ -441,6 +442,13 @@ def _compute_coercions(op, positional_kinds) -> List[Any]:
                     # PyTorch raises "Tried to cast a List<Any> to a
                     # List<Tensor?>" at replay.
                     out.append(LIST_OPT_T)
+                elif elem_kind == "BoolType":
+                    # bool[] -- e.g. native_layer_norm_backward's
+                    # `output_mask: bool[3]`. Boxed dispatcher's
+                    # iv.toBoolList() needs a strongly-typed
+                    # c10::List<bool>, not the GenericList<IValue>
+                    # we'd otherwise emit.
+                    out.append(LIST_B)
                 else:
                     out.append(NONE)
             else:

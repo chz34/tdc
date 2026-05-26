@@ -207,6 +207,17 @@ inline c10::IValue apply_coercion(c10::IValue iv, ArgCoercion tag) {
             }
             return c10::IValue(std::move(opts));
         }
+        case ArgCoercion::kListToBoolList: {
+            // For schemas with bool[] (e.g. native_layer_norm_backward's
+            // output_mask). Build the typed c10::List<bool>.
+            const auto& generic = iv.toList();
+            c10::List<bool> bools;
+            bools.reserve(generic.size());
+            for (const auto& e : generic) {
+                bools.push_back(c10::IValue(e).toBool());
+            }
+            return c10::IValue(std::move(bools));
+        }
     }
     return iv;
 }

@@ -141,6 +141,7 @@ const char* coercion_tag(ArgCoercion c) {
         case ArgCoercion::kListToIntList:             return "L>I";
         case ArgCoercion::kListToTensorList:          return "L>T";
         case ArgCoercion::kListToOptionalTensorList:  return "L>T?";
+        case ArgCoercion::kListToBoolList:            return "L>B";
     }
     return "?";
 }

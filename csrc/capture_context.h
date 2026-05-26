@@ -94,6 +94,12 @@ enum class ArgCoercion : uint8_t {
     // None IValue becomes std::nullopt, a Tensor IValue becomes the
     // tensor wrapped in an optional.
     kListToOptionalTensorList,
+    // For schemas with bool[] (e.g. native_layer_norm_backward's
+    // `output_mask: bool[3]`). Raw GenericList<IValue<bool>> fails the
+    // boxed dispatcher's iv.toBoolList() with an INTERNAL ASSERT
+    // ("Expected BoolList but got GenericList"). Element-wise:
+    // IValue<bool> -> bool.
+    kListToBoolList,
 };
 
 // Tag for kPyCall steps. The few Python builtin / torch.sym helpers
