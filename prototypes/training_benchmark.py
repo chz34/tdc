@@ -19,34 +19,51 @@ idiomatic PyTorch -- nn.Linear / nn.LayerNorm modules with weights
 stored as parameters, F.cross_entropy as the loss, torch.optim.SGD
 as the optimizer.
 
-The default mode (-t train without --include-optimizer) captures
-forward + backward only and skips optimizer.step(). Add
---include-optimizer to also fold the SGD update into the timed
-iteration (the update itself stays in Python, outside the captured
-trace).
+Every mode runs `optimizer.zero_grad() / forward / loss.backward() /
+optimizer.step()` -- a real training step where weights actually
+move and loss drops between iterations.
+
+`--include-optimizer` controls whether the optimizer.step() is
+folded into the captured/compiled artifact (where supported), or
+runs in normal eager Python outside the trace:
+
+  - default (no --include-optimizer): optimizer.step() runs in
+    eager Python after each replay. v1's trace covers fw+bw;
+    v2's captured fn covers fw+bw; the weight update is a
+    separate Python-side call that mutates parameters via
+    aten::add_ as usual.
+
+  - --include-optimizer: where possible, fold optimizer.step()'s
+    aten ops into the capture so replay does the whole step in
+    one dispatch sequence.
+        v1: opt.step() is called INSIDE the
+            `with tdc.capture(allow_grad=True)` block, so the SGD
+            add_ ops are recorded as Steps; replay applies them.
+        v2: not currently supported -- v2's autograd.Function
+            wrapper only owns fw + bw graphs; folding the
+            optimizer would need a different capture API. v2
+            falls back to eager-step behaviour and prints a notice.
+        eager / dynamo / aot_eager / inductor: no-op (no "capture"
+            concept beyond what each compile backend already does).
 
 How each mode handles training:
 
-  - eager / dynamo / aot_eager / inductor: drop the model into
-    torch.compile (or use eager) and call as `loss = model(x); ...;
-    loss.backward(); optimizer.step()`. The optimizer sees
-    model.parameters() and updates them in place.
+  - eager / dynamo / aot_eager / inductor: idiomatic
+    `optimizer.step()` after backward. dynamo / aot_eager /
+    inductor compile the forward (and backward via autograd), but
+    optimizer always runs in Python.
 
-  - v1: capture the entire fw+bw inside the `tdc.capture(allow_grad=
-    True)` context manager. trace.replay() re-runs every aten op
-    including the AccumulateGrad add_ into .grad. (Known limitation:
-    multi-Linear chain backward currently misidentifies one of the
-    saved-for-backward tensor identities; see the printed STEP
-    FAILED diagnostics.)
+  - v1: capture fw+bw (or fw+bw+step with --include-optimizer)
+    inside the `tdc.capture(allow_grad=True)` context manager.
+    (Known limitation: multi-Linear chain backward currently
+    misidentifies one of the saved-for-backward tensor identities;
+    the printed STEP FAILED diagnostics make this visible.)
 
   - v2 (direct): use torch.func.functional_call to thread the
     module's parameters through as positional user-input args of a
-    wrapper fn. This is needed because v2's _CapturedFn.backward
-    only routes gradients for tensors that appear in user-input
-    positions; module parameters lifted internally by AOT don't get
-    their grads forwarded back to autograd. The user still defines
-    the model normally -- the param-positional adaptation happens
-    inside the variant builder.
+    wrapper fn. v2's _CapturedFn.backward only routes gradients
+    for tensors that appear in user-input positions; functional_call
+    bridges that gap without forcing the model code to be functional.
 
   - v2 (wrapper) is omitted: capture() silently downgrades
     allow_grad=True to wrapper=False per compile.py's existing logic.
@@ -153,26 +170,35 @@ WORKLOADS = {
 # if include_optimizer was set at build time), and returns the loss
 # value as a detached scalar so the benchmark can record convergence.
 # ---------------------------------------------------------------------------
-def _build_optimizer(params, lr, include_optimizer):
-    if not include_optimizer:
-        return None
-    return torch.optim.SGD(params, lr=lr)
+def _snapshot_params(model):
+    """Return a dict of cloned parameter tensors -- used to reset
+    every variant back to the same initial weights after any
+    capture-time warmup or example-call mutations."""
+    return {n: p.detach().clone() for n, p in model.named_parameters()}
+
+
+def _restore_params(model, snapshot):
+    """In-place copy snapshot values back into the model's parameters
+    and clear .grad. Identity is preserved so any captured trace
+    that references model.parameters() by TensorImpl identity
+    keeps working against the reset values."""
+    with torch.no_grad():
+        for n, p in model.named_parameters():
+            p.copy_(snapshot[n])
+        for p in model.parameters():
+            p.grad = None
 
 
 def build_eager(model, x_ex, y_ex, *, lr, include_optimizer):
-    opt = _build_optimizer(model.parameters(), lr, include_optimizer)
+    # Eager has no "capture", so --include-optimizer is a no-op here:
+    # the optimizer always runs in Python.
+    opt = torch.optim.SGD(model.parameters(), lr=lr)
 
     def step(x, y):
-        if opt is not None:
-            opt.zero_grad(set_to_none=False)
-        else:
-            for p in model.parameters():
-                if p.grad is not None:
-                    p.grad.zero_()
+        opt.zero_grad()
         loss = F.cross_entropy(model(x), y)
         loss.backward()
-        if opt is not None:
-            opt.step()
+        opt.step()
         return loss.detach()
     return step
 
@@ -180,63 +206,67 @@ def build_eager(model, x_ex, y_ex, *, lr, include_optimizer):
 def build_compiled(model, x_ex, y_ex, *, backend, lr, include_optimizer):
     """torch.compile-based variant (dynamo / aot_eager / inductor).
 
-    For the training case we compile just the forward; backward is
-    autograd-driven and runs on the same compiled artifact when
-    backends support it (inductor / aot_eager)."""
+    Compile the forward; backward is autograd-driven, optimizer
+    runs in eager Python. --include-optimizer has no effect on
+    these modes (would require torch.compile(opt.step) which is a
+    separate gesture)."""
     compiled_forward = torch.compile(model, backend=backend, dynamic=True)
-    opt = _build_optimizer(model.parameters(), lr, include_optimizer)
+    opt = torch.optim.SGD(model.parameters(), lr=lr)
 
     def step(x, y):
-        if opt is not None:
-            opt.zero_grad(set_to_none=False)
-        else:
-            for p in model.parameters():
-                if p.grad is not None:
-                    p.grad.zero_()
+        opt.zero_grad()
         loss = F.cross_entropy(compiled_forward(x), y)
         loss.backward()
-        if opt is not None:
-            opt.step()
+        opt.step()
         return loss.detach()
     return step
 
 
 def build_v1(model, x_ex, y_ex, *, lr, include_optimizer):
-    """v1 captures the entire fw+bw via the dispatcher fallback.
+    """v1 captures fw+bw (and optimizer.step() under
+    --include-optimizer) via the dispatcher fallback.
 
     Pattern from test_backward.py: warmup with one eager fw+bw to
     allocate .grad on every parameter (AccumulateGrad's first call
-    bypasses dispatch); then capture; then replay re-runs everything
-    including the captured grad accumulations.
+    bypasses dispatch); then capture; then replay re-runs everything.
+    The build_v1 builder dirties the weights through the warmup +
+    capture-time example call; the benchmark's outer loop resets
+    the weights via _restore_params before timing/correctness so
+    every variant starts from the same initial state."""
+    opt = torch.optim.SGD(model.parameters(), lr=lr)
 
-    Optimizer step is applied OUTSIDE the captured trace -- v1's
-    capture only covers aten ops that go through the dispatcher,
-    and torch.optim's parameter update path is in Python."""
-    # Warmup: eager fw+bw to allocate .grad
+    # Warmup: eager fw+bw+step. Needed so AccumulateGrad's special-
+    # first-call path doesn't appear inside the capture, and so any
+    # SGD-internal lazy allocation (e.g. momentum buffers, if we add
+    # them later) is done before the capture window.
+    opt.zero_grad()
     loss = F.cross_entropy(model(x_ex), y_ex)
     loss.backward()
-    for p in model.parameters():
-        p.grad.zero_()
+    opt.step()
+    opt.zero_grad()
 
-    # Capture
-    with tdc.capture(allow_grad=True) as trace:
-        captured_loss = F.cross_entropy(model(x_ex), y_ex)
-        captured_loss.backward()
-    for p in model.parameters():
-        p.grad.zero_()
-
-    opt = _build_optimizer(model.parameters(), lr, include_optimizer)
+    if include_optimizer:
+        # Capture fw + bw + optimizer.step() -- the SGD update's
+        # aten::add_ on each parameter is dispatched and recorded.
+        with tdc.capture(allow_grad=True) as trace:
+            captured_loss = F.cross_entropy(model(x_ex), y_ex)
+            captured_loss.backward()
+            opt.step()
+    else:
+        with tdc.capture(allow_grad=True) as trace:
+            captured_loss = F.cross_entropy(model(x_ex), y_ex)
+            captured_loss.backward()
+    opt.zero_grad()
 
     def step(x, y):
-        for p in model.parameters():
-            if p.grad is not None:
-                p.grad.zero_()
-        # v1 replays against the same captured input tensors; copy
-        # the caller-supplied batch into them in place.
+        opt.zero_grad()
+        # v1 replays against the captured input tensors; copy the
+        # caller-supplied batch into them in place.
         x_ex.detach().copy_(x)
         y_ex.copy_(y)
         trace.replay()
-        if opt is not None:
+        if not include_optimizer:
+            # opt.step() runs in eager Python outside the trace.
             opt.step()
         return captured_loss.detach().clone()
     return step
@@ -246,21 +276,23 @@ def build_v2(model, x_ex, y_ex, *, lr, include_optimizer):
     """v2 + idiomatic nn.Module training.
 
     v2's _CapturedFn.backward only routes gradients for tensors that
-    appeared as USER-INPUT positional args at capture time -- nn.Module
-    parameters that AOT lifts internally are absorbed into pre_binds
-    and their bw outputs are discarded. To bridge that without
-    contorting the model code, we wrap the captured fn in
-    torch.func.functional_call: parameters are extracted from the
-    Module and threaded through positionally, with the model code
-    itself unchanged.
+    appeared as USER-INPUT positional args at capture time. To
+    keep the user's model code idiomatic (nn.Module + parameters),
+    we wrap the forward in torch.func.functional_call and thread
+    parameters positionally inside the wrapper. .grad lands on the
+    same Tensor objects model.parameters() returns, so the eager
+    optimizer.step() outside the trace mutates the model correctly.
 
-    .grad still lands on the same Tensor objects model.parameters()
-    references, so torch.optim works against them transparently.
-    """
+    --include-optimizer is not currently supported on v2 -- the
+    autograd.Function-based wrapper only owns fw + bw graphs and
+    folding the optimizer would need a different capture API. We
+    fall back to eager-step and emit a notice."""
     from torch.func import functional_call
 
-    # Snapshot the model's parameter names + tensors. Order matters
-    # because we use positional args.
+    if include_optimizer:
+        print("   v2          NOTICE     --include-optimizer not supported "
+              "on v2's autograd.Function path; running optimizer in eager")
+
     param_names = list(dict(model.named_parameters()).keys())
     params = list(model.parameters())
 
@@ -272,17 +304,18 @@ def build_v2(model, x_ex, y_ex, *, lr, include_optimizer):
     captured = tdcv2.capture(
         train_step, x_ex, y_ex, *params, allow_grad=True,
     )
+    # capture-time example call already ran a .backward(); clear
+    # the accumulated grads so the first timed step starts clean.
+    for p in params:
+        p.grad = None
 
-    opt = _build_optimizer(params, lr, include_optimizer)
+    opt = torch.optim.SGD(params, lr=lr)
 
     def step(x, y):
-        for p in params:
-            if p.grad is not None:
-                p.grad.zero_()
+        opt.zero_grad()
         loss = captured(x, y, *params)
         loss.backward()
-        if opt is not None:
-            opt.step()
+        opt.step()
         return loss.detach()
     return step
 
@@ -363,11 +396,22 @@ def run_correctness(model_key, *, n_iters, lr, include_optimizer):
     print(f"\n## correctness: {label}")
     print(f"#  n_iters={n_iters}, lr={lr}, include_optimizer={include_optimizer}")
 
-    # Eager reference
+    # One canonical initial snapshot drives every variant -- this way
+    # variants whose build dirties weights (v1's warmup + capture-time
+    # example call, v2's example call's .backward) get reset to the
+    # same initial state before the timed loop starts.
+    ref_model_for_snapshot, _, _ = _fresh_model_and_batch(make_model)
+    init_snapshot = _snapshot_params(ref_model_for_snapshot)
+
+    # Eager reference: builds + runs N iterations from the initial
+    # snapshot. eager doesn't need a snapshot reset because its build
+    # doesn't dirty weights.
     model_ref, x, y = _fresh_model_and_batch(make_model)
+    _restore_params(model_ref, init_snapshot)
     ref_step = build_variant(
         "eager", model_ref, x.clone(), y.clone(),
         lr=lr, include_optimizer=include_optimizer)
+    _restore_params(model_ref, init_snapshot)
     ref_losses = []
     for _ in range(n_iters):
         loss = ref_step(x, y)
@@ -376,7 +420,6 @@ def run_correctness(model_key, *, n_iters, lr, include_optimizer):
     print("   eager final loss: {:.4f}  (path: {})".format(
         ref_losses[-1], " -> ".join(f"{l:.3f}" for l in ref_losses)))
 
-    # Each variant gets an independent model with the same init seed.
     for name in VARIANT_NAMES:
         if name == "eager":
             continue
@@ -387,6 +430,10 @@ def run_correctness(model_key, *, n_iters, lr, include_optimizer):
         if step is None:
             print(f"   {name:<11} BUILD FAILED")
             continue
+        # Reset weights AFTER build (v1's warmup / v2's example call
+        # both mutate the model). Captured traces keep their TensorImpl
+        # references; in-place .copy_ preserves identity.
+        _restore_params(model_var, init_snapshot)
         try:
             losses = []
             for _ in range(n_iters):
@@ -437,17 +484,28 @@ def _time_one(step_fn, x, y, *, n_warmup=5, n_iters=50):
 def run_speed(model_key, *, lr, include_optimizer):
     label, make_model = WORKLOADS[model_key]
 
+    # Use the same canonical snapshot every variant resets to so
+    # timing isn't biased by post-build dirty weight state.
+    ref_model_for_snapshot, _, _ = _fresh_model_and_batch(make_model)
+    init_snapshot = _snapshot_params(ref_model_for_snapshot)
+
     times = {}
     for name in VARIANT_NAMES:
         model, x, y = _fresh_model_and_batch(make_model)
         step = build_variant(
             name, model, x.clone(), y.clone(),
             lr=lr, include_optimizer=include_optimizer)
+        if step is not None:
+            _restore_params(model, init_snapshot)
         times[name] = None if step is None else _time_one(step, x, y)
 
     col_w = 9
     print(f"\n## per-iteration training speed: {label} (median, us)")
-    sub = "(includes optimizer step)" if include_optimizer else "(fw+bw only)"
+    sub = (
+        "(optimizer.step() in the captured trace; v1 only)"
+        if include_optimizer
+        else "(optimizer.step() in eager after captured fw+bw replay)"
+    )
     print(f"#  {sub}")
     header_cols = " ".join(f"{n:>{col_w}}" for n in VARIANT_NAMES)
     ratio_cols = " ".join(
@@ -491,8 +549,16 @@ def main():
     )
     parser.add_argument(
         "--include-optimizer", action="store_true",
-        help="Run torch.optim.SGD.step() inside the timed iteration. "
-             "Default off -- the benchmark covers fw+bw only.",
+        help=(
+            "Fold optimizer.step() into the captured trace (v1 only). "
+            "Default off: optimizer.step() runs in normal eager Python "
+            "after the captured fw+bw replay -- weights still update "
+            "and loss drops between iterations. Setting this flag puts "
+            "the SGD add_ ops INSIDE the capture window so replay does "
+            "the entire training step in one dispatch sequence. v2's "
+            "current autograd.Function path cannot fold the optimizer "
+            "and will print a notice + run optimizer in eager."
+        ),
     )
     parser.add_argument(
         "--n-iters", type=int, default=5,
