@@ -280,22 +280,58 @@ def _compute_loss(spec, model_or_bench, x, y):
 
 
 def _snapshot_params(spec, model_or_bench):
-    """Return a dict of cloned parameter tensors -- used to reset
-    every variant back to the same initial weights after any
-    capture-time warmup or example-call mutations."""
+    """Return a dict of cloned parameter + buffer tensors -- used to
+    reset every variant back to the same initial state after any
+    capture-time warmup or example-call mutations.
+
+    Buffers must be snapshotted alongside params because some variants
+    (notably v2, which runs an example forward inside `capture()`)
+    advance stateful buffers like BatchNorm's running_mean/running_var
+    before the timed loop starts. Without resetting buffers the variant
+    enters its first step "1 forward ahead" of the eager reference and
+    the loss comparison sees BN-state drift rather than backward
+    correctness.
+    """
     m = _real_model(spec, model_or_bench)
-    return {n: p.detach().clone() for n, p in m.named_parameters()}
+    snap = {f"P/{n}": p.detach().clone() for n, p in m.named_parameters()}
+    for n, b in m.named_buffers():
+        snap[f"B/{n}"] = b.detach().clone()
+    return snap
 
 
 def _restore_params(spec, model_or_bench, snapshot):
     """In-place copy snapshot values back into the model's parameters
-    and clear .grad. Identity is preserved so any captured trace
-    that references model.parameters() by TensorImpl identity
-    keeps working against the reset values."""
+    AND buffers, then clear .grad. Identity is preserved so any captured
+    trace that references model state by TensorImpl identity keeps
+    working against the reset values.
+
+    Strips a leading `_orig_mod.` from the param/buffer name if the
+    direct lookup misses: build_compiled monkey-patches `bench.model =
+    torch.compile(real, ...)` for torchbench, which wraps state under
+    that prefix in named_parameters() / named_buffers(). The canonical
+    snapshot was taken from the pre-wrap eager model so its keys don't
+    carry the prefix.
+    """
+    PREFIX = "_orig_mod."
+
+    def _lookup(kind, name):
+        key = f"{kind}/{name}"
+        if key in snapshot:
+            return snapshot[key]
+        if name.startswith(PREFIX):
+            stripped = f"{kind}/{name[len(PREFIX):]}"
+            if stripped in snapshot:
+                return snapshot[stripped]
+        raise KeyError(
+            f"_restore_params: no snapshot entry for {kind}/{name!r}. "
+            f"snapshot keys (first 5): {list(snapshot.keys())[:5]}")
+
     m = _real_model(spec, model_or_bench)
     with torch.no_grad():
         for n, p in m.named_parameters():
-            p.copy_(snapshot[n])
+            p.copy_(_lookup("P", n))
+        for n, b in m.named_buffers():
+            b.copy_(_lookup("B", n))
         for p in m.parameters():
             p.grad = None
 
@@ -394,53 +430,77 @@ def build_v1(spec, model, x_ex, y_ex, *, lr, include_optimizer):
 def build_v2(spec, model, x_ex, y_ex, *, lr, include_optimizer):
     """v2 + idiomatic nn.Module training.
 
-    v2's _CapturedFn.backward only routes gradients for tensors that
-    appeared as USER-INPUT positional args at capture time. To
-    keep the user's model code idiomatic (nn.Module + parameters),
-    we wrap the forward in torch.func.functional_call and thread
-    parameters positionally inside the wrapper.
+    Uses the natural closure form: v2.capture detects Parameters lifted
+    by AOT and routes their backward grads to .grad through autograd's
+    accumulator path (aot_eager-style). No functional_call needed.
 
-    --include-optimizer is not currently supported on v2; the
-    autograd.Function-based wrapper only owns fw + bw graphs.
+    --include-optimizer is not folded into the captured trace -- the
+    autograd.Function wrapper only owns fw + bw graphs, optimizer.step
+    runs in eager. opt.step's in-place .data mutation IS visible to the
+    next captured replay (v2 holds the Parameter object in
+    captured_tensors_, not a snapshot), so multi-iteration training
+    converges identically to eager.
 
-    torchbench workloads aren't currently supported on v2 either:
-    bench.forward() takes no positional Tensors (its example_inputs
-    are baked into the bench instance), so we can't expose them as
-    requires_grad=True user-input args for v2's allow_grad path.
+    For torchbench: capture `bench.forward` directly. It's a zero-arg
+    method that closure-references bench.model + bench.example_inputs.
+    Dynamo lifts both as graph inputs; parameters route through the
+    autograd-leaf path, example_inputs Tensors stay pre-bound (same
+    batch per replay, which matches torchbench's benchmark loop
+    semantics anyway). Capture is wrapped in try/except so individual
+    bench wrappers that graph-break (HF amp_context, exotic output
+    dataclasses, etc.) fail loud but don't crash the benchmark.
     """
-    if spec.is_torchbench:
-        print(f"   v2          NOTICE     torchbench workloads "
-              f"(bench.forward has no positional Tensor args) not "
-              f"supported on v2's allow_grad path; skipping")
-        return None
-
-    from torch.func import functional_call
-
     if include_optimizer:
-        print("   v2          NOTICE     --include-optimizer not supported "
-              "on v2's autograd.Function path; running optimizer in eager")
+        print("   v2          NOTICE     --include-optimizer not folded "
+              "into the captured trace; running optimizer in eager "
+              "(in-place updates ARE reflected in the next replay)")
 
-    param_names = list(dict(model.named_parameters()).keys())
-    params = list(model.parameters())
+    real = _real_model(spec, model)
 
-    def train_step(x, y, *param_list):
-        p_dict = dict(zip(param_names, param_list))
-        out = functional_call(model, p_dict, x)
-        return F.cross_entropy(out, y)
+    if spec.is_torchbench:
+        # bench.forward() is zero-arg; bench.example_inputs and
+        # bench.model are both closure-captured. Capture with no
+        # positional args -- v2 will lift everything via Dynamo +
+        # the new param-leaf routing.
+        try:
+            captured = tdcv2.capture(model.forward, allow_grad=True)
+        except Exception as e:
+            print(f"   v2          CAPTURE FAILED  "
+                  f"({type(e).__name__}: {str(e).splitlines()[0][:140]})")
+            return None
+        for p in real.parameters():
+            p.grad = None
+        opt = torch.optim.SGD(real.parameters(), lr=lr)
 
-    captured = tdcv2.capture(
-        train_step, x_ex, y_ex, *params, allow_grad=True,
-    )
+        def step(x, y):
+            # bench owns its own inputs; ignore the caller-supplied
+            # x, y (mirrors build_v1's torchbench branch).
+            opt.zero_grad()
+            loss = captured()
+            loss.backward()
+            opt.step()
+            return loss.detach()
+        return step
+
+    # In-house path: closure form with x, y as positional args.
+    def train_step(x, y):
+        return F.cross_entropy(model(x), y)
+    try:
+        captured = tdcv2.capture(train_step, x_ex, y_ex, allow_grad=True)
+    except Exception as e:
+        print(f"   v2          CAPTURE FAILED  "
+              f"({type(e).__name__}: {str(e).splitlines()[0][:140]})")
+        return None
     # capture-time example call already ran a .backward(); clear
     # the accumulated grads so the first timed step starts clean.
-    for p in params:
+    for p in real.parameters():
         p.grad = None
 
-    opt = torch.optim.SGD(params, lr=lr)
+    opt = torch.optim.SGD(real.parameters(), lr=lr)
 
     def step(x, y):
         opt.zero_grad()
-        loss = captured(x, y, *params)
+        loss = captured(x, y)
         loss.backward()
         opt.step()
         return loss.detach()
@@ -499,8 +559,17 @@ def _fresh_model_and_batch(spec, seed=42):
 # Correctness
 # ---------------------------------------------------------------------------
 def _params_close(model_ref, model_var, atol=1e-4, rtol=1e-4):
-    ref_params = dict(model_ref.named_parameters())
-    var_params = dict(model_var.named_parameters())
+    # Strip a leading "_orig_mod." from var keys: build_compiled
+    # monkey-patches bench.model with torch.compile, which wraps params
+    # under that prefix in named_parameters(). The pre-wrap eager model
+    # has no such prefix, so a direct set comparison would always fail
+    # for the dynamo/aot_eager/inductor variants on torchbench.
+    def _strip(n):
+        prefix = "_orig_mod."
+        return n[len(prefix):] if n.startswith(prefix) else n
+
+    ref_params = {n: p for n, p in model_ref.named_parameters()}
+    var_params = {_strip(n): p for n, p in model_var.named_parameters()}
     if set(ref_params) != set(var_params):
         return False, (
             f"param-name set differs: ref - var = "

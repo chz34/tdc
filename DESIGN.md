@@ -1707,3 +1707,321 @@ schema 要的 `c10::List<std::optional<at::Tensor>>` 是**两个完全不同的 
 | `RuntimeError: Tried to cast a List<Any> to a List<Tensor?>` | 直接命中本节,升级到含 `LIST_TO_OPTIONAL_TENSOR_LIST` 的 translator + apply_coercion 即可 |
 | `TDC_TRACE_DEBUG=1` 中某 step 的 arg 出现 `<L>T?` tag | coercion 已正确路由 |
 | 错误信息提到其他 `List<X?>` 类型(`List<int?>` / `List<float?>` 等) | 是同类问题,但需要为该内层类型单独加 coercion case;`int?[]` 和 `float?[]` 在 aten schema 中非常罕见,目前没必要预先支持 |
+
+#### 17.6.16 v2.capture(allow_grad=True):nn.Module Parameter 作为 autograd leaf
+
+**问题**
+
+`_capture_with_backward` 的初版实现只把"用户显式作为 positional arg 传入"的
+Tensor 接到 autograd 上,机制是 `_build_recipe_specs` 里 `id()` 匹配
+`example_args`,匹配成功的 placeholder 进 `ph_to_user_input`,
+`_CapturedFn.backward` 据此把对应 bw output 返回给 autograd。
+
+闭包内引用的 nn.Module 参数走的是 **Dynamo 自动 lift** —— 它们出现在 fw_gm 的
+placeholder 列表里(`primals_N`),但 **id() 不在 example_args**,所以进
+`pre_binds`,被 `v2_pre_bind(ph_idx, value)` 永久绑到 trace 的
+`captured_tensors_[ph_idx]`。问题在于:
+
+1. **trace 层**:pre_bind 存的是 Parameter 对象本身,TensorImpl identity 保留,
+   `opt.step()` 的 in-place `param.add_(grad, alpha=-lr)` 是可见的 —— 这部分
+   OK,不是 bug。
+2. **autograd 层**:`_CapturedFn.backward` 返回 grads 给 `apply` 的 positional
+   args 位置,Parameter 没作为 apply 位置出现 → 对应 bw output **被默默丢弃**
+   → `param.grad` 永远是 `None` → opt.step 等于在零梯度上 step → 模型不训练。
+
+**对照 aot_eager**
+
+PyTorch 原生 `aot_eager` 在 Dynamo+AOT 处理 nn.Module 闭包时:
+
+```
+Dynamo trace model.forward
+  ↓ 把 self.fc.weight 等参数 lift 成 graph inputs(L_self_modules_fc_weight_)
+AOT joint trace
+  ↓ fw_gm.forward(*params, *user_inputs)
+  ↓ bw_gm 输出 grads 给 ALL fw inputs(包括 params 位置)
+RuntimeWrapper 包装:
+  class AOTAutogradFn(autograd.Function):
+      forward(ctx, *params, *user_inputs):  ← params 是 leaf args
+          out, *saved = fw_gm(*params, *user_inputs)
+          return out
+      backward(ctx, grad_out):
+          grads = bw_gm(*saved, grad_out)
+          return grads  ← 长度等于 forward 输入数,一一对应
+  compiled_forward(x) = AOTAutogradFn.apply(*model.parameters(), x)
+```
+
+关键设计点:**Parameter 既 lift 到图里(让 fw/bw 知道 op 输入)又作为
+autograd.Function 的 apply 位置(让 autograd 把 grad 路由回 leaf)**。 这是
+"图层级"和"autograd 层级"的两条路同时挂上。
+
+**v2 的对应做法**
+
+在 `_capture_with_backward` 里复刻这个双挂载:
+
+1. 走完 `_build_recipe_specs` 后,从 `fw_pre_binds` 里把 nn.Parameter 单独提
+   出来:
+   ```python
+   fw_param_specs = [
+       (ph_idx, value) for ph_idx, value in fw_pre_binds
+       if isinstance(value, torch.nn.Parameter)
+   ]
+   captured_params = [p for _, p in fw_param_specs]
+   ph_to_param_slot = {ph_idx: slot for slot, (ph_idx, _) in enumerate(fw_param_specs)}
+   ```
+   注意:**保留** `fw_pre_binds` 中的 Parameter 项,不要移除。pre_bind 仍然必须
+   做,这样 trace 的 `captured_tensors_` 槽指向真正的 Parameter 对象,
+   `opt.step()` 的 in-place 修改通过 TensorImpl identity 自动反映。
+
+2. 改 `_CapturedFn`:
+   ```python
+   class _CapturedFn(torch.autograd.Function):
+       @staticmethod
+       def forward(ctx, *all_args):
+           # all_args 排布: (*user_args, *params)
+           user_args = all_args[:n_user_inputs]
+           # params 已经 pre-bound 到 trace,不走 fw_flat。
+           # 这里只是为了让 autograd 把它们记为 leaf inputs。
+           fw_flat(user_args, fw_flat_buf)
+           fw_outputs = fw_trace.v2_replay(fw_flat_buf)
+           ...
+
+       @staticmethod
+       def backward(ctx, *grad_outputs):
+           ...
+           bw_outputs = bw_trace.v2_replay(bw_args)
+           user_grads = [None] * n_user_inputs
+           for fw_ph_idx, user_idx in fw_ph_to_user_input.items():
+               if fw_ph_idx < len(bw_outputs):
+                   user_grads[user_idx] = bw_outputs[fw_ph_idx]
+           param_grads = [None] * n_params
+           for ph_idx, slot in ph_to_param_slot.items():
+               if ph_idx < len(bw_outputs):
+                   param_grads[slot] = bw_outputs[ph_idx]
+           return (*user_grads, *param_grads)
+   ```
+
+3. `call` wrapper 自动 append params,**用户层 API 保持不变**:
+   ```python
+   def call(*user_args):
+       return _CapturedFn.apply(*user_args, *captured_params)
+   ```
+
+**用户视角的差别**
+
+```python
+# 之前:必须 functional_call 把 params 显式 thread 进 positional args
+def train_step(x, y, *param_list):
+    p_dict = dict(zip(param_names, param_list))
+    out = functional_call(model, p_dict, x)
+    return F.cross_entropy(out, y)
+captured = tdcv2.capture(train_step, x, y, *list(model.parameters()), allow_grad=True)
+
+# 现在:自然 closure 形式即可
+def train_step(x, y):
+    return F.cross_entropy(model(x), y)
+captured = tdcv2.capture(train_step, x, y, allow_grad=True)
+```
+
+**附带改动:relax 入口的 requires_grad 预检**
+
+`_capture_with_backward` 原来要求至少一个 `example_arg.requires_grad=True`,
+排除了"x、y 无 grad,只有闭包内 Parameter 有 grad"这种典型 nn.Module 训练
+场景。改成 post-compile 检查 `out.requires_grad`:
+
+```python
+out = compiled_fn(*example_args)
+def _has_grad_path(x):
+    if isinstance(x, torch.Tensor):
+        return x.requires_grad
+    if isinstance(x, (tuple, list)):
+        return any(_has_grad_path(o) for o in x)
+    return False
+if not _has_grad_path(out):
+    raise RuntimeError("v2.capture(allow_grad=True): output has no "
+                       "requires_grad path; AOT won't build a bw graph.")
+```
+
+闭包-lift 的 Parameter 让 `out.requires_grad=True`,绕过新的检查,旧的预检
+直接报错的情形不再出现。
+
+**验证**
+
+| 场景 | 结果 |
+|---|---|
+| `nn.Sequential(Linear, ReLU, Linear)` + cross_entropy | loss、grad 全 bit-exact 对齐 eager |
+| 3-iter SGD,验证 in-place opt.step 跨 replay 可见 | 每步 loss 跟 eager 完全一致 |
+| introspection:`captured.captured_params` | 暴露 lift 出的 Parameter 列表(顺序 = fw 输入顺序),便于 debug tied weights |
+
+**已知边界**
+
+- **Parameter 替换不生效**:`model.fc = nn.Linear(...)` 之后,trace 的
+  pre_bind 仍引用旧 Parameter 对象。in-place(opt.step、`param.data.copy_`)
+  OK;对象替换需要重新 capture。
+- **Buffer mutation 单独章节处理**:Buffer 在 pre_binds 里 isinstance 检查
+  不是 `nn.Parameter`,继续走 frozen 路径。BN running stats 的 write-back
+  需要 AOT metadata,见 §17.6.17。
+
+#### 17.6.17 AOT ViewAndMutationMeta:user_outputs 定位 + mutated 输入 write-back
+
+**问题(两层)**
+
+`_CapturedFn.forward` 走完 `fw_trace.v2_replay(...)` 拿到 `fw_outputs`,初版
+做两件事:`user_outputs = fw_outputs[:n_tangents]`,其余进
+`save_for_backward`。这套切片在**没有 mutated 输入**时是对的,但 BN 训练态、
+任何带 in-place buffer 修改、`x.add_()` 调用等等都会让 AOT 在 fw 输出最前面
+插入"mutated-input copies",**整个切片偏移就错了**:
+
+```
+AOT fw 输出契约:
+  [mutated_input_copies, user_outputs, saved_for_backward]
+    ↑ N 项,N = num_mutated_inp_runtime_indices
+                      ↑ M 项,M = n_tangents(可微 user 输出)
+                                       ↑ 其余,backward 用
+```
+
+BN1d(8) 训练态下 N=3(num_batches_tracked / running_mean / running_var),
+M=1(loss)。v2 初版返回 `fw_outputs[0]` = num_batches_tracked 的新值(int64
+标量) —— 用户看到 "`Float did not match Long`" 这种诡异错误,根因就是 loss 被
+错位的 int64 替了。
+
+第二层问题:即便切片对了,**mutated_input_copies 的值没人写回真正的 buffer**。
+AOT functionalize 把 `running_mean.copy_(new)` 改写成"new 出现在 fw output
+里,RuntimeWrapper 在调用结束后做 epilogue copy_ 写回"。v2 绕过了
+RuntimeWrapper,buffer 永远停留在初始值,跨 replay 不更新。
+
+**对照 aot_eager**
+
+PyTorch 在 `torch._functorch._aot_autograd.schemas.ViewAndMutationMeta` 里把
+这两个信息精确编码:
+
+```python
+@dataclass
+class InputAliasInfo:
+    mutates_data: bool
+    mutates_metadata: bool
+    requires_grad: bool
+    ...
+
+@dataclass
+class ViewAndMutationMeta:
+    input_info: list[InputAliasInfo]
+    output_info: list[OutputAliasInfo]
+    mutated_inp_runtime_indices: list[int]    # ← 关键:mutated 输入的 ph_idx
+    num_mutated_inp_runtime_indices: int      # ← 切片偏移 = 这个数
+    num_outputs: int                          # 含 alias 在内的 user 输出数
+    ...
+```
+
+RuntimeWrapper 的 epilogue 写回(`runtime_wrappers._apply_input_mutations`)
+直接消费这个 metadata:
+
+```python
+for i, inpt_idx in enumerate(self.runtime_metadata.mutated_inp_runtime_indices):
+    original_inpt = orig_inputs[inpt_idx]
+    updated_inpt = updated_inputs[i]   # = fw_outputs[i]
+    original_inpt.copy_(updated_inpt)
+```
+
+无启发式、完全确定、与 AOT 内部演进绑定。
+
+**关键接入点**
+
+AOT 在 `torch._functorch._aot_autograd.graph_compile.py` 调用 fw_compiler 前
+先把 fw_metadata 挂到 `TracingContext`:
+
+```python
+tracing_context.fw_metadata = _get_inner_meta(maybe_subclass_meta, fw_metadata)
+# ...
+compiled_fw_func = compiler(fw_module, adjusted_flat_args)   # ← 我们的 callback
+```
+
+所以 v2 的 `grab_compiler` 里可以**直接读到**这份 metadata:
+
+```python
+from torch._guards import TracingContext
+tc = TracingContext.try_get()
+aot_fw_metadata = getattr(tc, "fw_metadata", None) if tc else None
+state["aot_fw_metadata"] = aot_fw_metadata
+```
+
+bw_compile 这一遍的 TracingContext 没有有效的 fw_metadata(它是为 fw 设置
+的),所以只取 fw_state 的那份就够。
+
+**v2 的对应做法**
+
+1. **切片偏移**:`user_out_start = aot_fw_metadata.num_mutated_inp_runtime_indices`。
+   `_CapturedFn.forward` 改成 `user_outputs = fw_outputs[user_out_start:user_out_start + n_tangents]`。
+
+2. **write-back 映射**:
+   ```python
+   mutated_output_to_ph_idx = {
+       i: aot_fw_metadata.mutated_inp_runtime_indices[i]
+       for i in range(num_mutated_inputs)
+   }
+   pre_bind_by_phidx = {ph_idx: v for ph_idx, v in fw_pre_binds}
+   ph_to_writeback_target = {
+       ph_idx: pre_bind_by_phidx[ph_idx]
+       for ph_idx in mutated_output_to_ph_idx.values()
+       if isinstance(pre_bind_by_phidx.get(ph_idx), torch.Tensor)
+   }
+   ```
+
+3. **`_CapturedFn.forward` 末尾做 epilogue 写回**:
+   ```python
+   for out_idx, ph_idx in mutated_output_to_ph_idx.items():
+       target = ph_to_writeback_target.get(ph_idx)
+       new_val = fw_outputs[out_idx]
+       if target is not None and isinstance(new_val, torch.Tensor):
+           target.detach().copy_(new_val.detach())
+   ```
+   `.detach()` 是为了避免在 autograd graph 中把 epilogue copy 当成 op;`copy_`
+   作用在 underlying Storage 上,TensorImpl identity 保留,下一次 replay 的
+   trace 通过同一个 `captured_tensors_` 槽就能读到新值。
+
+**注意:`num_outputs` ≠ `n_tangents`**
+
+`output_info` 把 alias outputs(view of input、view of intermediate)也算
+进 `num_outputs`,但只有 non-alias 的 differentiable output 才在 bw_gm 里
+有对应的 `tangents_N` placeholder。例如 resnet18 的 `bench.forward` 看到
+`num_outputs=2 vs n_tangents=1` —— 有一个 alias output 不带 grad。所以
+**不能用 `num_outputs == n_tangents` 做 sanity check**,要分别使用:
+`user_out_start` 用 metadata 的 `num_mutated_inp_runtime_indices`,
+user_outputs 切片长度用从 bw_gm 计数得到的 `n_tangents`。
+
+**Fallback 行为**
+
+如果 `TracingContext.fw_metadata` 不存在(PyTorch 版本太老 / API 路径改名
+了),走旧路径:`num_mutated_inputs = 0`,等同于"假设没 mutation"。打印
+warning 让 BN training 的 stale buffer 现象浮出来,而不是隐式正确性退化。
+
+**验证(三类 case)**
+
+| 场景 | mutated buffers | v2 写回数 | 数值对齐 eager |
+|---|---|---|---|
+| BatchNorm1d 单层 unit test(`test_v2_backward.test_batchnorm_training_buffer_mutation`) | 3 (mean/var/num_batches) | 3/3 | bit-exact |
+| resnet18(深 BN stack,20 个 BN2d) | 60 | 60/60 | within 1e-4 |
+| squeezenet1.1(无 BN,Fire module 不带 stateful buffer) | 0 | 0/0(空循环,不引入虚假 mutation) | n/a |
+| in-house MLP / Transformer(无 buffer) | 0 | 0/0 | bit-exact |
+
+**为什么不复用之前的启发式版本**
+
+第一版我用了纯启发式:`getitem(call_function, N)` → call_function 的第 N 个
+arg(对应 functionalize pass 的契约)+ signature 匹配 + shape 校验。在 BN1d
+单层上工作,但**深 BN stack(resnet18)上很多 buffer 签名相同((C,) float32
+的有 running_mean、running_var、weight、bias,撞一起 ~12 个候选/层)**,
+启发式经常选错 placeholder,只能加 shape validation 把错的丢掉 —— 代价是
+"60 个 BN buffer 里只写回部分,剩下的 model.eval() 后用旧值",可观察的
+correctness 退化。
+
+切到 metadata 后:resnet18 60/60 全写回,跟 eager 完全对齐,代码量从 ~80
+行启发式 + validation 减到 ~20 行直接索引。该 metadata 是 PyTorch 内部稳定
+契约(RuntimeWrapper 自己也靠它),版本耦合不可避免,但比启发式更可信。
+
+**该缺陷的诊断方法**
+
+| 看到 | 含义 |
+|---|---|
+| `Float did not match Long`(loss 看起来变成 int64) | 切片偏移没设;v2 把 `num_batches_tracked` 的更新当 user output 返回了 |
+| `loss.requires_grad=False` + `does not have a grad_fn`(尤其在 deep CNN 上) | 同上,user_out_start 给到了不参与 autograd 的 mutated_input_copy |
+| `bn.running_mean` 多次 replay 后没变化,但 eager 同样调用是会变的 | write-back 没生效;检查 `TracingContext.fw_metadata is None` warning 是否在 capture 时出现过 |
+| `TracingContext.fw_metadata is None` warning | PyTorch 版本不暴露这条 attr,需要回退到启发式或升级 PyTorch |

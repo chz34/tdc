@@ -564,13 +564,28 @@ def _build_output_shaper(user_visible_out, trace_out):
 def _capture_with_backward(fn, example_args):
     """allow_grad=True path. Capture fw + bw graphs in one example call
     and return an autograd.Function-wrapped callable so the captured
-    pair runs as a normal differentiable PyTorch op."""
-    if not any(isinstance(a, torch.Tensor) and a.requires_grad for a in example_args):
-        raise RuntimeError(
-            "v2.capture(allow_grad=True): at least one example arg must "
-            "have requires_grad=True so AOTAutograd produces a backward "
-            "graph during the example call.")
+    pair runs as a normal differentiable PyTorch op.
 
+    Supports two ways of supplying parameters for the gradient graph:
+      1. As positional `example_args` with requires_grad=True (e.g.
+         passing model.parameters() positionally and using
+         torch.func.functional_call inside `fn`).
+      2. As Module attributes referenced via fn's closure (the natural
+         nn.Module form, no functional_call boilerplate required).
+         Dynamo lifts these Parameters as graph inputs; we detect them
+         after tracing (isinstance check on observed_args) and surface
+         them as positional leaf args of the wrapped autograd.Function
+         so backward grads route to `param.grad` through the standard
+         autograd accumulator path. From the user's perspective, the
+         returned callable still takes only the original user_args:
+         `captured(*user_args)`. Params are stitched in internally.
+
+    Either way, opt.step()'s in-place updates to the Parameters are
+    automatically reflected at replay time -- the trace stores the
+    Parameter tensor object itself (same TensorImpl), not a snapshot.
+    Replacing a Parameter (model.fc = new_layer) is NOT reflected; treat
+    the trace as bound to the Parameter objects present at capture time.
+    """
     captured: list = []
 
     def grab_compiler(gm, sample_inputs):
@@ -584,7 +599,25 @@ def _capture_with_backward(fn, example_args):
         gm = rewrite_slice_scatter_to_inplace(gm)
         gm = eliminate_dead_clones(gm)
         trace = translate_graph(gm)
-        state = {"trace": trace, "gm": gm, "observed_args": None}
+        # Snapshot AOTAutograd's ViewAndMutationMeta off the active
+        # TracingContext. AOT stashes fw_metadata on the context just
+        # before calling our compiler (see torch._functorch._aot_autograd
+        # .graph_compile.py around the `compiled_fw_func = compiler(...)`
+        # call) -- this is the same metadata RuntimeWrapper consumes to
+        # do mutation write-back and output-aliasing fixup. Capturing
+        # it here lets v2 reproduce that bookkeeping at replay time
+        # WITHOUT heuristics. Only the FW compile pass populates
+        # mutated_inp_runtime_indices, so the bw call's snapshot is
+        # discarded.
+        from torch._guards import TracingContext
+        tc = TracingContext.try_get()
+        aot_fw_metadata = getattr(tc, "fw_metadata", None) if tc else None
+        state = {
+            "trace": trace,
+            "gm": gm,
+            "observed_args": None,
+            "aot_fw_metadata": aot_fw_metadata,
+        }
         captured.append(state)
         def wrapping_cb(*args):
             if state["observed_args"] is None:
@@ -602,6 +635,26 @@ def _capture_with_backward(fn, example_args):
         dynamic=True,
     )
     out = compiled_fn(*example_args)
+
+    # Post-compile requires_grad check: covers both user-input-grad and
+    # closure-captured Parameter cases. The previous pre-check (requiring
+    # an example_arg with requires_grad=True) was too strict for the
+    # common nn.Module training pattern where x/y carry no grad and only
+    # the closure-lifted Parameters do.
+    def _has_grad_path(x):
+        if isinstance(x, torch.Tensor):
+            return x.requires_grad
+        if isinstance(x, (tuple, list)):
+            return any(_has_grad_path(o) for o in x)
+        return False
+    if not _has_grad_path(out):
+        raise RuntimeError(
+            "v2.capture(allow_grad=True): example call's output has "
+            "requires_grad=False; AOTAutograd will not produce a "
+            "backward graph. Either pass an example_arg with "
+            "requires_grad=True, or ensure fn references an nn.Module "
+            "with at least one Parameter (requires_grad=True).")
+
     # Force a backward so AOTAutograd materialises the bw graph and our
     # grab_compiler gets invoked a second time.
     if isinstance(out, torch.Tensor):
@@ -629,15 +682,39 @@ def _capture_with_backward(fn, example_args):
     fw_pre_binds = _promote_scalar_pre_binds_to_device(fw_pre_binds, example_args)
     for arg_idx, value in fw_pre_binds:
         fw_trace_obj.v2_pre_bind(arg_idx, value)
+
+    # Extract nn.Parameter pre-binds for autograd-leaf routing. They
+    # REMAIN pre-bound in the trace (v2_pre_bind above) so the trace's
+    # captured_tensors_ slot points to the actual Parameter object --
+    # opt.step's in-place mutation propagates through TensorImpl identity
+    # without any per-call work. Separately, we surface the same params
+    # as positional leaf args of _CapturedFn.apply so autograd records
+    # them as inputs to the Function; backward grads then route to
+    # `param.grad` through PyTorch's standard accumulator path. This is
+    # the v2 analogue of aot_eager's mechanism: AOT lifts the params,
+    # the wrapping autograd.Function exposes them as leaves, autograd
+    # routes grads back.
+    fw_param_specs: List[Tuple[int, torch.nn.Parameter]] = [
+        (ph_idx, value) for ph_idx, value in fw_pre_binds
+        if isinstance(value, torch.nn.Parameter)
+    ]
+    captured_params: List[torch.nn.Parameter] = [p for _, p in fw_param_specs]
+    # ph_idx -> slot in captured_params (== position in trailing apply args).
+    ph_to_param_slot: Dict[int, int] = {
+        ph_idx: slot for slot, (ph_idx, _) in enumerate(fw_param_specs)
+    }
+
     fw_flat = _compile_flat_recipe(fw_specs)
     # See _capture_positional for the rationale; persistent buffer
     # reused across every forward replay invocation under autograd.
     fw_flat_buf: list = [None] * fw_flat._buf_len
 
     n_user_inputs = len(example_args)
+    n_params = len(captured_params)
 
     # Count tangent placeholders in bw_gm to learn how many of fw's
-    # outputs are user-visible (the rest are saved-for-backward).
+    # outputs are user-visible (the rest are mutated-input copies or
+    # saved-for-backward intermediates).
     n_tangents = sum(
         1 for n in bw_state["gm"].graph.nodes
         if n.op == "placeholder" and n.name.startswith("tangents_")
@@ -646,6 +723,70 @@ def _capture_with_backward(fn, example_args):
         raise RuntimeError(
             "v2.capture(allow_grad=True): bw graph has no 'tangents_*' "
             "placeholders; cannot tell user outputs from saved tensors.")
+
+    # AOT's fw output ordering is documented as
+    #     [mutated_input_copies, user_outputs, saved_for_backward]
+    # where the mutated_input_copies block has length
+    # `num_mutated_inp_runtime_indices` and the i-th entry of that block
+    # is the new value of the input at position
+    # `mutated_inp_runtime_indices[i]`. This metadata is the same one
+    # RuntimeWrapper consumes for its epilogue write-back (see
+    # torch._functorch._aot_autograd.runtime_wrappers
+    # ._apply_input_mutations). v2 bypasses RuntimeWrapper, so we must
+    # reproduce the write-back manually -- otherwise BN's running_mean
+    # / running_var / num_batches_tracked stay at their initial values
+    # across replays (visible after bn.eval() or model checkpointing).
+    #
+    # We snapshotted ViewAndMutationMeta off TracingContext during the
+    # FW compile callback (grab_compiler). The bw compile snapshot is
+    # discarded because backward doesn't carry input-mutation info.
+    aot_fw_meta = fw_state.get("aot_fw_metadata")
+    if aot_fw_meta is None:
+        # Defensive fallback: previously this path tried heuristics
+        # over the FX graph (getitem-arg-N + signature matching) which
+        # mis-resolves on deep BN stacks. With TracingContext-based
+        # metadata available in the supported PyTorch versions, this
+        # branch should be unreachable; warn loudly so a regression
+        # surfaces as a slow/silent buffer drift rather than getting
+        # missed.
+        print("# v2.capture: WARNING -- no AOT fw_metadata on "
+              "TracingContext; mutated-buffer write-back is disabled "
+              "for this trace. BN-style training will fail to update "
+              "running stats across replays.")
+        num_mutated_inputs = 0
+        mutated_inp_indices: List[int] = []
+    else:
+        num_mutated_inputs = aot_fw_meta.num_mutated_inp_runtime_indices
+        mutated_inp_indices = list(aot_fw_meta.mutated_inp_runtime_indices)
+
+    # User outputs live immediately after the mutated_input_copies in
+    # fw_outputs.
+    user_out_start = num_mutated_inputs
+
+    # Note: aot_fw_meta.num_outputs counts ALL user-output positions
+    # including aliases, but only the differentiable ones get tangents
+    # in bw_gm. We deliberately don't assert num_outputs == n_tangents
+    # (resnet etc. produce alias outputs that count in num_outputs but
+    # carry no tangent). v2's user-visible output slice still uses
+    # n_tangents below, matching the previous behavior.
+
+    # Build the write-back map: fw_output[i] for i in
+    # [0..num_mutated_inputs) -> placeholder ph_idx (which is the same
+    # index in the fw input list).
+    mutated_output_to_ph_idx: Dict[int, int] = {
+        i: mutated_inp_indices[i] for i in range(num_mutated_inputs)
+    }
+
+    # Build ph_idx -> actual buffer Tensor map. pre_binds stores the
+    # real input tensors keyed by ph_idx; for mutated_input positions
+    # (typically buffers like running_mean), this gives us the source-
+    # of-truth tensor to copy_() into.
+    ph_to_writeback_target: Dict[int, torch.Tensor] = {}
+    pre_bind_by_phidx = {ph_idx: v for ph_idx, v in fw_pre_binds}
+    for out_idx, ph_idx in mutated_output_to_ph_idx.items():
+        v = pre_bind_by_phidx.get(ph_idx)
+        if isinstance(v, torch.Tensor):
+            ph_to_writeback_target[ph_idx] = v
 
     # AOTAutograd internally re-orders fw outputs before feeding them
     # to bw — bw's placeholder order does not match fw's output order.
@@ -674,9 +815,31 @@ def _capture_with_backward(fn, example_args):
 
     class _CapturedFn(torch.autograd.Function):
         @staticmethod
-        def forward(ctx, *user_args):
+        def forward(ctx, *all_args):
+            # all_args layout: (*user_args, *params)
+            #   - user_args feed into fw_flat -> fw_flat_buf -> v2_replay
+            #     (params are NOT routed through fw_flat -- they're already
+            #     pre-bound to the trace's captured_tensors_ slots).
+            #   - params are still passed here so autograd records them
+            #     as leaf inputs to this Function; backward returns grads
+            #     for them, autograd routes to param.grad accumulators.
+            user_args = all_args[:n_user_inputs]
             fw_flat(user_args, fw_flat_buf)
             fw_outputs = fw_trace.v2_replay(fw_flat_buf)
+            # AOT-RuntimeWrapper replacement: write mutated-input
+            # outputs back to their source buffers. Functionalize
+            # turned `buffer.copy_(new)` into `new = ...; output new`.
+            # The C++ trace's captured_tensors_ slot still points to
+            # the original buffer (via pre_bind), and the new value is
+            # at fw_outputs[i] for each mutated-input slot. .copy_()
+            # is in-place on the underlying Storage, so subsequent
+            # replays see the updated buffer value through the same
+            # TensorImpl identity.
+            for out_idx, ph_idx in mutated_output_to_ph_idx.items():
+                target = ph_to_writeback_target.get(ph_idx)
+                new_val = fw_outputs[out_idx]
+                if target is not None and isinstance(new_val, torch.Tensor):
+                    target.detach().copy_(new_val.detach())
             # Save the full fw_outputs list — split into tensors (via
             # save_for_backward, autograd requirement) + non-tensors
             # (stashed as ctx attributes), with positions preserved so
@@ -697,7 +860,7 @@ def _capture_with_backward(fn, example_args):
             ctx.other_values = other_values
             ctx.other_positions = other_positions
             ctx.fw_out_len = len(fw_outputs)
-            user_outputs = fw_outputs[:n_tangents]
+            user_outputs = fw_outputs[user_out_start:user_out_start + n_tangents]
             if len(user_outputs) == 1:
                 return user_outputs[0]
             return tuple(user_outputs)
@@ -719,20 +882,27 @@ def _capture_with_backward(fn, example_args):
                 else:  # tangent
                     bw_args.append(grad_outputs[idx])
             bw_outputs = bw_trace.v2_replay(bw_args)
-            # bw outputs are aligned with fw INPUT placeholders.
-            # Map back to user_input grads via fw recipes.
-            input_grads = [None] * n_user_inputs
+            # bw outputs are aligned with fw INPUT placeholders. Route to
+            # the corresponding apply position so autograd can hand grads
+            # to the right leaf (user_input grads -> user .grad,
+            # param grads -> param.grad).
+            user_grads = [None] * n_user_inputs
             for fw_ph_idx, user_idx in fw_ph_to_user_input.items():
                 if fw_ph_idx < len(bw_outputs):
-                    input_grads[user_idx] = bw_outputs[fw_ph_idx]
-            return tuple(input_grads)
+                    user_grads[user_idx] = bw_outputs[fw_ph_idx]
+            param_grads = [None] * n_params
+            for ph_idx, slot in ph_to_param_slot.items():
+                if ph_idx < len(bw_outputs):
+                    param_grads[slot] = bw_outputs[ph_idx]
+            return (*user_grads, *param_grads)
 
     def call(*user_args):
-        return _CapturedFn.apply(*user_args)
+        return _CapturedFn.apply(*user_args, *captured_params)
 
     call.fw_trace = fw_trace                  # type: ignore[attr-defined]
     call.bw_trace = bw_trace                  # type: ignore[attr-defined]
     call.fw_recipe_specs = fw_specs           # type: ignore[attr-defined]
+    call.captured_params = captured_params    # type: ignore[attr-defined]
     return call
 
 
