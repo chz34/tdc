@@ -1,16 +1,28 @@
 # torch_dispatch_capture
 
 C++ dispatcher-level capture/replay for PyTorch — PoC of the design
-described in [`DESIGN.md`](DESIGN.md).
+described in [`DESIGN.md`](DESIGN.md). Replay a captured aten-op
+trace without paying Dynamo / AOTAutograd / Python-interpreter cost
+per call.
 
-## What it does
+## Two paths
 
-Capture every aten op a block of code dispatches, then replay them later
-without paying the Python interpreter / framework cost between ops. The
-captured trace re-reads each input Tensor's metadata on every replay,
-so an input that has been mutated in-place or resized between replays
-is reflected automatically — there is no per-shape recapture, unlike
-cudagraph.
+The project ships two capture mechanisms that share the same C++
+`Trace` / `Step` data structures and replay engine:
+
+| | v2 (recommended) | v1 |
+|---|---|---|
+| Entry | `tdcv2.capture(fn, *example_args, allow_grad=...)` | `with tdc.capture():` context manager |
+| Capture mechanism | `torch.compile(backend=aot_autograd(fw_compiler=...))` runs once; AOT FX graph is translated to a C++ `Trace` | Boxed dispatcher fallback records every aten op as it dispatches |
+| Dynamic shape | Full SymInt support (shape-derived literals like `x.view(x.shape[0]//2, ...)` work) | Only shape changes that propagate through dim-index ops (`view(-1, ...)`, `permute`, `transpose`, ...) |
+| Backward | `allow_grad=True` — fw + bw double-graph capture, wrapped in `torch.autograd.Function`. nn.Module Parameters auto-routed to autograd; BN running stats / other mutated buffers written back via AOT `ViewAndMutationMeta` | `allow_grad=True` — autograd's backward ops captured as they dispatch through the fallback. Warmup required to allocate `.grad` first. |
+| Cost per call | C++ replay only; no Dynamo / AOT runtime overhead | C++ replay only; no Python overhead between ops |
+| Coupling with PyTorch internals | Medium — depends on Dynamo/AOT interfaces incl. `TracingContext.fw_metadata` | Low — only uses dispatcher |
+| Best for | Training (incl. BN), models with complex shape arithmetic, anything torch.compile can already trace | Tiny / KV-cache-style decode loops, fixed-shape patterns where Dynamo+AOT overhead at capture is too much |
+
+**Start with v2.** Drop to v1 only if you have a workload where the
+`torch.compile` one-time capture cost is unacceptable, or you need the
+absolute floor of PyTorch-internals coupling.
 
 ## Build
 
@@ -29,7 +41,111 @@ The build uses `torch.utils.cpp_extension.CppExtension`, so it picks up
 the PyTorch installation in the active venv. `MAX_JOBS=4` is clamped by
 `setup.py` to avoid blowing up parallel compile load.
 
-## Usage patterns
+## v2: the primary path
+
+### Quick start — inference
+
+```python
+import torch
+import torch_dispatch_capture.v2 as tdcv2
+
+def fn(x):
+    # Shape-derived literals work — Dynamo's SymInt tracing handles them.
+    return x.view(x.shape[0] // 2, 2, -1)
+
+x_example = torch.randn(8, 16)
+captured = tdcv2.capture(fn, x_example)
+
+# Subsequent calls bypass Dynamo / AOT runtime entirely:
+out = captured(torch.randn(8, 16))
+out = captured(torch.randn(12, 16))    # different shape, same trace
+```
+
+`captured` is a plain callable. Internally, `tdcv2.capture` runs
+`torch.compile(backend=aot_autograd(...))` once, intercepts the
+forward-graph compile callback, translates the FX graph into a C++
+trace, and returns a wrapper that calls `Trace::replay_v2()`. After
+the one-time capture, there is no Dynamo, no AOT runtime wrapper, no
+Python guard tower on the call path — just IValue conversion and C++
+replay.
+
+### Training — nn.Module, backward, optimizer step
+
+```python
+import torch.nn as nn
+import torch.nn.functional as F
+import torch_dispatch_capture.v2 as tdcv2
+
+model = nn.Sequential(
+    nn.Linear(8, 16),
+    nn.BatchNorm1d(16),       # BN running stats are written back across replays
+    nn.ReLU(),
+    nn.Linear(16, 4),
+)
+opt = torch.optim.SGD(model.parameters(), lr=0.01)
+
+def train_step(x, y):
+    return F.cross_entropy(model(x), y)    # natural closure form
+
+x_ex = torch.randn(32, 8)
+y_ex = torch.randint(0, 4, (32,))
+
+# allow_grad=True captures both forward and backward graphs and wraps
+# them in a torch.autograd.Function. nn.Module parameters lifted by
+# Dynamo are surfaced to autograd as leaf inputs, so `param.grad` is
+# populated on `loss.backward()` exactly as in eager.
+captured = tdcv2.capture(train_step, x_ex, y_ex, allow_grad=True)
+
+for x, y in batches:
+    opt.zero_grad()
+    captured(x, y).backward()
+    opt.step()        # in-place .data update is visible to the next replay
+```
+
+Two things work that look like they shouldn't:
+
+- **`model.parameters()` get gradients** even though they're not in the
+  positional args of `captured(x, y)`. v2 detects Parameters lifted by
+  Dynamo, pre-binds them into the trace's `captured_tensors_` slot AND
+  surfaces them as `_CapturedFn.apply` leaf args. Backward returns one
+  grad per leaf; autograd routes them into `param.grad` the same way
+  `aot_eager` does.
+- **`opt.step()` is observed by the next replay**. SGD's
+  `param.data.add_(grad, alpha=-lr)` is an in-place mutation on the
+  same TensorImpl the trace holds, so it lands in `captured_tensors_`
+  automatically. Same mechanism handles BN's `running_mean` /
+  `running_var` updates: v2 reads AOT's `ViewAndMutationMeta` off
+  `TracingContext.fw_metadata` and `.copy_()`s the new values back
+  into the buffer tensors at the end of each forward replay — the
+  same epilogue RuntimeWrapper does, just done manually because v2
+  bypasses the wrapper for speed.
+
+No `torch.func.functional_call` boilerplate. No manual parameter
+threading. Switch `bn.eval()` after training and the BN running stats
+are correctly accumulated.
+
+### What v2 does NOT cover
+
+- **Module replacement**: `model.fc = nn.Linear(...)` after capture
+  doesn't take effect; the trace still references the old Parameter
+  objects. In-place updates (`opt.step()`, `param.data.copy_(...)`)
+  are fine.
+- **Capture-time mode is frozen**: if you capture with
+  `model.train()`, switching to `model.eval()` afterwards doesn't
+  change the recorded BN code path (training-mode BN uses batch
+  stats; eval-mode uses running stats; these are different ops
+  inside the trace). Re-capture if you need to switch modes.
+- **Torchbench HuggingFace `outputs.loss`-style returns**: the bench's
+  `forward()` is supported (no positional Tensors needed — closure
+  lifts everything), but if your benchmark wrapper returns
+  `BaseModelOutputWith*` dataclasses and you're consuming `.loss`
+  through that wrapper, you may need a small adapter.
+
+## v1: dispatcher-level capture
+
+Use v1 when the one-time `torch.compile` cost of v2 is unacceptable —
+typically very small ops, KV-cache decode loops, or anywhere you need
+the lowest possible coupling with PyTorch internals.
 
 ### Pattern A: PyTorch native `out=` style
 
@@ -244,6 +360,25 @@ replay time. This avoids:
    See `test/test_backward.py::test_backward_dynamic_shape_with_reduction_fails`
    for the documented expected-failure example.
 
+### v1 — when NOT to use it
+
+| Scenario | v1 verdict | Use v2 instead |
+|---|---|---|
+| `x.view(x.shape[0]//2, 2, -1)` (shape-derived literal) | ✗ | ✓ |
+| Heavy reductions like `.sum().backward()` with dynamic shape | ✗ | ✓ |
+| `as_strided(size, stride)` with shape-following stride | ✗ | ✓ |
+| Models whose forward has data-dependent control flow | ✗ | ✓ (via Dynamo's compile-time specialization) |
+| nn.Module training with BN running stats | works but caveat-heavy | ✓ recommended |
+
+**Why these limits exist for v1**: our fallback intercepts at the
+dispatcher, which sees args **after Python has already evaluated them**.
+When user code writes `x.view(x.shape[0]//2, ...)`, the `//2` is a
+Python int operation that runs before the `view` call, so the
+dispatcher gets a literal int — we have no way to recover the lineage
+back to `x.shape`. Solving this requires SymInt-level symbolic tracing,
+which lives at the Python bytecode layer (Dynamo / FX) — exactly what
+v2 plugs into. See `DESIGN.md` §8.1–8.3 for the full discussion.
+
 ## Why `replay()` returns nothing
 
 A trace is a recording of **side effects**, not a pure function. A
@@ -253,17 +388,30 @@ returning "the last step's output" would silently hide all the other
 writes and mislead callers. Patterns A/B/C above are explicit about
 which tensors are observation points.
 
+v2 follows the same model internally (the trace records side effects
+on `captured_tensors_` slots), but its user-facing API wraps the trace
+in a callable that returns the user's expected outputs — the
+side-effects-only design is hidden behind `_CapturedFn.forward` /
+`_CapturedFn.backward`.
+
 ## Tests
 
 ```bash
-python -m unittest discover test -v        # all tests
-python -m unittest test.test_correctness   # 7 correctness tests
-python -m unittest test.test_dynamic_shape # 4 dynamic-shape tests
-python -m unittest test.test_backward      # 8 backward tests
-python test/test_benchmark.py              # 5 benchmarks with numbers
+# all tests
+python -m unittest discover test -v
+
+# single test file -- test/ has no __init__.py, so the
+# `python -m unittest test.test_v2_capture` form errors;
+# use one of these instead:
+( cd test && python -m unittest test_v2_capture -v )
+python -m unittest discover -s test -p test_v2_capture.py -v
+
+# single test case
+( cd test && python -m unittest \
+  test_v2_backward.TestV2Backward.test_batchnorm_training_buffer_mutation -v )
 ```
 
-All test files (not just the benchmark) honor the `TDC_DEVICE` env
+All test files (not just the benchmarks) honor the `TDC_DEVICE` env
 var. Default is `cpu`; set to any of `cuda` / `xpu` / `mps` / `npu` /
 `privateuseone` to run the whole suite on an accelerator:
 
@@ -280,113 +428,58 @@ and synchronize helpers live in `test/_device.py`.
 ## Layout
 
 ```
-csrc/
-  capture_context.{h,cpp}   data structures + TLS, Trace::dump
-  capture_fallback.cpp      boxed fallback (TESTING_ONLY_GenericMode)
-  trace.cpp                 Trace::replay (the hot path)
-  bindings.cpp              pybind11 module
-python/__init__.py          capture() context manager + usage docs
+csrc/                       C++ source (built as one _C.so)
+  capture_context.{h,cpp}   data structures + TLS capture context + dump
+  capture_fallback.cpp      v1 boxed fallback (TESTING_ONLY_GenericMode)
+  trace.cpp                 v1 Trace::replay hot path
+  trace_v2.cpp              v2 Trace::replay_v2 engine + builtin dispatch
+  bindings.cpp              pybind11 module (both v1 and v2)
+python/
+  __init__.py               v1 capture() context manager + usage docs
+  v2/__init__.py            v2 entry (re-exports capture, translate_graph)
+  v2/compile.py             v2 capture() + recipe building
+  v2/translator.py          FX graph -> C++ Trace translator
+  v2/fx_passes.py           FX rewrites used before translation
 setup.py                    CppExtension config (MAX_JOBS<=4)
 test/
   _device.py                shared DEVICE / SYNC helper (reads TDC_DEVICE)
-  test_correctness.py       15 tests, no_grad guard, view family
-  test_dynamic_shape.py     4 tests, varied batch / resize / mutation
-  test_backward.py          8 tests, allow_grad capture + replay
-  test_benchmark.py         5 benchmarks, eager vs replay timings
+  test_correctness.py       v1 correctness
+  test_dynamic_shape.py     v1 dynamic shape
+  test_backward.py          v1 allow_grad capture + replay
+  test_benchmark.py         v1 timing benchmarks
+  test_v2_capture.py        v2 end-to-end
+  test_v2_kwargs.py         v2 kwargs handling
+  test_v2_nn_module.py      v2 nn.Module wrapper=True path
+  test_v2_inplace_mutation.py  v2 in-place op cross-replay behaviour
+  test_v2_backward.py       v2 backward + parameter routing + BN buffer writeback
+  test_v2_triton.py         v2 + torch.library.triton_op custom ops
+prototypes/                 exploratory / benchmark scripts (gitignored runs)
+  v2_benchmark.py           v1 / v2 / inductor speed comparison
+  training_benchmark.py     fw+bw+SGD across all variants (in-house + torchbench)
+  run.py                    torchbench-style capture validation harness
 ```
 
-## What this PoC is **for**
+## How it works (in 3 lines each)
 
-| Scenario | v1 verdict |
-|---|---|
-| Inference with host-overhead-dominated small ops | ✓ sweet spot |
-| LLM decode (batch=1, seq=1) repeated calls | ✓ |
-| KV cache writes / in-place mutation patterns | ✓ |
-| `view(-1, N)` / `transpose` / `permute` / `squeeze` (dim-index ops) | ✓ |
-| Fixed-shape training loop with warmup-then-capture | ✓ |
-| Cross-shape replay where shape changes are along dim-index ops | ✓ |
+**v2:** `tdcv2.capture` runs `torch.compile(backend=aot_autograd(fw_compiler=...))`
+once. The fw_compiler callback receives the FX graph and AOT's
+`ViewAndMutationMeta` (via `TracingContext.fw_metadata`); both are
+translated into a C++ `Trace` that knows where each call-time arg
+plugs in, where mutated buffers need to be written back at the end of
+forward, and which input slots are autograd leaves for the backward
+graph. After capture, `captured(*args)` calls `Trace::replay_v2()`
+directly — no Dynamo, no AOT runtime wrapper.
 
-## What this PoC is **not** for
+**v1:** Boxed fallback registered on `TESTING_ONLY_GenericMode` fires
+on every aten op while capture is active; it classifies inputs
+(captured tensor / prior-step output / literal IValue), records the
+step, and runs the op normally. Because GenericMode sits above
+AutogradFunctionality in priority, autograd's backward dispatches are
+also visible when `allow_grad=True`. `Trace::replay()` re-pushes
+inputs onto a stack (reading current metadata from the captured Tensor
+objects, so mutations propagate) and invokes each step's op via
+`op.callBoxed(stack)`.
 
-| Scenario | v1 verdict | Use this instead |
-|---|---|---|
-| `x.view(x.shape[0]//2, 2, -1)` (shape-derived literal) | ✗ | `torch.compile` (see v2 below) |
-| Heavy reductions like `.sum().backward()` with dynamic shape | ✗ | `torch.compile` |
-| `as_strided(size, stride)` with shape-following stride | ✗ | rewrite or `torch.compile` |
-| Models whose forward has data-dependent control flow | ✗ | `torch.compile(dynamic=True)` |
-
-**Why these limits exist**: our fallback intercepts at the dispatcher,
-which sees args **after Python has already evaluated them**. When user
-code writes `x.view(x.shape[0]//2, ...)`, the `//2` is a Python int
-operation that runs before the `view` call, so the dispatcher gets a
-literal int — we have no way to recover the lineage back to `x.shape`.
-Solving this requires SymInt-level symbolic tracing, which lives at
-the Python bytecode layer (Dynamo / FX), not at the dispatcher.
-
-See `DESIGN.md` §8.1–8.3 for the full discussion.
-
-## Known constraints (within the supported scope)
-
-- **Forward + autograd default**: `capture()` defaults to
-  `allow_grad=False` and requires `torch.no_grad()`. Backward support
-  is opt-in via `allow_grad=True` (see Pattern C above) and has its
-  own caveats listed there.
-- The captured Tensor **objects** (Python identity) must be the same
-  ones used at replay. Their metadata (sizes/strides/data_ptr) can
-  change freely. Use Pattern B to track output-side identity for code
-  that returns new tensors.
-- Changing dtype / device / layout between capture and replay is not
-  supported (would change the dispatch keyset; cached lookups would be
-  wrong). Shape changes are fine **when they fall under the supported
-  patterns above**.
-- TensorList args (e.g., `aten::cat([t1, t2, ...])`) are recorded as
-  literal IValues; in-place mutation of list elements may not
-  propagate. Common patterns work fine; corner-case workloads might.
-
-## v2 direction (if needed): compose with `torch.compile`, don't compete
-
-Full dynamic-shape support (handling shape-derived literals like
-`x.view(x.shape[0]//2, ...)`) is **out of scope for v1 by design**. The
-right place to add it is not to evolve v1 with self-written FX graph
-parsing — that would replicate a large part of Dynamo and Inductor.
-Instead, the proposed v2 is a thin **custom backend for `torch.compile`**:
-
-```python
-@torch.compile(backend=tdc_backend, dynamic=True)
-def fn(x):
-    return x.view(x.shape[0] // 2, 2, -1)
-```
-
-In this form:
-- `torch.compile` (Dynamo + AOTAutograd) does all the symbolic tracing,
-  functionalization, and decomposition for us — handing our backend a
-  clean SymInt-bearing functional aten FX graph.
-- Our backend translates the graph into an extended trace where size
-  computations are explicit Steps (rather than baked literals), then
-  uses the existing dispatcher-fallback capture for the Tensor-op
-  steps.
-- Estimated work: ~1000 LoC of additional graph-translation code,
-  vs ~3000+ if we tried to build our own FX parser.
-
-This isn't currently planned — v1 is shipped as a focused PoC for the
-host-overhead-bound workloads above. v2 is documented as the natural
-next step if production needs full dynamic shape with our dispatcher
-acceleration. See design doc §17.6 for the detailed v2 layout.
-
-## How it works (3-line summary)
-
-1. Boxed fallback registered on `TESTING_ONLY_GenericMode` fires on
-   every aten op while capture is active; it classifies inputs
-   (captured tensor / prior-step output / literal IValue), records the
-   step, and runs the op normally. Because GenericMode sits above
-   AutogradFunctionality in priority, autograd's backward dispatches
-   are also visible when `allow_grad=True`.
-2. `Trace::replay()` re-pushes inputs onto a stack (reading current
-   metadata from the captured Tensor objects, so mutations propagate)
-   and invokes each step's op via `op.callBoxed(stack)`. Replay also
-   pushes `at::AutoDispatchBelowAutograd` so autograd wrappers do not
-   re-execute — every replay is pure aten-op execution.
-3. Dynamic shape is automatic because each push reads the Tensor's
-   current `sizes/strides/data_ptr`, and the kernel adapts. The few
-   ops that bake shape into literals (`as_strided`,
-   `sum_backward`'s `expand`, ...) are the documented exceptions.
+Dynamic shape is automatic in v1 for ops that read shape from input
+TensorImpls; v2 handles the full SymInt case because the FX graph
+preserves shape-derived literals as explicit `sym_*` Steps.
