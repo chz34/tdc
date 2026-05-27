@@ -2048,3 +2048,98 @@ correctness 退化。
 | `loss.requires_grad=False` + `does not have a grad_fn`(尤其在 deep CNN 上) | 同上,user_out_start 给到了不参与 autograd 的 mutated_input_copy |
 | `bn.running_mean` 多次 replay 后没变化,但 eager 同样调用是会变的 | write-back 没生效;检查 `TracingContext.fw_metadata is None` warning 是否在 capture 时出现过 |
 | `TracingContext.fw_metadata is None` warning | PyTorch 版本不暴露这条 attr,需要回退到启发式或升级 PyTorch |
+
+#### 17.6.18 Data-dependent 输出 shape:`masked_select` / `nonzero` 这一类
+
+**问题(其实是 Dynamo 的设计选择,不是 v2 缺陷)**
+
+`torch.masked_select(x, mask)` 返回的 1-D Tensor 的长度 = `mask` 里 True
+的个数;`torch.nonzero(x)` 返回 `(count_of_nonzero, x.ndim)`;`torch.unique`
+返回去重后的元素数。**这些 op 的输出 shape 不是输入 shape 的函数,而是
+输入的 VALUES 的函数**。
+
+Dynamo 把这类 op 单独列为"data-dependent output shape ops",**默认拒绝
+trace**,直接 graph break 并提示:
+
+```
+[__graph_breaks] Dynamic shape operator
+[__graph_breaks]   Explanation: Operator `aten.masked_select.default`'s
+                   output shape depends on input Tensor data.
+[__graph_breaks]   Hint: Enable tracing of dynamic shape operators with
+                   `torch._dynamo.config.capture_dynamic_output_shape_ops = True`
+```
+
+(Dynamo 文档分类号 `gb0036`。)所以 `tdcv2.capture(fn_using_masked_select, ...)`
+在默认配置下会**根本进不去 fw_compiler**,我们看到的是
+`"v2.capture: fw_compiler was never called; torch.compile may have
+graph-broken"` 这条错误。
+
+**Dynamo 默认拒绝的原因**
+
+inductor 等下游 backend 处理 unbacked SymInt 比 backed SymInt 复杂得多
+(没法做 size 相关的 specialization、loop unroll 等),很多 backend 实测
+后采取了"宁可 graph break 也不要扛 unbacked"的策略。所以 Dynamo 把这个
+开关默认关掉,只在用户/backend 明确表态"我能处理 unbacked SymInt"时打开。
+
+**v2 的处理(开 flag 即可)**
+
+`tdcv2.capture` 调用前加一句:
+
+```python
+torch._dynamo.config.capture_dynamic_output_shape_ops = True
+```
+
+或者在测试方法上加装饰器(参照 pytorch CLAUDE.md 推荐的写法):
+
+```python
+@torch._dynamo.config.patch(capture_dynamic_output_shape_ops=True)
+def test_my_masked_select_workload(self):
+    captured = tdcv2.capture(fn, x_ex, mask_ex)
+    ...
+```
+
+之后 Dynamo 会:
+1. 为 mask 的 True count 生成一个 **unbacked SymInt**(类似 `u0`)
+2. masked_select 的输出在 FakeTensor 层挂着这个 unbacked size
+3. 下游若有 shape arith,继续传播 unbacked SymInt
+4. AOT 把整个图(含 unbacked SymInt 节点)交给 fw_compiler
+
+**v2 的 C++ 重放为什么不需要再做事**
+
+v2 的设计里,**每个 step 的 input shape/dtype/data_ptr 都是 replay 时从
+Tensor 对象读取的**,trace 不持有任何 capture 时 frozen 的 shape 数据
+(除了 §17.6.9 中 Dynamo 特化的标量常量,但那条是用户显式标记的另一回事)。
+所以 mask 在 replay 时 True 个数变化 → kernel 计算出不同 output size →
+后续 step 通过 `kPrevStepOutput` 引用拿到的就是新 size 的 Tensor →
+data_ptr / sizes 自动反映 →链式 OK。
+
+实测覆盖(`test/test_v2_capture.py::TestV2DataDependentShape`):
+
+| 测试 case | 验证内容 | 结果 |
+|---|---|---|
+| `test_masked_select_varies_output_size` | 同一 (12,) input,cutoff = -1 / 3 / 5 / 100 → True 数 = 12 / 8 / 6 / 0;同 trace 替换 mask 后 output shape 各自正确 | PASS |
+|  | 跨 input shape(12→20)+ 跨 mask True 数 (→9):output shape 仍然正确 | PASS |
+| `test_masked_select_downstream_consumer` | `masked_select(x, mask).sum()` —— unbacked SymInt 流入下游 reduce,数值跟 eager 一致 | PASS |
+| `test_nonzero_indices` | `torch.nonzero(mask)` 输出 `(count_of_True, 1)` 跟随 mask 变化 | PASS |
+| `test_masked_select_without_flag_errors_clearly` | guard:不开 flag 时报 `"fw_compiler was never called"`,防 PyTorch 改默认后静默退化 | PASS |
+
+**v1 vs v2 在这条路径上**
+
+| | v1(dispatcher fallback) | v2(Dynamo + AOT) |
+|---|---|---|
+| 触发条件 | 任何场景,无需 flag | 必须 `capture_dynamic_output_shape_ops=True` |
+| 原因 | 不做 symbolic 分析,纯按值 dispatch,任何 op 都被记录 | 借 Dynamo 走 symbolic 路径,默认对 data-dependent op 保守 |
+| 输入 shape 灵活性 | 沿 dim-index op 传播的部分可变,其它要重 capture | SymInt 完整覆盖(backed + unbacked) |
+
+v1 在 data-dependent shape 上反而**少一道门槛**,这是 v1 现存的少数几个
+独特优势之一。在 LLM beam search / sparsity-aware kv cache / token filtering
+等场景下,这个特性可以让 v1 直接复用,不需要切到 v2。
+
+**该特性的诊断方法**
+
+| 看到 | 含义 |
+|---|---|
+| `"v2.capture: fw_compiler was never called; torch.compile may have graph-broken"` + 函数体中含 `masked_select` / `nonzero` / `unique` | 没开 `capture_dynamic_output_shape_ops`,加 `torch._dynamo.config.patch(capture_dynamic_output_shape_ops=True)` 或在 import 后顶层设置 |
+| `TORCH_LOGS='graph_breaks'` 输出 `Operator 'aten.<op>.default' output shape depends on input Tensor data` | 确认是这一类 op 触发的 graph break |
+| 已开 flag,但仍报 `"example_args[[...]] did not appear as Tensor placeholders"` | Dynamo 把某些 user 输入 specialize 成了常量(罕见),需要参照 §17.6.9 看是不是落到 pre-bind 路径上 |
+| 已开 flag,运行 OK 但 replay 出来的 shape 跟 eager 不一致 | trace 里有 `as_strided` / `expand` 等把 shape 烧成 literal 的 op,跟 §17.6.13 / §13.5 同类问题(不是 data-dependent shape 自身的 bug) |

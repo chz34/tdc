@@ -554,5 +554,121 @@ class TestV2Capture(unittest.TestCase):
         self.assertTrue(torch.allclose(got[2], ref[2]))
 
 
+class TestV2DataDependentShape(unittest.TestCase):
+    """v2 + ops whose OUTPUT SHAPE depends on input DATA values, not
+    just input shapes (masked_select, nonzero, unique, etc.).
+
+    Background: Dynamo refuses to trace these ops by default --
+    they're called "dynamic output shape ops" and they graph-break
+    with a hint to set `capture_dynamic_output_shape_ops = True`.
+    Once that's enabled Dynamo emits an "unbacked SymInt" for the
+    output size and the AOT FX graph carries it through. v2's trace
+    + C++ replay then handles the runtime size automatically because
+    each step reads its inputs' current metadata from the live
+    Tensor objects (the same mechanism that gives v1 dynamic-shape
+    coverage for dim-index ops).
+
+    These tests validate that:
+      1. With the flag on, capture succeeds (no graph break).
+      2. Replays with masks/inputs that select DIFFERENT numbers of
+         elements all produce outputs of the correct runtime shape.
+      3. Values match eager exactly.
+    """
+
+    def setUp(self):
+        torch._dynamo.reset()
+
+    @torch._dynamo.config.patch(capture_dynamic_output_shape_ops=True)
+    def test_masked_select_varies_output_size(self):
+        def fn(x, mask):
+            return torch.masked_select(x, mask)
+
+        x_ex = torch.arange(12, dtype=torch.float32)
+        mask_ex = x_ex > 5                  # 6 True
+        captured = tdcv2.capture(fn, x_ex, mask_ex)
+
+        # Same args -> 6 outputs
+        out = captured(x_ex, mask_ex)
+        self.assertEqual(tuple(out.shape), (6,))
+        self.assertTrue(torch.equal(out, fn(x_ex, mask_ex)))
+
+        # Different masks at same input shape: output size flexes with
+        # the number of True values.
+        for cutoff, expected_count in [(3, 8), (-1, 12), (100, 0)]:
+            mask = x_ex > cutoff
+            out = captured(x_ex, mask)
+            self.assertEqual(
+                tuple(out.shape), (expected_count,),
+                f"cutoff={cutoff}: got shape {tuple(out.shape)}, expected ({expected_count},)",
+            )
+            self.assertTrue(torch.equal(out, fn(x_ex, mask)))
+
+        # Different INPUT shape AND different True count.
+        x2 = torch.arange(20, dtype=torch.float32)
+        out = captured(x2, x2 > 10)         # 9 True
+        self.assertEqual(tuple(out.shape), (9,))
+        self.assertTrue(torch.equal(out, fn(x2, x2 > 10)))
+
+    @torch._dynamo.config.patch(capture_dynamic_output_shape_ops=True)
+    def test_masked_select_downstream_consumer(self):
+        """The data-dependent SymInt produced by masked_select must
+        flow correctly into a downstream op that consumes the runtime
+        size (here: .sum() over the variably-sized output)."""
+        def fn(x, mask):
+            return torch.masked_select(x, mask).sum()
+
+        x = torch.arange(12, dtype=torch.float32)
+        captured = tdcv2.capture(fn, x, x > 5)
+
+        for cutoff in [5, 3, -1, 100]:        # 6, 8, 12, 0 True
+            mask = x > cutoff
+            got = captured(x, mask)
+            ref = fn(x, mask)
+            self.assertTrue(
+                torch.allclose(got, ref),
+                f"cutoff={cutoff}: v2={got.item()} eager={ref.item()}",
+            )
+
+    @torch._dynamo.config.patch(capture_dynamic_output_shape_ops=True)
+    def test_nonzero_indices(self):
+        """torch.nonzero is the canonical data-dependent op: output
+        is (count_of_true, ndim)."""
+        def fn(mask):
+            return torch.nonzero(mask)
+
+        mask_ex = torch.tensor([0, 1, 0, 1, 1], dtype=torch.bool)
+        captured = tdcv2.capture(fn, mask_ex)
+
+        for mask, expected_count in [
+            (torch.tensor([0, 1, 0, 1, 1], dtype=torch.bool), 3),
+            (torch.tensor([1, 1, 1, 1, 1], dtype=torch.bool), 5),
+            (torch.tensor([0, 0, 0, 0, 0], dtype=torch.bool), 0),
+        ]:
+            out = captured(mask)
+            self.assertEqual(out.shape, (expected_count, 1))
+            self.assertTrue(torch.equal(out, fn(mask)))
+
+    def test_masked_select_without_flag_errors_clearly(self):
+        """Without capture_dynamic_output_shape_ops=True the capture
+        should fail predictably -- this is the "diagnostic guard"
+        test so a future PyTorch version that flips the default
+        doesn't quietly break this expectation."""
+        # Default config: Dynamo graph-breaks on masked_select.
+        def fn(x, mask):
+            return torch.masked_select(x, mask)
+        x = torch.arange(8, dtype=torch.float32)
+        with self.assertRaises(RuntimeError) as cm:
+            tdcv2.capture(fn, x, x > 3)
+        # We don't pin the exact message (Dynamo phrasing evolves);
+        # it should be the "fw_compiler was never called" form since
+        # Dynamo bailed before getting to AOT.
+        msg = str(cm.exception)
+        self.assertTrue(
+            "fw_compiler was never called" in msg
+            or "graph" in msg.lower(),
+            f"unexpected error: {msg}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
