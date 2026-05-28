@@ -454,7 +454,7 @@ if os.environ.get("TDC_TORCHBENCH", "0") == "1":
         ("llama",         64),
         # ("llava",         64),
         ("timm_vision_transformer",         64),
-        ("hf_GPT2",         64),
+        ("hf_GPT2",         8),
     ]:
         _label = f"torchbench:{_name} (B={_bs})"
         _loaded = _load_torchbench(_name, batch_size=_bs)
@@ -583,9 +583,9 @@ def build_variants(fn, example_inputs):
         ("inductor",  lambda: torch.compile(fn, backend="inductor", dynamic=True)),
         ("v3-stock",    lambda: tdcv3.capture(fn, *example_inputs)),
         ("v3-fallback", lambda: tdcv3.capture_fallback(fn, *example_inputs)),
-        ("v1",             lambda: _v1_capture(fn, example_inputs)),
-        ("v2 (direct)",    lambda: tdcv2.capture(fn, *example_inputs, wrapper=False)),
-        ("v2 (wrapper)",   lambda: tdcv2.capture(fn, *example_inputs, wrapper=True)),
+        # ("v1",             lambda: _v1_capture(fn, example_inputs)),
+        ("v2",    lambda: tdcv2.capture(fn, *example_inputs, wrapper=False)),
+        # ("v2 (wrapper)",   lambda: tdcv2.capture(fn, *example_inputs, wrapper=True)),
         ("export",         lambda: _export_capture(fn, example_inputs)),
     ]:
         try:
