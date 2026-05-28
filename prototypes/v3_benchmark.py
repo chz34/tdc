@@ -28,6 +28,10 @@ from _device import DEVICE, SYNC  # noqa: E402
 import torch_dispatch_capture.v2 as tdcv2
 import torch_dispatch_capture.v3 as tdcv3
 
+# Reuse model builders from v2_benchmark to avoid duplication.
+sys.path.insert(0, str(_PROTO))
+from v2_benchmark import _build_transformer_block  # noqa: E402
+
 
 def _time_call(callable_, args, n_warmup=100, n_iters=1000):
     for _ in range(n_warmup):
@@ -157,15 +161,64 @@ def run_scenario_b():
     print()
 
 
+def run_scenario_c():
+    print(f"### Scenario C -- Transformer block on {DEVICE}")
+    block = _build_transformer_block(hidden=512, n_heads=8, ffn_inner=2048).to(DEVICE).eval()
+    x = torch.randn(2, 16, 512, device=DEVICE)
+    with torch.no_grad():
+        ref = block(x).detach()
+
+    def fn(inp):
+        with torch.no_grad():
+            return block(inp)
+
+    eager_us = None
+    rows = []
+    for name in VARIANTS:
+        c, cap_s, err = _capture_variant(name, fn, (x,))
+        if c is None:
+            rows.append((name, None, None, None, err))
+            continue
+        try:
+            with torch.no_grad():
+                out = c(x)
+            max_abs = (out - ref).abs().max().item()
+        except Exception as e:  # noqa: BLE001
+            rows.append((name, None, cap_s, None, f"call failed: {type(e).__name__}: {e}"))
+            continue
+        if not torch.allclose(out, ref, atol=1e-3, rtol=1e-3):
+            rows.append((name, None, cap_s, max_abs, "numerics drift atol/rtol 1e-3"))
+            continue
+        per_call_us = _time_call(c, (x,))
+        if name == "eager":
+            eager_us = per_call_us
+        rows.append((name, per_call_us, cap_s, max_abs, None))
+
+    print()
+    print("| variant       | per_call_us | speedup_vs_eager | capture_s | max_abs_diff |")
+    print("| ------------- | ----------- | ---------------- | --------- | ------------ |")
+    for name, per_us, cap_s, max_abs, err in rows:
+        if err is not None:
+            print(f"| {name:<13} | -           | -                | -         | {err}")
+            continue
+        speedup = f"{eager_us / per_us:.2f}x" if eager_us else "-"
+        cap_str = f"{cap_s:.2f}" if cap_s is not None else "-"
+        max_abs_str = f"{max_abs:.2e}" if max_abs is not None else "-"
+        print(f"| {name:<13} | {per_us:>10.2f}  | {speedup:<16} | {cap_str:>9} | {max_abs_str:>12} |")
+    print()
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--scenarios", default="A,B", help="comma-separated subset of {A,B,C}")
+    parser.add_argument("--scenarios", default="A,B,C", help="comma-separated subset of {A,B,C}")
     args = parser.parse_args()
     scenarios = {s.strip().upper() for s in args.scenarios.split(",")}
     if "A" in scenarios:
         run_scenario_a()
     if "B" in scenarios:
         run_scenario_b()
+    if "C" in scenarios:
+        run_scenario_c()
 
 
 if __name__ == "__main__":
