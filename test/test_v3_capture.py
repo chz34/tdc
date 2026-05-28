@@ -84,6 +84,36 @@ class TestV3CaptureReport(unittest.TestCase):
         self.assertGreater(rep["fx_node_count"], 0)
         self.assertEqual(rep["fallback_node_count"], rep["fx_node_count"])
 
+    def test_fused_kernel_count_distinguishes_variants(self):
+        """Strongest evidence that fallback really skips inductor fusion:
+        inspect the generated cpp_wrapper source and count fused-kernel
+        DEFINITIONS. Fallback must have zero; stock must have at least
+        one for a workload with obvious fusion opportunities."""
+        def fn(x, y):
+            return ((x + y) * 0.5 - 1.0).relu()
+
+        x = torch.randn(4, 5, device=DEVICE)
+        y = torch.randn(4, 5, device=DEVICE)
+
+        torch._dynamo.reset()
+        tdcv3.capture_fallback(fn, x, y)
+        fb = tdcv3.last_capture_report()
+        self.assertEqual(
+            fb["fused_kernel_count"], 0,
+            f"fallback variant produced {fb['fused_kernel_count']} fused "
+            f"kernel(s); check {fb['cpp_source_path']}"
+        )
+
+        torch._dynamo.reset()
+        tdcv3.capture(fn, x, y)
+        st = tdcv3.last_capture_report()
+        self.assertIsNotNone(st["fused_kernel_count"])
+        self.assertGreater(
+            st["fused_kernel_count"], 0,
+            f"stock variant on a fusable workload produced 0 fused kernels; "
+            f"check {st['cpp_source_path']}"
+        )
+
     def test_capture_report_paths_exist_on_disk(self):
         import os
 

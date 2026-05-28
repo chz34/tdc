@@ -67,6 +67,40 @@ def _stock_cpp_wrapper_config():
         yield
 
 
+def _count_fused_kernels(cpp_source_path: str | None) -> int | None:
+    """Count fused-kernel function definitions in an inductor cpp_wrapper
+    artifact. Returns:
+      - 0  if the file exists and has no fused kernel definitions
+            (definitive evidence inductor produced no fusion -- expected
+            for the fallback variant)
+      - >0 if the file contains any `cpp_fused_*` or `triton_*` symbol
+            definitions (expected for the stock variant)
+      - None if the path is None or unreadable
+
+    The match is intentionally syntactic: we look for the kernel
+    DEFINITION marker, not call sites. cpp kernels are emitted as
+    `extern "C" void cpp_fused_<ops>_<n>(...)` and triton kernels via
+    `triton_<poi|red|...>_fused_<ops>_<n>` symbols.
+    """
+    if cpp_source_path is None:
+        return None
+    try:
+        with open(cpp_source_path) as f:
+            src = f.read()
+    except OSError:
+        return None
+
+    import re
+
+    # cpp fused kernel definitions: `void cpp_fused_..._N(`
+    cpp_defs = re.findall(r"\bvoid\s+cpp_fused_\w+\s*\(", src)
+    # Triton kernels are emitted as `def triton_..._N(`  (autotune block)
+    # AND referenced as `triton_..._N` in the cpp side -- counting the
+    # `def` form keeps us aligned to definitions only.
+    triton_defs = re.findall(r"\bdef\s+triton_\w+_fused_\w+\s*\(", src)
+    return len(cpp_defs) + len(triton_defs)
+
+
 def _snapshot_pycodecache_module_count() -> int:
     """Return current size of PyCodeCache.modules, or 0 if unavailable."""
     try:
@@ -132,6 +166,7 @@ def _capture_common(fn, example_args, example_kwargs, fallback: bool):
 
     fx_nodes = _LAST_GRAPH_STATS.get("fx_nodes")
     so_path, cpp_source_path = _resolve_last_inductor_artifact_paths(baseline_module_count)
+    fused_kernel_count = _count_fused_kernels(cpp_source_path)
     _LAST_REPORT = {
         "variant": "fallback" if fallback else "stock",
         "capture_seconds": t1 - t0,
@@ -139,6 +174,12 @@ def _capture_common(fn, example_args, example_kwargs, fallback: bool):
         # In fallback variant, every aten op becomes a FallbackKernel, so
         # the count equals fx_node_count by construction.
         "fallback_node_count": fx_nodes if fallback else None,
+        # Read directly from the generated cpp_wrapper source: number of
+        # cpp_fused_* / triton_* kernel DEFINITIONS. The fallback variant
+        # MUST report 0 here, else fusion leaked through. The stock
+        # variant reports >0 unless the workload was trivial (no fusion
+        # opportunities -- e.g. a single op).
+        "fused_kernel_count": fused_kernel_count,
         "so_path": so_path,
         "cpp_source_path": cpp_source_path,
     }
