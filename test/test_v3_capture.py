@@ -128,5 +128,23 @@ class TestV3DynamicShape(unittest.TestCase):
         self.assertLessEqual(delta, 1, f"unexpected recompiles: {delta}")
 
 
+class TestV3Kwargs(unittest.TestCase):
+    def setUp(self):
+        torch._dynamo.reset()
+
+    def test_kwargs_passthrough(self):
+        def fn(x, *, scale):
+            return x * scale + 1.0
+
+        x = torch.randn(4, 5, device=DEVICE)
+        captured = tdcv3.capture_fallback(fn, x, scale=torch.tensor(2.5, device=DEVICE))
+
+        new_x = torch.randn(4, 5, device=DEVICE)
+        new_scale = torch.tensor(3.0, device=DEVICE)
+        ref = new_x * new_scale + 1.0
+        out = captured(new_x, scale=new_scale)
+        self.assertTrue(torch.allclose(out, ref, atol=1e-3, rtol=1e-3))
+
+
 if __name__ == "__main__":
     unittest.main()
