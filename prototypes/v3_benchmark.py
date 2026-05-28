@@ -104,13 +104,68 @@ def run_scenario_a():
     print()
 
 
+def workload_gemm_chain(x, w):
+    return torch.matmul(x, w).relu() + 1.0
+
+
+def run_scenario_b():
+    print(f"### Scenario B -- gemm+pointwise, varying seq_len on {DEVICE}")
+    hidden = 64
+    seqs = [128, 256, 512, 1024]
+    x_example = torch.randn(seqs[0], hidden, device=DEVICE)
+    w = torch.randn(hidden, hidden, device=DEVICE)
+
+    captured: dict[str, object] = {}
+    cap_seconds: dict[str, float] = {}
+    capture_errors: dict[str, str] = {}
+    recompile_baseline: dict[str, int] = {}
+    counters = torch._dynamo.utils.counters
+
+    for name in VARIANTS:
+        torch._dynamo.reset()
+        recompile_baseline[name] = counters.get("stats", {}).get("calls_captured", 0)
+        c, cap_s, err = _capture_variant(name, workload_gemm_chain, (x_example, w))
+        if c is None:
+            capture_errors[name] = err
+            continue
+        captured[name] = c
+        cap_seconds[name] = cap_s
+
+    per_shape_us: dict[str, dict[int, float]] = {name: {} for name in VARIANTS}
+    for seq in seqs:
+        x_seq = torch.randn(seq, hidden, device=DEVICE)
+        for name, c in captured.items():
+            per_shape_us[name][seq] = _time_call(c, (x_seq, w), n_warmup=5, n_iters=50)
+
+    recompiles_total: dict[str, int] = {}
+    for name in captured:
+        delta = counters.get("stats", {}).get("calls_captured", 0) - recompile_baseline[name]
+        recompiles_total[name] = delta
+
+    print()
+    header = "| variant       | " + " | ".join(f"seq={s:>4} us" for s in seqs) + " | recompiles |"
+    sep = "| ------------- | " + " | ".join(["-----------"] * len(seqs)) + " | ---------- |"
+    print(header)
+    print(sep)
+    for name in VARIANTS:
+        if name in capture_errors:
+            cells = " | ".join(["-          "] * len(seqs))
+            print(f"| {name:<13} | {cells} | -          |")
+            continue
+        cells = " | ".join(f"{per_shape_us[name][s]:>10.2f} " for s in seqs)
+        print(f"| {name:<13} | {cells} | {recompiles_total[name]:>10} |")
+    print()
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--scenarios", default="A", help="comma-separated subset of {A,B,C}")
+    parser.add_argument("--scenarios", default="A,B", help="comma-separated subset of {A,B,C}")
     args = parser.parse_args()
     scenarios = {s.strip().upper() for s in args.scenarios.split(",")}
     if "A" in scenarios:
         run_scenario_a()
+    if "B" in scenarios:
+        run_scenario_b()
 
 
 if __name__ == "__main__":
