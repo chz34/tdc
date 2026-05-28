@@ -68,5 +68,22 @@ class TestV3CaptureFallback(unittest.TestCase):
         self.assertEqual(tdcv3.last_capture_report()["variant"], "fallback")
 
 
+class TestV3CaptureReport(unittest.TestCase):
+    def setUp(self):
+        torch._dynamo.reset()
+
+    def test_fallback_node_count_matches_fx_node_count(self):
+        def fn(q, k):
+            return torch.matmul(q, k.transpose(-1, -2))
+
+        q = torch.randn(2, 4, 8, device=DEVICE)
+        k = torch.randn(2, 4, 8, device=DEVICE)
+        tdcv3.capture_fallback(fn, q, k)
+
+        rep = tdcv3.last_capture_report()
+        self.assertGreater(rep["fx_node_count"], 0)
+        self.assertEqual(rep["fallback_node_count"], rep["fx_node_count"])
+
+
 if __name__ == "__main__":
     unittest.main()
