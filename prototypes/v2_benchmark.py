@@ -596,10 +596,18 @@ def build_variants(fn, example_inputs):
     return variants
 
 
-# Modes that don't reuse Dynamo's compile cache between workloads — we
-# reset before timing each. v1/v2 capture once and stash their own state,
-# so resetting Dynamo's cache afterwards would be a no-op for them.
-_CAPTURE_MODES = {"v1", "v2"}
+# Variants for which we MUST NOT torch._dynamo.reset() between calls.
+# Two reasons end up in the same set:
+#   - v1 / v2: capture into their own C++ Trace; Dynamo's cache is
+#     irrelevant after capture, but resetting it is also harmless.
+#   - v3-stock / v3-fallback: the captured object is an OptimizedModule.
+#     dynamo.reset() invalidates its compile entry, the next call
+#     re-traces under whatever inductor_config is current at that moment
+#     (cpp_wrapper=False by default), and the variant silently degrades
+#     to a vanilla python-wrapper inductor compile. Verified empirically
+#     -- without this the v3 columns are indistinguishable from
+#     'inductor' because they ARE the same compile.
+_CAPTURE_MODES = {"v1", "v2 (direct)", "v2 (wrapper)", "v3-stock", "v3-fallback"}
 
 
 # ---------------------------------------------------------------------------
