@@ -27,6 +27,10 @@ def capture(fn: Callable, *example_args: Any, **example_kwargs: Any) -> Callable
     return _capture_common(fn, example_args, example_kwargs, fallback=False)
 
 
+def capture_fallback(fn: Callable, *example_args: Any, **example_kwargs: Any) -> Callable:
+    return _capture_common(fn, example_args, example_kwargs, fallback=True)
+
+
 def last_capture_report() -> dict | None:
     return dict(_LAST_REPORT) if _LAST_REPORT is not None else None
 

@@ -49,5 +49,24 @@ class TestV3CaptureStock(unittest.TestCase):
         self.assertTrue(torch.allclose(out, ref, atol=1e-3, rtol=1e-3))
 
 
+class TestV3CaptureFallback(unittest.TestCase):
+    def setUp(self):
+        torch._dynamo.reset()
+
+    def test_smoke_fallback_pointwise(self):
+        def fn(x, y):
+            return x * 2.0 + y - 1.5
+
+        x = torch.randn(4, 5, device=DEVICE)
+        y = torch.randn(4, 5, device=DEVICE)
+        captured = tdcv3.capture_fallback(fn, x, y)
+
+        ref = x * 2.0 + y - 1.5
+        out = captured(x, y)
+        # AOT decomp still applies, so the same 1e-3 tolerance v2 uses applies here.
+        self.assertTrue(torch.allclose(out, ref, atol=1e-3, rtol=1e-3))
+        self.assertEqual(tdcv3.last_capture_report()["variant"], "fallback")
+
+
 if __name__ == "__main__":
     unittest.main()
