@@ -84,6 +84,21 @@ class TestV3CaptureReport(unittest.TestCase):
         self.assertGreater(rep["fx_node_count"], 0)
         self.assertEqual(rep["fallback_node_count"], rep["fx_node_count"])
 
+    def test_capture_report_paths_exist_on_disk(self):
+        import os
+
+        def fn(x):
+            return x * 2.0 + 1.0
+
+        x = torch.randn(4, 5, device=DEVICE)
+        tdcv3.capture_fallback(fn, x)
+
+        rep = tdcv3.last_capture_report()
+        # cpp_source_path is the inductor-emitted Python wrapper file that
+        # embeds the cpp source. It must exist on disk when capture succeeded.
+        self.assertIsNotNone(rep["cpp_source_path"])
+        self.assertTrue(os.path.exists(rep["cpp_source_path"]))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -62,11 +62,62 @@ def _stock_cpp_wrapper_config():
         yield
 
 
+def _snapshot_pycodecache_module_count() -> int:
+    """Return current size of PyCodeCache.modules, or 0 if unavailable."""
+    try:
+        from torch._inductor.codecache import PyCodeCache
+    except ImportError:
+        return 0
+    return len(getattr(PyCodeCache, "modules", []))
+
+
+def _resolve_last_inductor_artifact_paths(
+    baseline_module_count: int,
+) -> tuple[str | None, str | None]:
+    """Best-effort: return (so_path, cpp_source_path) for the most recent
+    inductor-emitted artifact added to PyCodeCache.modules since the
+    baseline snapshot. Returns (None, None) when nothing matches (e.g.
+    cache hit -- no new module was loaded).
+    """
+    import os
+
+    try:
+        from torch._inductor.codecache import PyCodeCache
+    except ImportError:
+        return None, None
+
+    modules = list(getattr(PyCodeCache, "modules", []))
+    new_modules = modules[baseline_module_count:]
+    if not new_modules:
+        return None, None
+
+    # Pick the latest non-None __file__. cpp_wrapper outputs are large
+    # Python files containing the embedded C++ source as a raw string.
+    cpp_source_path = None
+    for mod in reversed(new_modules):
+        path = getattr(mod, "__file__", None)
+        if path and os.path.exists(path):
+            cpp_source_path = path
+            break
+
+    if cpp_source_path is None:
+        return None, None
+
+    # Matching .so lives next to the .py under the same stem.
+    so_path = None
+    stem, _ = os.path.splitext(cpp_source_path)
+    so_guess = stem + ".so"
+    if os.path.exists(so_guess):
+        so_path = so_guess
+    return so_path, cpp_source_path
+
+
 def _capture_common(fn, example_args, example_kwargs, fallback: bool):
     global _LAST_REPORT
     _LAST_GRAPH_STATS.clear()
     cm = force_all_fallback() if fallback else _stock_cpp_wrapper_config()
 
+    baseline_module_count = _snapshot_pycodecache_module_count()
     t0 = time.perf_counter()
     with cm, inductor_config.patch({"post_grad_custom_pre_pass": _stats_post_grad_pass}):
         compiled = torch.compile(fn, backend="inductor", dynamic=True)
@@ -75,6 +126,7 @@ def _capture_common(fn, example_args, example_kwargs, fallback: bool):
     t1 = time.perf_counter()
 
     fx_nodes = _LAST_GRAPH_STATS.get("fx_nodes")
+    so_path, cpp_source_path = _resolve_last_inductor_artifact_paths(baseline_module_count)
     _LAST_REPORT = {
         "variant": "fallback" if fallback else "stock",
         "capture_seconds": t1 - t0,
@@ -82,5 +134,7 @@ def _capture_common(fn, example_args, example_kwargs, fallback: bool):
         # In fallback variant, every aten op becomes a FallbackKernel, so
         # the count equals fx_node_count by construction.
         "fallback_node_count": fx_nodes if fallback else None,
+        "so_path": so_path,
+        "cpp_source_path": cpp_source_path,
     }
     return compiled
