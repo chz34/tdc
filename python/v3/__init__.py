@@ -2,6 +2,7 @@
 
 See docs/specs/2026-05-28-v3-design.md for the design.
 """
+from .compile import capture, last_capture_report
 from .fallback_hijack import force_all_fallback
 
-__all__ = ["force_all_fallback"]
+__all__ = ["capture", "last_capture_report", "force_all_fallback"]

@@ -1,9 +1,15 @@
 """End-to-end and unit tests for v3 (Inductor cpp_wrapper probe)."""
+import sys
 import unittest
+from pathlib import Path
 
 import torch
 import torch._inductor.lowering as _lowering
 import torch_dispatch_capture.v3 as tdcv3
+
+# Allow importing test/_device.py when run from repo root or test/ dir.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _device import DEVICE  # noqa: E402
 
 
 class TestForceAllFallback(unittest.TestCase):
@@ -24,6 +30,23 @@ class TestForceAllFallback(unittest.TestCase):
         # And the original handler must be restored.
         for k, v in before.items():
             self.assertIs(after[k], v)
+
+
+class TestV3CaptureStock(unittest.TestCase):
+    def setUp(self):
+        torch._dynamo.reset()
+
+    def test_smoke_stock_pointwise(self):
+        def fn(x, y):
+            return x * 2.0 + y - 1.5
+
+        x = torch.randn(4, 5, device=DEVICE)
+        y = torch.randn(4, 5, device=DEVICE)
+        captured = tdcv3.capture(fn, x, y)
+
+        ref = x * 2.0 + y - 1.5
+        out = captured(x, y)
+        self.assertTrue(torch.allclose(out, ref, atol=1e-3, rtol=1e-3))
 
 
 if __name__ == "__main__":
