@@ -12,6 +12,7 @@ Run with:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -28,9 +29,9 @@ from _device import DEVICE, SYNC  # noqa: E402
 import torch_dispatch_capture.v2 as tdcv2
 import torch_dispatch_capture.v3 as tdcv3
 
-# Reuse model builders from v2_benchmark to avoid duplication.
+# Reuse model builders + torchbench loader from v2_benchmark to avoid duplication.
 sys.path.insert(0, str(_PROTO))
-from v2_benchmark import _build_transformer_block  # noqa: E402
+from v2_benchmark import _build_transformer_block, _load_torchbench  # noqa: E402
 
 
 def _time_call(callable_, args, n_warmup=100, n_iters=1000):
@@ -96,15 +97,15 @@ def run_scenario_a():
         rows.append((name, per_call_us, cap_s, None))
 
     print()
-    print("| variant       | per_call_us | speedup_vs_eager | capture_s |")
-    print("| ------------- | ----------- | ---------------- | --------- |")
+    print("| variant       | per_call_us | time_vs_eager | capture_s |")
+    print("| ------------- | ----------- | ------------- | --------- |")
     for name, per_us, cap_s, err in rows:
         if err is not None:
-            print(f"| {name:<13} | -           | -                | skipped: {err}")
+            print(f"| {name:<13} | -           | -             | skipped: {err}")
             continue
-        speedup = f"{eager_us / per_us:.2f}x" if eager_us else "-"
+        ratio = f"{per_us / eager_us:.2f}x" if eager_us else "-"
         cap_str = f"{cap_s:.2f}" if cap_s is not None else "-"
-        print(f"| {name:<13} | {per_us:>10.2f}  | {speedup:<16} | {cap_str:>9} |")
+        print(f"| {name:<13} | {per_us:>10.2f}  | {ratio:<13} | {cap_str:>9} |")
     print()
 
 
@@ -195,22 +196,119 @@ def run_scenario_c():
         rows.append((name, per_call_us, cap_s, max_abs, None))
 
     print()
-    print("| variant       | per_call_us | speedup_vs_eager | capture_s | max_abs_diff |")
-    print("| ------------- | ----------- | ---------------- | --------- | ------------ |")
+    print("| variant       | per_call_us | time_vs_eager | capture_s | max_abs_diff |")
+    print("| ------------- | ----------- | ------------- | --------- | ------------ |")
     for name, per_us, cap_s, max_abs, err in rows:
         if err is not None:
-            print(f"| {name:<13} | -           | -                | -         | {err}")
+            print(f"| {name:<13} | -           | -             | -         | {err}")
             continue
-        speedup = f"{eager_us / per_us:.2f}x" if eager_us else "-"
+        ratio = f"{per_us / eager_us:.2f}x" if eager_us else "-"
         cap_str = f"{cap_s:.2f}" if cap_s is not None else "-"
         max_abs_str = f"{max_abs:.2e}" if max_abs is not None else "-"
-        print(f"| {name:<13} | {per_us:>10.2f}  | {speedup:<16} | {cap_str:>9} | {max_abs_str:>12} |")
+        print(f"| {name:<13} | {per_us:>10.2f}  | {ratio:<13} | {cap_str:>9} | {max_abs_str:>12} |")
     print()
+
+
+def _run_torchbench_one(model_name: str, batch_size: int):
+    """Run all 5 variants on a torchbench model. Returns (eager_us_or_None, rows).
+    Rows shape mirrors run_scenario_c: (name, per_us, cap_s, max_abs, err)."""
+    loaded = _load_torchbench(model_name, batch_size=batch_size)
+    if loaded is None:
+        return None, None     # message already printed by _load_torchbench
+    fn, example_inputs = loaded
+
+    with torch.no_grad():
+        try:
+            ref = fn(*example_inputs)
+        except Exception as e:  # noqa: BLE001
+            print(f"# torchbench:{model_name} eager call failed: "
+                  f"{type(e).__name__}: {e}")
+            return None, None
+
+    eager_us = None
+    rows = []
+    for name in VARIANTS:
+        c, cap_s, err = _capture_variant(name, fn, example_inputs)
+        if c is None:
+            rows.append((name, None, None, None, err))
+            continue
+        try:
+            with torch.no_grad():
+                out = c(*example_inputs)
+        except Exception as e:  # noqa: BLE001
+            rows.append((name, None, cap_s, None,
+                         f"call failed: {type(e).__name__}: {e}"))
+            continue
+
+        # Output may be a tensor, tuple, or HF-style dataclass. Best-effort
+        # numerical diff: flatten ref/out via pytree, ignore if structure differs
+        # so we don't bail entire timing on output shape quirks.
+        max_abs = None
+        try:
+            from torch.utils._pytree import tree_flatten
+            ref_leaves = [t for t in tree_flatten(ref)[0]
+                          if isinstance(t, torch.Tensor)]
+            out_leaves = [t for t in tree_flatten(out)[0]
+                          if isinstance(t, torch.Tensor)]
+            if len(ref_leaves) == len(out_leaves) and ref_leaves:
+                max_abs = max(
+                    (rl - ol).abs().max().item()
+                    for rl, ol in zip(ref_leaves, out_leaves)
+                    if rl.shape == ol.shape
+                )
+        except Exception:  # noqa: BLE001
+            pass
+
+        per_call_us = _time_call(c, example_inputs, n_warmup=5, n_iters=20)
+        if name == "eager":
+            eager_us = per_call_us
+        rows.append((name, per_call_us, cap_s, max_abs, None))
+
+    return eager_us, rows
+
+
+def run_scenario_d():
+    """Scenario D -- torchbench models. Gated on TDC_TORCHBENCH=1 to keep
+    casual sweeps fast (these models are 1M..116M params)."""
+    if os.environ.get("TDC_TORCHBENCH", "0") != "1":
+        print("### Scenario D -- skipped (set TDC_TORCHBENCH=1 to enable)")
+        print()
+        return
+
+    # Light-to-heavy ordering so an early failure on the heaviest model
+    # doesn't lose the data we already gathered.
+    models = [
+        ("squeezenet1_1", 8),
+        ("BERT_pytorch",  4),
+        ("hf_GPT2",       4),
+    ]
+
+    for model_name, batch_size in models:
+        print(f"### Scenario D -- torchbench:{model_name} (B={batch_size}) on {DEVICE}")
+        eager_us, rows = _run_torchbench_one(model_name, batch_size)
+        if rows is None:
+            print()
+            continue
+
+        print()
+        print("| variant       | per_call_us | time_vs_eager | capture_s | max_abs_diff |")
+        print("| ------------- | ----------- | ------------- | --------- | ------------ |")
+        for name, per_us, cap_s, max_abs, err in rows:
+            if err is not None:
+                print(f"| {name:<13} | -           | -             | -         | {err}")
+                continue
+            ratio = f"{per_us / eager_us:.2f}x" if eager_us else "-"
+            cap_str = f"{cap_s:.2f}" if cap_s is not None else "-"
+            max_abs_str = f"{max_abs:.2e}" if max_abs is not None else "-"
+            print(f"| {name:<13} | {per_us:>10.2f}  | {ratio:<13} | {cap_str:>9} | {max_abs_str:>12} |")
+        print()
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--scenarios", default="A,B,C", help="comma-separated subset of {A,B,C}")
+    parser.add_argument("--scenarios", default="A,B,C,D",
+                        help="comma-separated subset of {A,B,C,D}; D = torchbench, "
+                             "requires TDC_TORCHBENCH=1")
     args = parser.parse_args()
     scenarios = {s.strip().upper() for s in args.scenarios.split(",")}
     if "A" in scenarios:
@@ -219,6 +317,8 @@ def main():
         run_scenario_b()
     if "C" in scenarios:
         run_scenario_c()
+    if "D" in scenarios:
+        run_scenario_d()
 
 
 if __name__ == "__main__":
