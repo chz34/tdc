@@ -35,6 +35,7 @@ from torch import nn
 from torchvision import models as tv_models
 import torch_dispatch_capture as tdc           # v1
 import torch_dispatch_capture.v2 as tdcv2      # v2
+import torch_dispatch_capture.v3 as tdcv3      # v3
 from torch.profiler import profile, ProfilerActivity
 
 # Share the test suite's device helper. test/ is a sibling of prototypes/.
@@ -580,6 +581,8 @@ def build_variants(fn, example_inputs):
         ("dynamo",    lambda: torch.compile(fn, backend="eager", dynamic=True)),
         ("aot_eager", lambda: torch.compile(fn, backend="aot_eager", dynamic=True)),
         ("inductor",  lambda: torch.compile(fn, backend="inductor", dynamic=True)),
+        ("v3-stock",    lambda: tdcv3.capture(fn, *example_inputs)),
+        ("v3-fallback", lambda: tdcv3.capture_fallback(fn, *example_inputs)),
         ("v1",             lambda: _v1_capture(fn, example_inputs)),
         ("v2 (direct)",    lambda: tdcv2.capture(fn, *example_inputs, wrapper=False)),
         ("v2 (wrapper)",   lambda: tdcv2.capture(fn, *example_inputs, wrapper=True)),
