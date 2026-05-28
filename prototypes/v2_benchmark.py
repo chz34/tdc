@@ -444,10 +444,16 @@ if TRITON_AVAILABLE:
 _TB_SKIP_CORRECTNESS: set[str] = set()
 
 if os.environ.get("TDC_TORCHBENCH", "0") == "1":
+    # When TDC_TORCHBENCH=1, the benchmark switches to torchbench-only
+    # mode: built-in workloads are cleared and we run only the
+    # torchbench models below. This keeps the printed table focused on
+    # real-model results when that's what the user asked for.
+    #
     # Label is auto-derived as f"torchbench:{name} (B={bs})". llama is
     # torchbench's reference Llama decoder; llava is the HF multimodal
     # model — metadata.yaml marks CPU unsupported (OOM on CI), so on
     # cpu it skips via _load_torchbench's broad except.
+    WORKLOADS.clear()
     for _name, _bs in [
         ("squeezenet1_1", 64),
         ("BERT_pytorch",  64),
@@ -460,6 +466,13 @@ if os.environ.get("TDC_TORCHBENCH", "0") == "1":
         _loaded = _load_torchbench(_name, batch_size=_bs)
         if _loaded is not None:
             WORKLOADS[_label] = _loaded
+    if not WORKLOADS:
+        raise SystemExit(
+            "TDC_TORCHBENCH=1 set but no torchbench models loaded -- "
+            "is the torchbenchmark package importable, and were the "
+            "model weights downloaded? See _load_torchbench()'s "
+            "per-model skip messages above for details."
+        )
 
 
 # ---------------------------------------------------------------------------
