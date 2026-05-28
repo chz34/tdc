@@ -142,6 +142,41 @@ are correctly accumulated.
   `BaseModelOutputWith*` dataclasses and you're consuming `.loss`
   through that wrapper, you may need a small adapter.
 
+## v3: Inductor `cpp_wrapper` probe (forward-only)
+
+`tdcv3` is a thin adapter around `torch.compile(backend="inductor",
+dynamic=True)` with `inductor_config.cpp_wrapper=True`. It exists for
+benchmarking, not to replace v2 — its purpose is to put the
+cpp_wrapper-emitted C++ host driver next to v2's boxed `callBoxed`
+trace on the same workload and measure the difference.
+
+Two variants:
+
+```python
+import torch_dispatch_capture.v3 as tdcv3
+
+# Stock: cpp_wrapper on, Inductor still fuses & emits Triton/C++ kernels.
+captured = tdcv3.capture(fn, *example_args)
+
+# Fallback: cpp_wrapper on AND every op forced through aten via FallbackKernel.
+# This is the shape that mirrors v2 most directly (no fusion, aten-only).
+captured = tdcv3.capture_fallback(fn, *example_args)
+
+out = captured(*new_args)
+report = tdcv3.last_capture_report()
+# {'variant', 'capture_seconds', 'fx_node_count', 'fallback_node_count',
+#  'so_path', 'cpp_source_path'}
+```
+
+Use v3 when you want to quantify *what does the cpp_wrapper host-side
+path actually buy us, and how much of inductor's win comes from fusion
+vs. wrapper shape?* Use v2 for everything else — v3 inherits Dynamo's
+recompile semantics, has no zero-recompile guarantee, and is
+forward-only in v0.1.
+
+See `docs/specs/2026-05-28-v3-design.md` for the design and
+`prototypes/v3_benchmark.py` for the canonical comparison.
+
 ## v1: dispatcher-level capture
 
 Use v1 when the one-time `torch.compile` cost of v2 is unacceptable —
