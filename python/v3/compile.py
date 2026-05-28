@@ -55,10 +55,15 @@ def last_capture_report() -> dict | None:
 
 @contextlib.contextmanager
 def _stock_cpp_wrapper_config():
-    with inductor_config.patch({
-        "cpp_wrapper": True,
-        "triton.cudagraphs": False,
-    }):
+    # Only set cpp_wrapper. Inductor's own get_cpp_wrapper_config()
+    # (compile_fx.py) handles cudagraph interaction internally: it
+    # preserves the user's triton.cudagraphs setting unless we're in
+    # AOTI or graph_partition mode (both incompatible). For JIT +
+    # fused Triton kernels, cudagraphs are cudagraph-safe and should
+    # stay on if the user enabled them. v3-fallback differs (see
+    # fallback_hijack.force_all_fallback) because aten FallbackKernel
+    # ops are NOT cudagraph-safe.
+    with inductor_config.patch({"cpp_wrapper": True}):
         yield
 
 

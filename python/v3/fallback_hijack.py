@@ -18,6 +18,12 @@ def force_all_fallback():
         for key in list(lowerings.keys()):
             if isinstance(key, torch._ops.OpOverload):
                 lowerings[key] = fallback_handler(key, add_to_fallback_set=False)
+        # triton.cudagraphs is explicitly False here (asymmetric with
+        # v3-stock): every aten op now lowers to a FallbackKernel which
+        # invokes the eager dispatcher + allocator, and most such ops
+        # are not cudagraph-safe (they may do cudaMalloc / synchronize
+        # inside the capture stream). Inductor's get_cpp_wrapper_config()
+        # would otherwise pass user's setting through.
         with inductor_config.patch({
             "cpp_wrapper": True,
             "epilogue_fusion": False,
