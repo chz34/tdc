@@ -11,6 +11,7 @@ compiled fn once with example args so the user's first real call is hot.
 from __future__ import annotations
 
 import contextlib
+import itertools
 import time
 from typing import Any, Callable
 
@@ -21,6 +22,33 @@ from .fallback_hijack import force_all_fallback
 
 
 _LAST_REPORT: dict | None = None
+_capture_counter = itertools.count()
+
+
+def _make_fresh_entry(fn: Callable) -> Callable:
+    """Build a thin wrapper whose CODE OBJECT identity is unique per call.
+
+    Why this matters: Dynamo's compile cache (extra_state.cpp) attaches
+    to the code object via _PyCode_SetExtra. Two torch.compile(fn) calls
+    in the same process share fn's code object and therefore its
+    cache_entry_list -- the second compile finds an entry from the first
+    (same guards, same arg types/shapes) and silently reuses the
+    compiled artifact, skipping our cm-scoped inductor config changes.
+
+    A `def` inside a Python function does NOT create a fresh code object
+    per call (Python interns the bytecode by source position), so a
+    plain closure wrap doesn't help. compile()/exec() from a unique
+    source string does -- each call yields a brand-new code object with
+    its own ExtraState, so Dynamo can't cross-pollute captures.
+    """
+    salt = next(_capture_counter)
+    src = (
+        f"def _v3_entry_{salt}(*args, **kwargs):\n"
+        f"    return fn(*args, **kwargs)\n"
+    )
+    ns: dict = {"fn": fn}
+    exec(compile(src, f"<v3_entry_{salt}>", "exec"), ns)
+    return ns[f"_v3_entry_{salt}"]
 _LAST_GRAPH_STATS: dict = {}
 
 
@@ -156,10 +184,11 @@ def _capture_common(fn, example_args, example_kwargs, fallback: bool):
     _LAST_GRAPH_STATS.clear()
     cm = force_all_fallback() if fallback else _stock_cpp_wrapper_config()
 
+    fresh_entry = _make_fresh_entry(fn)
     baseline_module_count = _snapshot_pycodecache_module_count()
     t0 = time.perf_counter()
     with cm, inductor_config.patch({"post_grad_custom_pre_pass": _stats_post_grad_pass}):
-        compiled = torch.compile(fn, backend="inductor", dynamic=True)
+        compiled = torch.compile(fresh_entry, backend="inductor", dynamic=True)
         # Prime the cache so the user's first call is hot.
         _ = compiled(*example_args, **example_kwargs)
     t1 = time.perf_counter()
