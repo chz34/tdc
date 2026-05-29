@@ -23,11 +23,12 @@ accelerator, tensors are allocated on DEVICE and each timed call is
 wrapped in SYNC() so wall-clock measurements reflect kernel completion,
 not just dispatch enqueueing.
 """
+import argparse
+import io
 import os
 import sys
 import time
 import traceback
-import io
 
 import torch
 import torch.nn.functional as F
@@ -579,7 +580,7 @@ def _export_capture(fn, example_inputs):
         return None
 
 
-def build_variants(fn, example_inputs):
+def build_variants(fn, example_inputs, only=None):
     """Return dict of {label: callable} for fn under each mode.
 
     Comment out a line to skip that mode entirely — the speed table and
@@ -588,12 +589,17 @@ def build_variants(fn, example_inputs):
     touching either of those functions.
 
     Key order here is the column order in the printed table.
+
+    ``only`` is an optional iterable of variant names to keep -- builders
+    not in ``only`` are skipped entirely (no compile cost paid). When
+    ``only`` is None all variants are built.
     """
     # torch.export: Dynamo bytecode trace once into a self-contained
     # gm + spec; ep.module() interprets it on each call. May fail per
     # workload (control flow torch.export refuses) — _export_capture
     # then returns None, and the speed table skips that cell while
     # keeping the column.
+    only_set = set(only) if only is not None else None
     variants = {}
     for name, builder in [
         ("eager",     lambda: fn),
@@ -612,12 +618,87 @@ def build_variants(fn, example_inputs):
         # ("v2 (wrapper)",   lambda: tdcv2.capture(fn, *example_inputs, wrapper=True)),
         ("export",         lambda: _export_capture(fn, example_inputs)),
     ]:
+        if only_set is not None and name not in only_set:
+            continue
         try:
             variants[name] = builder()
         except Exception:
             traceback.print_exc()
             variants[name] = None
     return variants
+
+
+# Authoritative ordered list of variant names. Mirrors the build_variants()
+# builder order so CLI listing and resolution stays in lock-step with what
+# the benchmark actually knows how to build.
+_ALL_VARIANT_NAMES = [
+    "eager", "dynamo", "aot_eager", "inductor",
+    "v3-stock", "v3-fallback",
+    "v2", "export",
+]
+
+
+def _resolve_variants(specs):
+    """Parse one-or-more --variants arguments into a deduplicated ordered
+    list of variant names. Supports exact match and case-insensitive
+    substring match ('v3' picks both v3-stock and v3-fallback). Errors
+    out on unrecognized patterns to fail loudly rather than silently run
+    fewer variants than the user asked for. Returns None when no spec
+    was given, meaning 'all variants'."""
+    if not specs:
+        return None
+    requested: list[str] = []
+    for spec in specs:
+        requested.extend(s.strip() for s in spec.split(",") if s.strip())
+    keep: list[str] = []
+    not_found: list[str] = []
+    for r in requested:
+        if r in _ALL_VARIANT_NAMES:
+            if r not in keep:
+                keep.append(r)
+            continue
+        r_lower = r.lower()
+        matches = [n for n in _ALL_VARIANT_NAMES if r_lower in n.lower()]
+        if not matches:
+            not_found.append(r)
+            continue
+        for m in matches:
+            if m not in keep:
+                keep.append(m)
+    if not_found:
+        raise SystemExit(
+            f"Unrecognized --variants entries: {not_found}\n"
+            f"Available: {_ALL_VARIANT_NAMES}"
+        )
+    return keep
+
+
+def _filter_workloads(specs):
+    """Parse --workloads arguments into a filtered WORKLOADS dict. Uses
+    case-insensitive substring match against the workload label so e.g.
+    '--workloads hf_GPT2' matches 'torchbench:hf_GPT2 (B=8)'. Errors out
+    on unrecognized patterns. Returns None when no spec was given."""
+    if not specs:
+        return None
+    requested: list[str] = []
+    for spec in specs:
+        requested.extend(s.strip() for s in spec.split(",") if s.strip())
+    keep: dict = {}
+    not_found: list[str] = []
+    for r in requested:
+        r_lower = r.lower()
+        matches = [label for label in WORKLOADS if r_lower in label.lower()]
+        if not matches:
+            not_found.append(r)
+            continue
+        for label in matches:
+            keep[label] = WORKLOADS[label]
+    if not_found:
+        raise SystemExit(
+            f"Unrecognized --workloads entries: {not_found}\n"
+            f"Available:\n  " + "\n  ".join(WORKLOADS)
+        )
+    return keep
 
 
 # Variants for which we MUST NOT torch._dynamo.reset() between calls.
@@ -715,16 +796,22 @@ def _compare_outputs(ref, got, atol=1e-3, rtol=1e-3):
     return True, ""
 
 
-def run_correctness_check():
+def run_correctness_check(only=None):
     """Run each variant once and compare its output against eager.
 
     Collects all results first, then prints them at once. Failures are
     reported but do not abort the run — the caller decides whether to
-    stop or continue with the speed table."""
+    stop or continue with the speed table.
+
+    ``only``, if set, restricts which variants are built. Eager is
+    always force-included as the comparison reference."""
     error_buf = io.StringIO()
     orig_stderr = sys.stderr
     results: list[tuple] = []
     all_ok = True
+    only_eff = (
+        list(dict.fromkeys(["eager", *only])) if only is not None else None
+    )
 
     for label, (fn, inputs) in WORKLOADS.items():
         if label in _TB_SKIP_CORRECTNESS:
@@ -733,7 +820,7 @@ def run_correctness_check():
         torch._dynamo.reset()
         sys.stderr = error_buf
         try:
-            variants = build_variants(fn, inputs)
+            variants = build_variants(fn, inputs, only=only_eff)
         finally:
             sys.stderr = orig_stderr
         if "eager" not in variants:
@@ -788,7 +875,7 @@ def run_correctness_check():
         print("\n*** Correctness check had failures — see lines above ***")
 
 
-def run_speed_table():
+def run_speed_table(only=None):
     """Print a per-workload x per-mode timing table.
 
     Column order is the insertion order of build_variants(); modes can
@@ -800,6 +887,8 @@ def run_speed_table():
     Errors during variant construction or timing are captured silently
     and printed after the complete table so tracebacks never interrupt
     the table layout.
+
+    ``only`` is the user-selected variant filter (or None for all).
     """
     # Discover the column structure once from a representative workload.
     sample_fn, sample_inputs = next(iter(WORKLOADS.values()))
@@ -807,7 +896,7 @@ def run_speed_table():
     orig_stderr = sys.stderr
     sys.stderr = error_buf
     try:
-        sample_variants = build_variants(sample_fn, sample_inputs)
+        sample_variants = build_variants(sample_fn, sample_inputs, only=only)
     finally:
         sys.stderr = orig_stderr
     variant_names = list(sample_variants.keys())
@@ -830,7 +919,7 @@ def run_speed_table():
         orig_stderr = sys.stderr
         sys.stderr = error_buf
         try:
-            variants = build_variants(fn, inputs)
+            variants = build_variants(fn, inputs, only=only)
         finally:
             sys.stderr = orig_stderr
         if list(variants.keys()) != variant_names:
@@ -938,7 +1027,8 @@ def _profile_one(label, callable_, inputs, out_path, n_warmup=5, n_iters=30):
 
 
 def run_profile(workload_label="attention QK (B=8,S=512,H=128)",
-                out_dir="prototypes/traces"):
+                out_dir="prototypes/traces",
+                only=None):
     """Profile the chosen workload under every mode that build_variants
     enables, exporting one Chrome-trace per mode for side-by-side
     timeline inspection in perfetto / chrome://tracing.
@@ -948,7 +1038,7 @@ def run_profile(workload_label="attention QK (B=8,S=512,H=128)",
     trace is produced for it.
     """
     fn, inputs = WORKLOADS[workload_label]
-    variants = build_variants(fn, inputs)
+    variants = build_variants(fn, inputs, only=only)
     stem = _safe_filename(workload_label)
 
     for name, callable_ in variants.items():
@@ -961,14 +1051,97 @@ def run_profile(workload_label="attention QK (B=8,S=512,H=128)",
             print(f"# profile: {name} skipped due to exception (see traceback above)")
 
 
+def _parse_cli_args(argv=None):
+    """Parse command-line arguments for the benchmark driver.
+
+    Designed so a bash launcher can shard work over many processes
+    (one variant x one workload per process) for full crash isolation:
+
+        for v in v3-stock v3-fallback v2 inductor; do
+            for w in hf_GPT2 BERT_pytorch llama; do
+                python prototypes/v2_benchmark.py \\
+                    --variants "$v" --workloads "$w" \\
+                    --skip-profile > out/${v}_${w}.log 2>&1
+            done
+        done
+
+    Each (variant, workload) pair runs in its own Python process; a
+    crash in v3-fallback's compile (e.g. the upstream proxy executor
+    codegen bug we saw on CUDA/NPU for hf_GPT2) only loses its own log,
+    not the whole sweep.
+    """
+    parser = argparse.ArgumentParser(
+        description="v2/v3 capture-vs-compile benchmark driver",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--variants", action="append", default=[],
+        help="Variant name(s) to include. May be repeated or comma-separated. "
+             "Case-insensitive substring match: 'v3' picks v3-stock + v3-fallback. "
+             "Default: all variants.",
+    )
+    parser.add_argument(
+        "--workloads", action="append", default=[],
+        help="Workload label substring(s). May be repeated or comma-separated. "
+             "e.g. '--workloads hf_GPT2' matches 'torchbench:hf_GPT2 (B=8)'. "
+             "Default: all workloads (which is the TDC_TORCHBENCH-gated set).",
+    )
+    parser.add_argument(
+        "--list", action="store_true",
+        help="List variant names and workload labels, then exit.",
+    )
+    parser.add_argument(
+        "--skip-correctness", action="store_true",
+        help="Skip the correctness-check vs eager pass.",
+    )
+    parser.add_argument(
+        "--skip-speed", action="store_true",
+        help="Skip the per-workload x per-variant timing table.",
+    )
+    parser.add_argument(
+        "--skip-profile", action="store_true",
+        help="Skip the profile / chrome-trace export step (default is to "
+             "profile the last workload).",
+    )
+    return parser.parse_args(argv)
+
+
 if __name__ == "__main__":
+    args = _parse_cli_args()
+
+    if args.list:
+        print("Variants:")
+        for n in _ALL_VARIANT_NAMES:
+            print(f"  {n}")
+        print("\nWorkloads:")
+        for label in WORKLOADS:
+            print(f"  {label}")
+        raise SystemExit(0)
+
+    only = _resolve_variants(args.variants)
+    filtered = _filter_workloads(args.workloads)
+    if filtered is not None:
+        # Replace WORKLOADS in place so the existing run_* code that
+        # iterates WORKLOADS directly sees the filtered subset.
+        WORKLOADS.clear()
+        WORKLOADS.update(filtered)
+    if not WORKLOADS:
+        raise SystemExit("No workloads selected -- nothing to run.")
+
     print("# v2 framework benchmark")
     print_device_banner()
+    if only is not None:
+        print(f"# variant filter: {only}")
+    if filtered is not None:
+        print(f"# workload filter: {list(WORKLOADS)}")
     # Reflect the live build_variants() output so commenting out a
     # backend (e.g. inductor on NPU) is reflected in the banner too.
     sample_fn, sample_inputs = next(iter(WORKLOADS.values()))
-    _names = list(build_variants(sample_fn, sample_inputs).keys())
+    _names = list(build_variants(sample_fn, sample_inputs, only=only).keys())
     print(f"# modes: {' / '.join(_names)}")
-    run_correctness_check()
-    run_speed_table()
-    run_profile(list(WORKLOADS)[-1])
+    if not args.skip_correctness:
+        run_correctness_check(only=only)
+    if not args.skip_speed:
+        run_speed_table(only=only)
+    if not args.skip_profile:
+        run_profile(list(WORKLOADS)[-1], only=only)
