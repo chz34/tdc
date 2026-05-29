@@ -84,6 +84,50 @@ class TestV3CaptureReport(unittest.TestCase):
         self.assertGreater(rep["fx_node_count"], 0)
         self.assertEqual(rep["fallback_node_count"], rep["fx_node_count"])
 
+    def test_stock_and_fallback_isolate_in_same_process(self):
+        """Running stock and fallback back-to-back must produce DIFFERENT
+        artifacts (different FxGraphCache hashes). This is what protects
+        us against the cache returning stock output to a fallback call
+        (or vice versa) when both variants compile the same FX graph.
+
+        Regression guard: if a future edit removes the
+        epilogue_fusion / max_fusion_size / freezing flags from
+        force_all_fallback's config patch, the cache hashes would
+        collapse and one variant would silently return the other's
+        artifact. This test fails in that case."""
+        def fn(x, y):
+            return ((x + y) * 0.5 - 1.0).relu()
+
+        x = torch.randn(4, 5, device=DEVICE)
+        y = torch.randn(4, 5, device=DEVICE)
+
+        # Order: stock -> fallback
+        torch._dynamo.reset()
+        tdcv3.capture(fn, x, y)
+        stock_path_1 = tdcv3.last_capture_report()["cpp_source_path"]
+
+        torch._dynamo.reset()
+        tdcv3.capture_fallback(fn, x, y)
+        fb_path = tdcv3.last_capture_report()["cpp_source_path"]
+
+        # Order: fallback -> stock (repeat to ensure stock path
+        # reproduces from cache, not from fallback's cached entry).
+        torch._dynamo.reset()
+        tdcv3.capture(fn, x, y)
+        stock_path_2 = tdcv3.last_capture_report()["cpp_source_path"]
+
+        self.assertNotEqual(
+            stock_path_1, fb_path,
+            "stock and fallback share the same cpp_source_path -- "
+            "FxGraphCache key collision, fallback config flags not "
+            "sufficient to distinguish from stock",
+        )
+        self.assertEqual(
+            stock_path_1, stock_path_2,
+            "stock capture reproduces a different path across calls -- "
+            "indicates non-deterministic cache key or state pollution",
+        )
+
     def test_fused_kernel_count_distinguishes_variants(self):
         """Strongest evidence that fallback really skips inductor fusion:
         inspect the generated cpp_wrapper source and count fused-kernel
