@@ -84,13 +84,14 @@ class TestV3CaptureReport(unittest.TestCase):
         self.assertGreater(rep["fx_node_count"], 0)
         self.assertEqual(rep["fallback_node_count"], rep["fx_node_count"])
 
-    def test_isolate_without_dynamo_reset_between_captures(self):
-        """Stronger regression: NO torch._dynamo.reset() between
-        captures (mirrors v2_benchmark.build_variants() ordering).
-        Without the closure wrap in _capture_common, the second capture
-        hits Dynamo's compile cache and returns the first capture's
-        artifact, so cpp_source_paths and fused_kernel_counts would
-        collapse. This test asserts they don't."""
+    def test_isolate_fresh_fn_partitions_dynamo_cache(self):
+        """Mirrors the v2_benchmark.build_variants() scenario: capture the
+        SAME fn under stock then fallback with NO torch._dynamo.reset()
+        between them. Without isolate_fresh_fn, Dynamo's per-code-object
+        cache_entry_list (extra_state.cpp) returns the first capture's
+        artifact for the second, silently collapsing the two variants
+        into one. isolate_fresh_fn gives each capture a fresh code
+        object so each gets its own ExtraState slot."""
         def fn(x, y):
             return ((x + y) * 0.5 - 1.0).relu()
 
@@ -98,9 +99,9 @@ class TestV3CaptureReport(unittest.TestCase):
         y = torch.randn(4, 5, device=DEVICE)
 
         torch._dynamo.reset()
-        tdcv3.capture(fn, x, y)
+        tdcv3.capture(tdcv3.isolate_fresh_fn(fn), x, y)
         stock = tdcv3.last_capture_report()
-        tdcv3.capture_fallback(fn, x, y)        # NO reset between!
+        tdcv3.capture_fallback(tdcv3.isolate_fresh_fn(fn), x, y)
         fb = tdcv3.last_capture_report()
 
         self.assertIsNotNone(stock["cpp_source_path"])
@@ -108,7 +109,7 @@ class TestV3CaptureReport(unittest.TestCase):
         self.assertNotEqual(
             stock["cpp_source_path"], fb["cpp_source_path"],
             "stock and fallback returned the same cpp_source_path -- "
-            "Dynamo compile cache leaked across captures",
+            "isolate_fresh_fn did not partition Dynamo's cache",
         )
         self.assertGreater(stock["fused_kernel_count"], 0)
         self.assertEqual(fb["fused_kernel_count"], 0)

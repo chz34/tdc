@@ -594,8 +594,13 @@ def build_variants(fn, example_inputs):
         ("dynamo",    lambda: torch.compile(fn, backend="eager", dynamic=True)),
         ("aot_eager", lambda: torch.compile(fn, backend="aot_eager", dynamic=True)),
         ("inductor",  lambda: torch.compile(fn, backend="inductor", dynamic=True)),
-        ("v3-stock",    lambda: tdcv3.capture(fn, *example_inputs)),
-        ("v3-fallback", lambda: tdcv3.capture_fallback(fn, *example_inputs)),
+        # v3 variants both compile the SAME fn in the same process; without
+        # isolate_fresh_fn each torch.compile would share fn.__code__'s
+        # Dynamo cache_entry_list, and the second capture would silently
+        # reuse the first's compiled artifact (see python/v3/compile.py's
+        # isolate_fresh_fn docstring).
+        ("v3-stock",    lambda: tdcv3.capture(tdcv3.isolate_fresh_fn(fn), *example_inputs)),
+        ("v3-fallback", lambda: tdcv3.capture_fallback(tdcv3.isolate_fresh_fn(fn), *example_inputs)),
         # ("v1",             lambda: _v1_capture(fn, example_inputs)),
         ("v2",    lambda: tdcv2.capture(fn, *example_inputs, wrapper=False)),
         # ("v2 (wrapper)",   lambda: tdcv2.capture(fn, *example_inputs, wrapper=True)),
