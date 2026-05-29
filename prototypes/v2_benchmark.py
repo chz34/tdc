@@ -458,9 +458,15 @@ if os.environ.get("TDC_TORCHBENCH", "0") == "1":
         ("squeezenet1_1", 64),
         ("BERT_pytorch",  64),
         ("llama",         64),
-        # ("llava",         64),
+        # ("llava",         64), // entry does not match, aot will remove all model
+        ("dlrm",         8),
+        ("cgan",         8),
+        ("stable_diffusion_unet",         8),
+        ("stable_diffusion_text_encoder",         8),
         ("timm_vision_transformer",         64),
         ("hf_GPT2",         8),
+        ("hf_Whisper",         8),
+
     ]:
         _label = f"torchbench:{_name} (B={_bs})"
         _loaded = _load_torchbench(_name, batch_size=_bs)
