@@ -460,13 +460,13 @@ if os.environ.get("TDC_TORCHBENCH", "0") == "1":
         ("BERT_pytorch",  64),
         ("llama",         64),
         # ("llava",         64), // entry does not match, aot will remove all model
-        ("dlrm",         8),
-        ("cgan",         8),
-        ("stable_diffusion_unet",         8),
-        ("stable_diffusion_text_encoder",         8),
+        ("dlrm",         128),
+        ("dcgan",         32),
+        ("stable_diffusion_unet",         None),
+        ("stable_diffusion_text_encoder",         None),
         ("timm_vision_transformer",         64),
         ("hf_GPT2",         8),
-        ("hf_Whisper",         8),
+        ("hf_Whisper",         1024),
 
     ]:
         _label = f"torchbench:{_name} (B={_bs})"
@@ -606,6 +606,13 @@ def build_variants(fn, example_inputs, only=None):
         ("dynamo",    lambda: torch.compile(fn, backend="eager", dynamic=True)),
         ("aot_eager", lambda: torch.compile(fn, backend="aot_eager", dynamic=True)),
         ("inductor",  lambda: torch.compile(fn, backend="inductor", dynamic=True)),
+        # Same backend as 'inductor', but mode="reduce-overhead" sets
+        # triton.cudagraphs=True. On CUDA/XPU it wraps the compiled graph
+        # in a cudagraph; on NPU it lands on torch_npu's monkey-patched
+        # cudagraphify -> npugraphify (aclgraph). On CPU the flag has no
+        # effect, so this column degrades to plain inductor.
+        ("reduce-overhead", lambda: torch.compile(
+            fn, backend="inductor", mode="reduce-overhead", dynamic=True)),
         # v3 variants both compile the SAME fn in the same process; without
         # isolate_fresh_fn each torch.compile would share fn.__code__'s
         # Dynamo cache_entry_list, and the second capture would silently
@@ -632,7 +639,7 @@ def build_variants(fn, example_inputs, only=None):
 # builder order so CLI listing and resolution stays in lock-step with what
 # the benchmark actually knows how to build.
 _ALL_VARIANT_NAMES = [
-    "eager", "dynamo", "aot_eager", "inductor",
+    "eager", "dynamo", "aot_eager", "inductor", "reduce-overhead",
     "v3-stock", "v3-fallback",
     "v2", "export",
 ]
