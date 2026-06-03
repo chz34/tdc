@@ -9,6 +9,12 @@ from .compile import (
     last_capture_report,
 )
 from .fallback_hijack import force_all_fallback
+from .fallback_backend import (
+    CppWrapperFallback,
+    CppWrapperFallbackCpu,
+    CppWrapperFallbackGpu,
+    make_fallback_backend,
+)
 
 __all__ = [
     "capture",
@@ -16,4 +22,8 @@ __all__ = [
     "isolate_fresh_fn",
     "last_capture_report",
     "force_all_fallback",
+    "make_fallback_backend",
+    "CppWrapperFallback",
+    "CppWrapperFallbackCpu",
+    "CppWrapperFallbackGpu",
 ]

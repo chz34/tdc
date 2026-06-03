@@ -466,7 +466,7 @@ if os.environ.get("TDC_TORCHBENCH", "0") == "1":
         ("stable_diffusion_text_encoder",         None),
         ("timm_vision_transformer",         64),
         ("hf_GPT2",         8),
-        ("hf_Whisper",         1024),
+        ("hf_Whisper",         8),
 
     ]:
         _label = f"torchbench:{_name} (B={_bs})"
@@ -620,6 +620,16 @@ def build_variants(fn, example_inputs, only=None):
         # isolate_fresh_fn docstring).
         ("v3-stock",    lambda: tdcv3.capture(tdcv3.isolate_fresh_fn(fn), *example_inputs)),
         ("v3-fallback", lambda: tdcv3.capture_fallback(tdcv3.isolate_fresh_fn(fn), *example_inputs)),
+        # Standalone fallback BACKEND (docs/specs/2026-06-03-...): all ops
+        # fallback + cpp_wrapper via stock compile_fx. Unlike the v3 capture
+        # variants above these are plain torch.compile(backend=...), so they
+        # are rebuilt with dynamo.reset like 'inductor' (NOT capture modes) and
+        # need no isolate_fresh_fn. boxed = every op via call_dispatcher
+        # (portable); stock = c-shim where available.
+        ("v3-fb-boxed", lambda: torch.compile(
+            fn, backend=tdcv3.make_fallback_backend("boxed"), dynamic=True)),
+        ("v3-fb-stock", lambda: torch.compile(
+            fn, backend=tdcv3.make_fallback_backend("stock"), dynamic=True)),
         # ("v1",             lambda: _v1_capture(fn, example_inputs)),
         ("v2",    lambda: tdcv2.capture(fn, *example_inputs, wrapper=False)),
         # ("v2 (wrapper)",   lambda: tdcv2.capture(fn, *example_inputs, wrapper=True)),
@@ -640,7 +650,7 @@ def build_variants(fn, example_inputs, only=None):
 # the benchmark actually knows how to build.
 _ALL_VARIANT_NAMES = [
     "eager", "dynamo", "aot_eager", "inductor", "reduce-overhead",
-    "v3-stock", "v3-fallback",
+    "v3-stock", "v3-fallback", "v3-fb-boxed", "v3-fb-stock",
     "v2", "export",
 ]
 
@@ -770,6 +780,17 @@ def _flatten_output(out):
         return []
     if isinstance(out, torch.Tensor):
         return [out]
+    # Support dict-like outputs (e.g. torchvision models returning dicts).
+    # Iterate keys in sorted order for stability across implementations.
+    try:
+        from collections.abc import Mapping
+    except Exception:
+        Mapping = dict
+    if isinstance(out, Mapping):
+        flat = []
+        for k in sorted(out.keys()):
+            flat.extend(_flatten_output(out[k]))
+        return flat
     if isinstance(out, (tuple, list)):
         flat = []
         for o in out:
