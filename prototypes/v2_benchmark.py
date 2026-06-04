@@ -64,12 +64,28 @@ def _detect_triton_available():
         return False, f"triton not installed ({e})"
     try:
         target = triton.runtime.driver.active.get_current_target()
-        return True, f"target={target}"
     except Exception as e:
         return False, (
-            f"triton has no active driver for {DEVICE.type} "
-            f"({type(e).__name__}: {str(e)[:80]})"
+            f"triton has no active driver ({type(e).__name__}: {str(e)[:80]})"
         )
+    # The benchmark's triton softmax kernel runs on DEVICE tensors, so triton
+    # must be usable for DEVICE *specifically*, not merely installed with some
+    # active driver. On a GPU box running with TDC_DEVICE=cpu, triton reports an
+    # active cuda driver but the kernel cannot launch on cpu tensors -- the
+    # workload would crash at run time. Gate on the active backend matching the
+    # selected device.
+    backend = getattr(target, "backend", None)
+    device_backends = {
+        "cuda": {"cuda", "hip"},  # torch uses the cuda device type for ROCm too
+        "xpu": {"xpu"},
+        "cpu": {"cpu"},  # only a triton-cpu build reports a cpu backend
+    }.get(DEVICE.type, set())
+    if backend not in device_backends:
+        return False, (
+            f"triton active backend {backend!r} does not match selected "
+            f"device {DEVICE.type!r}"
+        )
+    return True, f"target={target}"
 
 
 TRITON_AVAILABLE, TRITON_REASON = _detect_triton_available()
@@ -718,18 +734,36 @@ def _filter_workloads(specs):
     return keep
 
 
-# Variants for which we MUST NOT torch._dynamo.reset() between calls.
-# Two reasons end up in the same set:
-#   - v1 / v2: capture into their own C++ Trace; Dynamo's cache is
-#     irrelevant after capture, but resetting it is also harmless.
-#   - v3-stock / v3-fallback: the captured object is an OptimizedModule.
-#     dynamo.reset() invalidates its compile entry, the next call
-#     re-traces under whatever inductor_config is current at that moment
-#     (cpp_wrapper=False by default), and the variant silently degrades
-#     to a vanilla python-wrapper inductor compile. Verified empirically
-#     -- without this the v3 columns are indistinguishable from
-#     'inductor' because they ARE the same compile.
+# Capture modes bake their state at BUILD time, so a later variant's global
+# torch._dynamo.reset() corrupts them:
+#   - v1 / v2: capture into their own C++ Trace (Dynamo cache irrelevant after).
+#   - v3-stock / v3-fallback: the captured object is an OptimizedModule whose
+#     all-fallback / cpp_wrapper config came from a TRANSIENT context active
+#     only during the build. A reset invalidates its compile entry; the next
+#     call re-traces under the now-default inductor_config (cpp_wrapper=False,
+#     fusion on) and the variant silently degrades to vanilla inductor.
+# Not resetting the capture mode ITSELF is not enough -- a PRIOR variant's
+# reset already clobbered it. So we REBUILD capture modes right before use
+# (see _materialize_variant); the set just marks which need rebuilding.
 _CAPTURE_MODES = {"v1", "v2 (direct)", "v2 (wrapper)", "v3-stock", "v3-fallback"}
+
+
+def _materialize_variant(name, callable_, fn, inputs, error_buf, orig_stderr):
+    """Return a fresh callable to time/check for `name`.
+
+    Resets Dynamo first (clean state). Non-capture variants then recompile on
+    demand from the existing callable. Capture variants must be REBUILT, since
+    their build-time config does not survive the reset -- without this they
+    silently measure vanilla inductor instead of the intended path.
+    """
+    torch._dynamo.reset()
+    if name not in _CAPTURE_MODES:
+        return callable_
+    sys.stderr = error_buf
+    try:
+        return build_variants(fn, inputs, only=[name]).get(name)
+    finally:
+        sys.stderr = orig_stderr
 
 
 # ---------------------------------------------------------------------------
@@ -864,8 +898,11 @@ def run_correctness_check(only=None):
             if callable_ is None:
                 results.append((label, name, "skipped (variant not available)", True))
                 continue
-            if name not in _CAPTURE_MODES:
-                torch._dynamo.reset()
+            callable_ = _materialize_variant(
+                name, callable_, fn, inputs, error_buf, orig_stderr)
+            if callable_ is None:
+                results.append((label, name, "skipped (rebuild failed)", True))
+                continue
             with torch.no_grad():
                 sys.stderr = error_buf
                 try:
@@ -959,8 +996,11 @@ def run_speed_table(only=None):
             if callable_ is None:
                 times[name] = None
                 continue
-            if name not in _CAPTURE_MODES:
-                torch._dynamo.reset()
+            callable_ = _materialize_variant(
+                name, callable_, fn, inputs, error_buf, orig_stderr)
+            if callable_ is None:
+                times[name] = None
+                continue
             sys.stderr = error_buf
             try:
                 times[name] = time_iters(callable_, inputs)
