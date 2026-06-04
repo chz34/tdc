@@ -20,7 +20,11 @@ v4 通过 hook `compile_graph`,在编译时抓住 gm,让用户**同时拿到**:
 
 用户据此自行判断:直接跑 compiled,还是用其它方式处理 gm。
 
-非目标(YAGNI):CPU 支持(fx_wrapper 是 Triton-only,GPU 专属);gm 的具体下游
+设备:不预先按设备拦截。GPU/Triton 融合核可直接转 FX;CPU 上当宿主图无 cpp 融合核
+(全 fallback / 纯 extern)时也能转,有 cpp 融合核时由 inductor 在 prime 时抛
+"FX conversion only supports Triton kernels",我们让它自然冒出而不提前 guard。
+
+非目标(YAGNI):gm 的具体下游
 处理(v2 集成是后续工作,v4 只负责"拿到 gm");gm 与 compiled_fn 的精确一一映射
 元数据(只按顺序平铺)。
 
@@ -63,7 +67,7 @@ capture_fx(fn, *example_args)
 - 依赖:inductor 的 `device_codegens` / `init_backend_registration`、`CaptureFxWrapper`。
 
 ### 3.3 `capture_fx(fn, *example_args, dynamic=True) -> FxCaptureResult`
-- 职责:推断 device(必须 Triton 设备,否则报错);`with _capture_context(device)`
+- 职责:推断 device(不预先 guard,见 §1);`with _capture_context(device)`
   内 `torch.compile(fn, backend="inductor", dynamic=dynamic)` 并 prime 一次;返回
   `FxCaptureResult(compiled, gms=list(sink))`。
 - 接口:`capture_fx(fn, *example_args) -> FxCaptureResult`。
@@ -85,9 +89,11 @@ host_gm = r.gms[0]         # 选择2:拿融合产物宿主图自行处理(如喂
 
 ## 4. 约束与错误处理
 
-1. **GPU/Triton-only**:fx_wrapper 不能转换 CPU C++ 核。`capture_fx` 在非 Triton
-   设备上给出明确报错(prime 时会抛 "FX conversion only supports Triton kernels";
-   提前 guard,提示用 cuda/xpu)。
+1. **不预先按设备 guard**:GPU/Triton 融合核可直接转;CPU 上宿主图无 cpp 融合核时
+   也能转(全 fallback / 纯 extern),有 cpp 融合核时 inductor 在 prime 时抛
+   "FX conversion only supports Triton kernels" —— 让它自然冒出,不提前拦截。
+   (早期版本硬卡 cuda/xpu,实验证明 CPU 在 size_asserts/alignment_asserts 关闭后
+   也能转换无融合核的图,故移除该 guard。)
 2. **作用域恢复**:`try/finally` 确保 prime 抛异常时也恢复 fx_wrapper 配置、
    device_codegens、sink。进程全局 swap,非线程安全(同 v3-fb 约束)。
 2b. **关闭 size_asserts / alignment_asserts**:这两类断言由 inductor 以**裸字符串行**

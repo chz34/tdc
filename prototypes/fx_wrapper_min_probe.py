@@ -76,16 +76,11 @@ def main():
     if gm is None:
         raise SystemExit("no fx_wrapper gm captured (compile may have failed)")
 
-    print("=== captured fx_wrapper GraphModule ===")
-    print(gm.code.strip())
-    print("\n=== nodes (op / name / target) ===")
-    for n in gm.graph.nodes:
-        target = (
-            getattr(n.target, "__name__", n.target)
-            if n.op == "call_function"
-            else n.op
-        )
-        print(f"  {n.op:14s} {n.name:18s} {target}")
+    # Built-in fx debug dumps -- no manual node parsing needed.
+    print("=== FX IR (print(gm.graph): node / target / args / kwargs) ===")
+    print(gm.graph)  # richest single view; includes triton HOP launch kwargs
+    print("\n=== readable module (with shapes/dtypes) ===")
+    gm.print_readable()
 
 
 if __name__ == "__main__":

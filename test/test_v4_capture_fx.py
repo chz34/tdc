@@ -73,12 +73,10 @@ class TestCaptureFx(unittest.TestCase):
         self.assertEqual(ic.fx_wrapper, before_flag)
 
 
-class TestCaptureFxCpuGuard(unittest.TestCase):
-    def test_cpu_raises_clear_error(self):
-        a = torch.randn(8, 8)  # cpu
-        b = torch.randn(8, 8)
-        with self.assertRaises(RuntimeError):
-            tdcv4.capture_fx(_fn, a, b)
+# Note: capture_fx no longer pre-guards on device. On CPU a graph with a
+# cpp_fused kernel (like _fn) raises inductor's "FX conversion only supports
+# Triton kernels" at prime time; graphs without one (all-fallback / pure-extern)
+# convert fine. We don't assert that device-specific behavior here.
 
 
 if __name__ == "__main__":

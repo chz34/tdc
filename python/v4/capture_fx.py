@@ -13,7 +13,11 @@ either run the compiled fn directly or process the fused-op gm by other means
 
 Design: docs/specs/2026-06-04-v4-fx-capture-design.md.
 
-GPU/Triton only -- fx_wrapper cannot convert CPU C++ kernels.
+Works wherever inductor's host graph is FX-convertible: GPU/Triton fused kernels
+convert directly; on CPU it works for graphs whose host code has no fused C++
+kernel (e.g. all-fallback / pure-extern). A graph with a cpp_fused kernel will
+raise inductor's "FX conversion only supports Triton kernels" at prime time --
+we let that surface rather than pre-guarding on device.
 
     r = capture_fx(fn, *example_args)
     out = r.compiled(*example_args)   # run the normal fused result, or
@@ -33,8 +37,6 @@ from torch._inductor.codegen.wrapper_fxir import WrapperFxCodegen
 # so captured graphs cannot live on the instance -- they go to this context-local
 # sink, set up by _capture_context and appended to by compile_graph.
 _active_sink: "list | None" = None
-
-_TRITON_DEVICES = ("cuda", "xpu")
 
 
 class CaptureFxWrapper(WrapperFxCodegen):
@@ -121,13 +123,6 @@ def capture_fx(fn: Callable, *example_args: Any, dynamic: bool = True) -> FxCapt
     the captured graphs; the caller decides what to do with each.
     """
     device = _infer_device(example_args)
-    if device not in _TRITON_DEVICES:
-        raise RuntimeError(
-            f"capture_fx needs a Triton device {_TRITON_DEVICES}; got {device!r}. "
-            "fx_wrapper cannot convert CPU C++ kernels "
-            "('FX conversion only supports Triton kernels')."
-        )
-
     print("[v4.capture_fx] size_asserts & alignment_asserts disabled so the "
           "host graph is FX-convertible; the captured gm and compiled fn run "
           "without those runtime size/alignment checks.")
