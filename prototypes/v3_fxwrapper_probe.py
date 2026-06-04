@@ -111,11 +111,17 @@ def _categorize(node):
         return "alloc"
     if t is operator.getitem:
         return "getitem"
+    tmod = getattr(t, "__module__", "") or ""
     tname = getattr(t, "__name__", str(t))
     if "reinterpret" in tname or "as_strided" in tname:
         return "view/reinterpret"
-    if "sym" in tname.lower():
-        return "sym"
+    # SymInt size/grid arithmetic: operator.*/math.*/sympy/torch.sym_*.
+    # In the host wrapper graph these compute buffer sizes and launch grids
+    # (e.g. ceildiv(numel, BLOCK) = -(-numel // BLOCK)); they are infra, not
+    # compute, and a v2-style replay already models SymInt-derived literals.
+    if tmod in ("operator", "_operator", "math") or "sympy" in tmod \
+            or "sym" in tname.lower():
+        return "sym/size"
     return f"misc({tname})"
 
 
@@ -126,6 +132,36 @@ def _fmt_arg(a):
         return "[" + ", ".join(_fmt_arg(x) for x in a) + "]"
     s = repr(a)
     return s if len(s) <= 48 else s[:45] + "..."
+
+
+def _describe_triton(node):
+    """Resolve a triton_kernel_wrapper_mutation node into the data a v2-style
+    Trace step would have to capture: which compiled kernel, the launch grid,
+    and the tensor-arg -> buffer routing. The kernel itself is not inline -- it
+    lives in kernel_side_table indexed by kernel_idx."""
+    from torch._higher_order_ops.triton_kernel_wrap import kernel_side_table
+
+    kw = node.kwargs
+    idx = kw.get("kernel_idx")
+    name = None
+    try:
+        kernel = kernel_side_table.get_kernel(idx)
+        # JITFunction: .fn.__name__; Autotuner: .fn.fn.__name__
+        for chain in (("fn", "__name__"), ("__name__",), ("fn", "fn", "__name__")):
+            obj = kernel
+            for a in chain:
+                obj = getattr(obj, a, None)
+            if isinstance(obj, str):
+                name = obj
+                break
+        name = name or type(kernel).__name__
+    except Exception as e:  # GPU-only table; never let probing crash the dump
+        name = f"<unresolved: {type(e).__name__}>"
+
+    tkw = kw.get("kwargs", {})
+    args = {k: _fmt_arg(v) for k, v in tkw.items()} if isinstance(tkw, dict) else tkw
+    return {"kernel_idx": idx, "kernel": name, "grid": _fmt_arg(kw.get("grid")),
+            "args": args}
 
 
 def _dump_graph(gm, tag):
@@ -142,6 +178,11 @@ def _dump_graph(gm, tag):
             # for the triton HOP, kwargs carry kernel/grid -- show keys
             kw = "  kwargs={" + ", ".join(node.kwargs.keys()) + "}"
         print(f"  [{cat:20s}] {node.name:18s} = {tgt}({args}){kw}")
+        if cat == "triton_kernel_launch":
+            d = _describe_triton(node)
+            print(f"       -> kernel_idx={d['kernel_idx']} kernel={d['kernel']} "
+                  f"grid={d['grid']}")
+            print(f"       -> arg routing: {d['args']}")
 
     print(f"\n  -- category counts ({tag}) --")
     for c, n in cats.most_common():
@@ -150,7 +191,7 @@ def _dump_graph(gm, tag):
     # The design-relevant ratio for an fx_wrapper-based v3:
     aten = cats["aten_fallback"]
     triton = cats["triton_kernel_launch"]
-    infra = cats["alloc"] + cats["view/reinterpret"] + cats["getitem"] + cats["sym"]
+    infra = cats["alloc"] + cats["view/reinterpret"] + cats["getitem"] + cats["sym/size"]
     print(f"\n  -- v2-translator readiness ({tag}) --")
     print(f"     aten_fallback (callBoxed-ready) : {aten}")
     print(f"     triton_kernel_launch (NEW step) : {triton}")
@@ -180,6 +221,7 @@ def main():
     inductor_config.fx_wrapper = True
 
     total = Counter()
+    failures: list[tuple[str, str]] = []
     try:
         for name in selected:
             fn, inputs = _make_inputs(name)
@@ -187,15 +229,23 @@ def main():
             torch._dynamo.reset()
             current["tag"] = name
             before = len(captured)
-            compiled = torch.compile(fn, backend="inductor", dynamic=True)
-            with torch.no_grad():
-                out = compiled(*inputs)
-            ok = torch.allclose(out, ref, atol=1e-2, rtol=1e-2)
-            n_graphs = len(captured) - before
-            print(f"\n### workload={name}: numeric={'MATCH' if ok else 'MISMATCH'}, "
-                  f"fx graphs captured={n_graphs}")
-            for i, (tag, gm) in enumerate(captured[before:]):
-                total += _dump_graph(gm, f"{tag}#{i}")
+            # Isolate each workload: an fx_wrapper conversion gap in one
+            # (e.g. sdpa's assert_size_stride raw line) must not abort the run
+            # or drop the aggregate over the workloads that did convert.
+            try:
+                compiled = torch.compile(fn, backend="inductor", dynamic=True)
+                with torch.no_grad():
+                    out = compiled(*inputs)
+                ok = torch.allclose(out, ref, atol=1e-2, rtol=1e-2)
+                n_graphs = len(captured) - before
+                print(f"\n### workload={name}: numeric={'MATCH' if ok else 'MISMATCH'}"
+                      f", fx graphs captured={n_graphs}")
+                for i, (tag, gm) in enumerate(captured[before:]):
+                    total += _dump_graph(gm, f"{tag}#{i}")
+            except Exception as e:
+                last = str(e).strip().splitlines()[-1][:120]
+                failures.append((name, last))
+                print(f"\n### workload={name}: FAILED to convert -> {last}")
     finally:
         WrapperFxCodegen.compile_graph = orig
 
@@ -208,6 +258,10 @@ def main():
           f"{aten}/{denom} = {aten / denom:.0%}")
     print("  -> share of kernel-bearing nodes v2 translator already handles "
           "vs needs a new Triton-launch step.")
+    if failures:
+        print(f"\n  -- fx_wrapper conversion gaps ({len(failures)}) --")
+        for name, msg in failures:
+            print(f"     {name}: {msg}")
 
 
 if __name__ == "__main__":
