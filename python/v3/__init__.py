@@ -8,7 +8,11 @@ from .compile import (
     isolate_fresh_fn,
     last_capture_report,
 )
-from .fallback_hijack import force_all_fallback
+from .fallback_hijack import (
+    NO_FUSION_CONFIG,
+    force_all_fallback,
+    force_all_fallback_lowerings,
+)
 from .fallback_backend import (
     CppWrapperFallback,
     CppWrapperFallbackCpu,
@@ -22,6 +26,8 @@ __all__ = [
     "isolate_fresh_fn",
     "last_capture_report",
     "force_all_fallback",
+    "force_all_fallback_lowerings",
+    "NO_FUSION_CONFIG",
     "make_fallback_backend",
     "CppWrapperFallback",
     "CppWrapperFallbackCpu",
