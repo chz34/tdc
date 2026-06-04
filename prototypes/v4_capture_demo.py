@@ -33,6 +33,8 @@ def main():
     a = torch.randn(128, 128, device=DEVICE)
     b = torch.randn(128, 128, device=DEVICE)
 
+    ref = fn(a, b)
+
     with force_all_fallback_lowerings(), inductor_config.patch(
         {"fx_wrapper": True, "cpp_wrapper": False,
             "size_asserts": False, "alignment_asserts": False, **NO_FUSION_CONFIG}
@@ -41,7 +43,10 @@ def main():
 
         # Choice 1: run the normal fused result.
         out = result.compiled(a, b)
-        print("compiled output sum:", float(out.sum()))
+        print("compiled output:", out)
+        print("ref output:", ref)
+        assert torch.allclose(out, fn(a, b), atol=1e-3), "numeric mismatch"
+
 
     # Choice 2: inspect / process the captured host gm(s) -- built-in fx dumps.
     print(f"\ncaptured {len(result.gms)} host gm(s)")
