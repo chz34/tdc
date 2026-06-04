@@ -74,9 +74,13 @@ def _capture_context(device: str):
     if device not in device_codegens:
         raise RuntimeError(f"no inductor backend registered for device {device!r}")
     dc = device_codegens[device]
-    if dc.fx_wrapper_codegen is None:
-        raise RuntimeError(f"device {device!r} has no fx_wrapper_codegen registered")
 
+    # CaptureFxWrapper IS a subclass of torch's built-in WrapperFxCodegen, so we
+    # install it as the fx wrapper for ANY inductor-supporting device -- even
+    # ones that registered scheduling/wrapper but NOT an fx_wrapper_codegen
+    # (e.g. a GPU backend that never opted in). The default fx codegen is
+    # device-agnostic; it converts whatever Triton kernels the device emits.
+    # On exit we restore whatever was there before (often None).
     saved_wrapper = dc.fx_wrapper_codegen
     saved_sink = _active_sink
     sink: list = []

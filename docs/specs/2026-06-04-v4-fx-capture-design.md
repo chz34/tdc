@@ -60,9 +60,16 @@ capture_fx(fn, *example_args)
 - 依赖:`WrapperFxCodegen`;模块级的 `_active_sink`(context-local 列表)。
 
 ### 3.2 `_capture_context(device)`(上下文管理器)
-- 职责(`try/finally` 全恢复):patch `inductor_config.fx_wrapper=True`;snapshot
-  并 swap `device_codegens[device].fx_wrapper_codegen = CaptureFxWrapper`;把
-  `_active_sink` 指向一个新列表,退出时还原为先前值(支持嵌套/复用安全)。
+- 职责(`try/finally` 全恢复):patch `inductor_config.fx_wrapper=True`(连同
+  size_asserts/alignment_asserts=False);snapshot 并 swap
+  `device_codegens[device].fx_wrapper_codegen = CaptureFxWrapper`;把 `_active_sink`
+  指向一个新列表,退出时还原为先前值(支持嵌套/复用安全)。
+- **为没注册 fx_wrapper 的后端兜底**:`CaptureFxWrapper` 是 torch 内置
+  `WrapperFxCodegen` 的子类,所以**任何有 inductor 支持的设备**(哪怕只注册了
+  scheduling/wrapper、`fx_wrapper_codegen is None`,如某些 GPU 后端)都能用——
+  直接装入 `CaptureFxWrapper` 当默认 fx wrapper(内置 fx codegen 设备无关,转换
+  设备产出的 Triton 核)。退出时恢复为原值(常是 None)。只在 `device not in
+  device_codegens`(连 inductor 都没注册)时报错。
 - 接口:`with _capture_context("cuda") as sink: ...`,sink 是收集 gm 的列表。
 - 依赖:inductor 的 `device_codegens` / `init_backend_registration`、`CaptureFxWrapper`。
 
