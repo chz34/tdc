@@ -53,9 +53,18 @@ def main():
     # force_all_fallback did), FallbackKernel takes the cpp_wrapper
     # runtime-dispatch path and emits a raw Python op call the FX converter
     # cannot consume.
+    #
+    # size_asserts / alignment_asserts must be OFF: inductor emits those as RAW
+    # string lines (assert_size_stride(...) / "# ... not aligned"), and
+    # FxConverter only accepts structured WrapperLines -- a raw line aborts FX
+    # conversion. Disabling them is what lets an all-fallback graph convert on
+    # CPU. Trade-off: the captured gm runs without those runtime checks.
+    print("[fx_wrapper_min_probe] size_asserts & alignment_asserts disabled "
+          "(raw assert/comment lines are not FX-convertible)")
     with force_all_fallback_lowerings():
         with inductor_config.patch(
-            {"fx_wrapper": True, "cpp_wrapper": False, **NO_FUSION_CONFIG}
+            {"fx_wrapper": True, "cpp_wrapper": False,
+             "size_asserts": False, "alignment_asserts": False, **NO_FUSION_CONFIG}
         ):
             compiled = torch.compile(fn, backend="inductor", dynamic=True)
             # Prime INSIDE the patch -- torch.compile is lazy, the actual

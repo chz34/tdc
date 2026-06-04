@@ -40,11 +40,17 @@ setup(
     name="torch_dispatch_capture",
     version="0.0.1",
     description="C++ dispatcher-level capture/replay for PyTorch (PoC)",
-    packages=["torch_dispatch_capture", "torch_dispatch_capture.v2", "torch_dispatch_capture.v3"],
+    packages=[
+        "torch_dispatch_capture",
+        "torch_dispatch_capture.v2",
+        "torch_dispatch_capture.v3",
+        "torch_dispatch_capture.v4",
+    ],
     package_dir={
         "torch_dispatch_capture": "python",
         "torch_dispatch_capture.v2": "python/v2",
         "torch_dispatch_capture.v3": "python/v3",
+        "torch_dispatch_capture.v4": "python/v4",
     },
     ext_modules=[ext],
     cmdclass={"build_ext": BuildExtension},
