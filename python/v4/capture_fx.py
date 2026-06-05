@@ -31,11 +31,19 @@ we let that surface rather than pre-guarding on device.
 from __future__ import annotations
 
 import contextlib
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 import torch
 from torch._inductor.codegen.wrapper_fxir import WrapperFxCodegen
+
+
+# Child of torch's inductor logger: TORCH_LOGS=inductor puts torch._inductor at
+# INFO (+inductor -> DEBUG), which this child inherits and propagates to torch's
+# log handler. Logging at INFO thus prints iff TORCH_LOGS includes inductor; with
+# no TORCH_LOGS the logger sits at WARNING and the line is suppressed for free.
+_log = logging.getLogger("torch._inductor.compile_with_gm_backend")
 
 
 # CaptureFxWrapper instances are created fresh per inductor compile (.create()),
@@ -156,6 +164,10 @@ class BackendFxWrapper(WrapperFxCodegen):
     def compile_graph(self, gm):
         if _active_gm_backend is None:
             return super().compile_graph(gm)
+        # Dump the host graph we are about to hand to the user backend; INFO so it
+        # prints only when TORCH_LOGS includes inductor (gm.graph __str__ is via %s,
+        # deferred -- no cost when suppressed).
+        _log.info("compile_with_gm_backend: host gm before gm_backend:\n%s", gm.graph)
         example_inputs = [
             n.meta["val"] for n in gm.graph.nodes if n.op == "placeholder"
         ]
