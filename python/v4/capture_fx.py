@@ -6,10 +6,15 @@ fallbacks) -- i.e. inductor's fused output expressed as a graph. That gm is only
 reachable at the WrapperFxCodegen.compile_graph hook; the upper torch.compile
 object does not expose it (see DESIGN.md section 18).
 
-capture_fx hooks compile_graph (via a clean registered subclass) and returns
-both the normal torch.compile callable AND the captured gm(s), so the caller can
-either run the compiled fn directly or process the fused-op gm by other means
-(e.g. feed it to v2).
+Two entry points:
+  - capture_fx(fn, *example_args): returns both the normal torch.compile callable
+    AND the captured host gm(s), so the caller can run the compiled fn or process
+    the gm by other means (e.g. feed it to v2).
+  - compile_with_gm_backend(fn, gm_backend): returns a callable that routes the
+    host gm through a user backend on every (re)compile, callable with the
+    ORIGINAL fn args (the front-end flattens). Robust to shape/structure changes.
+
+Both hook WrapperFxCodegen.compile_graph via a clean registered subclass.
 
 Design: docs/specs/2026-06-04-v4-fx-capture-design.md.
 
@@ -38,6 +43,40 @@ from torch._inductor.codegen.wrapper_fxir import WrapperFxCodegen
 # sink, set up by _capture_context and appended to by compile_graph.
 _active_sink: "list | None" = None
 
+# Backend installed by compile_with_gm_backend (approach B); BackendFxWrapper
+# reads it. Context-local, like _active_sink.
+_active_gm_backend: "Callable | None" = None
+
+# fx_wrapper on + the asserts that emit raw (non-FX) lines off. Shared by both
+# the capture and the backend paths.
+_FX_CONFIG = {"fx_wrapper": True, "size_asserts": False, "alignment_asserts": False}
+
+
+@contextlib.contextmanager
+def _install_fx_wrapper(device: str, wrapper_cls: type):
+    """Swap `wrapper_cls` in as the device's fx wrapper + enable _FX_CONFIG,
+    restoring both on exit. wrapper_cls subclasses the built-in WrapperFxCodegen
+    (device-agnostic), so this works for ANY inductor-supporting device --
+    including ones that never registered an fx_wrapper_codegen. NOT thread-safe
+    (process-global swap)."""
+    import torch._inductor.config as inductor_config
+    from torch._inductor.codegen.common import (
+        device_codegens,
+        init_backend_registration,
+    )
+
+    init_backend_registration()
+    if device not in device_codegens:
+        raise RuntimeError(f"no inductor backend registered for device {device!r}")
+    dc = device_codegens[device]
+    saved_wrapper = dc.fx_wrapper_codegen
+    dc.fx_wrapper_codegen = wrapper_cls
+    try:
+        with inductor_config.patch(_FX_CONFIG):
+            yield
+    finally:
+        dc.fx_wrapper_codegen = saved_wrapper
+
 
 class CaptureFxWrapper(WrapperFxCodegen):
     """Clean WrapperFxCodegen subclass that records each compiled gm.
@@ -57,48 +96,16 @@ class CaptureFxWrapper(WrapperFxCodegen):
 
 @contextlib.contextmanager
 def _capture_context(device: str):
-    """Install CaptureFxWrapper + fx_wrapper for `device` and yield the gm sink.
-
-    Restores config / registry / sink on exit, even on exception. Swaps
-    process-global inductor registries -- not thread-safe (same constraint as
-    the v3 fallback backend); fine for single-threaded capture.
-    """
+    """Install CaptureFxWrapper for `device` and yield the gm sink. Restores the
+    sink + registry + config on exit (even on exception)."""
     global _active_sink
-    import torch._inductor.config as inductor_config
-    from torch._inductor.codegen.common import (
-        device_codegens,
-        init_backend_registration,
-    )
-
-    init_backend_registration()
-    if device not in device_codegens:
-        raise RuntimeError(f"no inductor backend registered for device {device!r}")
-    dc = device_codegens[device]
-
-    # CaptureFxWrapper IS a subclass of torch's built-in WrapperFxCodegen, so we
-    # install it as the fx wrapper for ANY inductor-supporting device -- even
-    # ones that registered scheduling/wrapper but NOT an fx_wrapper_codegen
-    # (e.g. a GPU backend that never opted in). The default fx codegen is
-    # device-agnostic; it converts whatever Triton kernels the device emits.
-    # On exit we restore whatever was there before (often None).
-    saved_wrapper = dc.fx_wrapper_codegen
     saved_sink = _active_sink
     sink: list = []
-    dc.fx_wrapper_codegen = CaptureFxWrapper
     _active_sink = sink
     try:
-        # size_asserts / alignment_asserts emit RAW string lines
-        # (assert_size_stride(...) / "# ... not aligned") that FxConverter
-        # cannot consume (it only accepts structured WrapperLines), so an extern
-        # kernel like sdpa/conv would abort FX conversion. Disable them so the
-        # host graph is FX-convertible. Trade-off: the captured gm and the
-        # returned compiled fn run without those runtime size/alignment checks.
-        with inductor_config.patch(
-            {"fx_wrapper": True, "size_asserts": False, "alignment_asserts": False}
-        ):
+        with _install_fx_wrapper(device, CaptureFxWrapper):
             yield sink
     finally:
-        dc.fx_wrapper_codegen = saved_wrapper
         _active_sink = saved_sink
 
 
@@ -135,3 +142,65 @@ def capture_fx(fn: Callable, *example_args: Any, dynamic: bool = True) -> FxCapt
         compiled(*example_args)  # prime -> triggers compile_graph -> capture
         gms = list(sink)
     return FxCaptureResult(compiled=compiled, gms=gms)
+
+
+# ---------------------------------------------------------------------------
+# compile_with_gm_backend (approach B): re-route the inductor host gm through a
+# user backend on EVERY (re)compile, robust to shape/structure changes.
+# ---------------------------------------------------------------------------
+class BackendFxWrapper(WrapperFxCodegen):
+    """compile_graph applies the active gm_backend to the host gm instead of
+    returning gm.forward. example_inputs are taken from the placeholder metas
+    (symints + fake tensors) -- the gm's flattened inputs."""
+
+    def compile_graph(self, gm):
+        if _active_gm_backend is None:
+            return super().compile_graph(gm)
+        example_inputs = [
+            n.meta["val"] for n in gm.graph.nodes if n.op == "placeholder"
+        ]
+        return _active_gm_backend(gm, example_inputs)
+
+
+@contextlib.contextmanager
+def _backend_context(device: str, gm_backend: Callable):
+    global _active_gm_backend
+    saved = _active_gm_backend
+    _active_gm_backend = gm_backend
+    try:
+        with _install_fx_wrapper(device, BackendFxWrapper):
+            yield
+    finally:
+        _active_gm_backend = saved
+
+
+def compile_with_gm_backend(
+    fn: Callable, gm_backend: Callable, dynamic: bool = True
+) -> Callable:
+    """Return a callable that runs fn but routes inductor's host FX graph through
+    `gm_backend`. Robust (approach B): the capture context is re-entered on EVERY
+    call, so any (re)compile -- including for a new shape/structure after the
+    first -- still applies gm_backend (no degradation to vanilla inductor). No
+    example args needed: it compiles lazily on the first call, inside the context.
+
+    Call the returned callable with the ORIGINAL fn args; the Dynamo/AOT
+    front-end flattens them to the gm's inputs, so the caller never handles the
+    flattened (symint + tensor) graph inputs.
+
+    gm_backend(gm, example_inputs) -> callable:
+      gm            -- inductor host GraphModule (alloc + triton HOP + fallback)
+      example_inputs-- the gm's placeholder metas (symints + fake tensors)
+      returns       -- a callable taking the flattened inputs (gm.forward's
+                       positional convention); must handle host-graph nodes.
+
+    Cost: a per-call inductor_config.patch + fx-wrapper swap (microseconds even
+    on cache hits); process-global, not thread-safe.
+    """
+    compiled = torch.compile(fn, backend="inductor", dynamic=dynamic)
+
+    def runner(*args: Any, **kwargs: Any):
+        device = _infer_device(args)
+        with _backend_context(device, gm_backend):
+            return compiled(*args, **kwargs)
+
+    return runner

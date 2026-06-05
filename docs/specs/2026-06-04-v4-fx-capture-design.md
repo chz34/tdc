@@ -127,3 +127,43 @@ host_gm = r.gms[0]         # 选择2:拿融合产物宿主图自行处理(如喂
 HOP(融合核启动)、aten `OpOverload` fallback。把它喂给 v2 需要 v2 translator 新增
 "Triton-kernel-launch step"(从 C++ 启动 cubin),详见
 `2026-05-28-v3-design.md` / fx_wrapper 版 v3 的讨论。v4 只负责把 gm 交到用户手里。
+
+## 7. `compile_with_gm_backend`(方案 B:把宿主 gm 路由给自定义后端)
+
+需求:对捕获的宿主 gm 应用另一个"以 gm 为输入"的后端,得到一个新 callable,**用户只用
+原始 fn 参数调,不感知图的扁平化输入**。
+
+关键洞察:**与其把 gm 抽出来在外面重编译(会丢掉 AOT/Dynamo 的扁平化前端),不如在
+`compile_graph` hook 里就把后端应用上**——这样扁平化前端原样保留。gm 的 example 输入
+直接从 placeholder 的 `meta["val"]`(symint + fake tensor)取。
+
+```python
+class BackendFxWrapper(WrapperFxCodegen):
+    def compile_graph(self, gm):
+        example_inputs = [n.meta["val"] for n in gm.graph.nodes if n.op == "placeholder"]
+        return gm_backend(gm, example_inputs)   # 顶替 gm.forward 的位置
+
+def compile_with_gm_backend(fn, gm_backend, dynamic=True) -> Callable:
+    compiled = torch.compile(fn, backend="inductor", dynamic=dynamic)
+    def runner(*args, **kwargs):
+        with _backend_context(_infer_device(args), gm_backend):  # 每次调用都重进上下文
+            return compiled(*args, **kwargs)
+    return runner
+```
+
+**鲁棒性(方案 B 的核心)**:`runner` **每次调用都重进 capture 上下文**,所以任何
+(重)编译——包括首次之后因 shape/dtype/structure 变化触发的——都在上下文内,
+仍把宿主 gm 路由给 `gm_backend`,**不会降级回普通 inductor**。对照"方案 A(只在 prime
+时进上下文)":上下文退出后的重编译会丢掉自定义后端(`dynamic=True` 把降级从"每形状"
+缩到"每结构",但结构变化仍降级)。
+
+- **无需 example_args**:lazy 编译,首次调用在上下文内触发。
+- **用户只给原始参数**:`gm_backend` 返回的 callable 吃扁平输入(symint+tensor,
+  gm.forward 约定),而 Dynamo/AOT 前端负责"原始参数 → 扁平输入"。
+- **代价**:每次调用一次 `inductor_config.patch` + fx-wrapper swap(微秒级,cache hit
+  也付);进程全局,非线程安全。
+- `gm_backend` 内部要能处理宿主图节点(triton HOP / alloc / fallback);inductor 本身
+  不行(它期望 aten 图)。
+
+与 `capture_fx` 共用 `_install_fx_wrapper`(swap wrapper + `_FX_CONFIG`)。`capture_fx`
+**存** gm,`compile_with_gm_backend` **替换** gm 的执行。

@@ -79,5 +79,49 @@ class TestCaptureFx(unittest.TestCase):
 # convert fine. We don't assert that device-specific behavior here.
 
 
+def _mm(a, b):
+    # pure extern (no cpp_fused kernel) so it converts to FX on CPU too.
+    return torch.mm(a, b)
+
+
+class TestCompileWithGmBackend(unittest.TestCase):
+    """Approach B: route the host gm through a backend on every (re)compile."""
+
+    def setUp(self):
+        # Isolate from other tests' compilations of _mm (Dynamo caches per code
+        # object), so recompile counts are deterministic.
+        torch._dynamo.reset()
+
+    def test_numeric_and_uses_original_args(self):
+        seen = {"n": 0}
+
+        def backend(gm, example_inputs):
+            seen["n"] += 1
+            return gm.forward  # passthrough backend
+
+        f2 = tdcv4.compile_with_gm_backend(_mm, gm_backend=backend, dynamic=True)
+        a = torch.randn(32, 32, device=DEVICE)
+        b = torch.randn(32, 32, device=DEVICE)
+        out = f2(a, b)  # called with ORIGINAL args
+        self.assertTrue(torch.allclose(out, _mm(a, b)))
+        self.assertGreaterEqual(seen["n"], 1)
+
+    def test_recompile_still_routes_through_backend(self):
+        # A recompile after the first (here: dtype change) must still hit the
+        # backend -- that is the whole point of approach B (no degradation).
+        seen = {"n": 0}
+
+        def backend(gm, example_inputs):
+            seen["n"] += 1
+            return gm.forward
+
+        f2 = tdcv4.compile_with_gm_backend(_mm, gm_backend=backend, dynamic=True)
+        a32 = torch.randn(16, 16, device=DEVICE)
+        a64 = torch.randn(16, 16, device=DEVICE, dtype=torch.float64)
+        self.assertTrue(torch.allclose(f2(a32, a32), _mm(a32, a32)))
+        self.assertTrue(torch.allclose(f2(a64, a64), _mm(a64, a64)))
+        self.assertGreaterEqual(seen["n"], 2)  # both compiles went through backend
+
+
 if __name__ == "__main__":
     unittest.main()

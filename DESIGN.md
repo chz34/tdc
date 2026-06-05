@@ -2250,3 +2250,22 @@ Wrapper IR Line;上边界时 gm 在 `FxConverter.generate()` 才诞生,经
 里存引用(`gm.code` 文本则经 `save_output_code` 外泄)。v4 正是在 `compile_graph`
 hook 抓 gm。`gm.forward` 而非 `gm` 作返回值是为了跳过 `GraphModule.__call__`
 (`call_wrapped` + `nn.Module._call_impl` 的 hook 派发,实测约 +2us/call)。
+
+### 18.4 嵌套 compile 透传:不能靠再 compile 复用 fx_wrapper gm
+
+一个常见误区:拿 v4 的 `result.compiled`(一个 fx_wrapper 编译过的 OptimizedModule)
+再喂给 `torch.compile(result.compiled, backend=...)`,以为新后端会拿到那张 fx_wrapper
+宿主 gm。**不会。** Dynamo 对嵌套 torch.compile 是"看穿"的:`result.compiled` 带
+`_torchdynamo_inline` 指向原始 fn,外层 trace 时**内联展开原始 fn 重新 trace**,新后端
+拿到的是**全新的 aten 图**,与 fx_wrapper 宿主图无关(实测:新 backend 收到
+`[aten.mm, aten.add, aten.relu, aten.mul]`,没有 `triton_kernel_wrapper_mutation` /
+`empty_strided`)。而且 capture 时的 fx_wrapper config 早已退出,外层只是一次普通
+inductor 编译。
+
+结论:
+- **`result.compiled` 不可嵌套复用其内部 gm** —— 再 compile 等于对原 fn 重编译一遍,
+  白做且拿不到融合图;
+- 要对捕获的融合宿主图应用别的后端,**只能直接用 `result.gms[i]`**(GraphModule)喂给
+  一个以 gm 为输入的后端 `backend(gm, flattened_inputs)`,且:① 输入要用 gm 的扁平化
+  placeholder(symint + tensor,非原始 fn 参数);② 后端要能处理宿主图节点(triton HOP /
+  alloc / aten fallback),inductor 本身不行(它期望 aten 图)。
