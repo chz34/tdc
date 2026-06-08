@@ -164,6 +164,15 @@ class BackendFxWrapper(WrapperFxCodegen):
     def compile_graph(self, gm):
         if _active_gm_backend is None:
             return super().compile_graph(gm)
+        # The host gm uses the AOT/inductor convention meta["val"]; Dynamo-style
+        # backends read meta["example_value"]. Mirror val -> example_value so such
+        # a backend finds the fakes it expects. Safe: compile_graph is inductor's
+        # last touch of this gm (we only ADD a key, don't change val / graph /
+        # gm.code), and we skip val=None nodes (0-return ops) to match Dynamo,
+        # which leaves example_value unset on value-less nodes.
+        for n in gm.graph.nodes:
+            if "example_value" not in n.meta and n.meta.get("val") is not None:
+                n.meta["example_value"] = n.meta["val"]
         # Dump the host graph we are about to hand to the user backend; INFO so it
         # prints only when TORCH_LOGS includes inductor (gm.graph __str__ is via %s,
         # deferred -- no cost when suppressed).
