@@ -271,7 +271,7 @@ def _assert_host_gm_all_extern(gm) -> None:
 
 
 @contextlib.contextmanager
-def enable_device_via_fallback(device: str, gm_backend: Callable):
+def enable_device_via_fallback(device: str, gm_backend: "Callable | None" = None):
     """Bring up inductor on a device that has NO codegen backend registered,
     with zero device codegen:
       - register the device with a no-op scheduling (fused kernel -> hard error),
@@ -280,6 +280,11 @@ def enable_device_via_fallback(device: str, gm_backend: Callable):
         dispatched aten on the device);
       - route the resulting all-extern host gm to gm_backend via fx_wrapper,
         after asserting it really is all-extern.
+
+    gm_backend is optional: when omitted, the host gm runs directly via
+    gm.forward (dispatched aten on the device, with inductor's memory planning) --
+    i.e. pure enablement, no backend substitution. Pass a gm_backend(gm,
+    example_inputs) -> callable only if you want to process/replace the host graph.
 
     This is an ENABLEMENT path (eager-grade perf, no fusion), not a perf path.
     The device must have aten kernels for every op it runs. Restores all swapped
@@ -302,6 +307,8 @@ def enable_device_via_fallback(device: str, gm_backend: Callable):
 
     def _validating_backend(gm, example_inputs):
         _assert_host_gm_all_extern(gm)
+        if gm_backend is None:
+            return gm.forward  # default: run the host graph directly
         return gm_backend(gm, example_inputs)
 
     had = device in device_codegens
