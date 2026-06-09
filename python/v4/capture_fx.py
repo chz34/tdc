@@ -232,6 +232,37 @@ def compile_with_gm_backend(
 # enable_device_via_fallback: minimal inductor bring-up for a device with NO
 # codegen backend -- all-fallback (no fusion) + fx_wrapper to a user backend.
 # ---------------------------------------------------------------------------
+
+# Self-contained all-fallback helpers (v4 stays a single-file pure-Python module,
+# no cross-version deps). Replacing every OpOverload lowering with its fallback
+# handler means no op is fused, so the host graph is all-extern and FX-convertible;
+# NO_FUSION_CONFIG turns off the remaining fusion / cudagraph / freezing knobs.
+# NOT thread-safe (patches the module-level lowerings dict).
+NO_FUSION_CONFIG = {
+    "epilogue_fusion": False,
+    "max_fusion_size": 1,
+    "triton.cudagraphs": False,
+    "freezing": False,
+}
+
+
+@contextlib.contextmanager
+def force_all_fallback_lowerings():
+    """Replace every OpOverload lowering with its fallback_handler (no fusion),
+    restoring the lowerings dict on exit. No config changes."""
+    from torch._inductor.lowering import fallback_handler, lowerings
+
+    saved = dict(lowerings)
+    try:
+        for key in list(lowerings.keys()):
+            if isinstance(key, torch._ops.OpOverload):
+                lowerings[key] = fallback_handler(key, add_to_fallback_set=False)
+        yield
+    finally:
+        lowerings.clear()
+        lowerings.update(saved)
+
+
 class _NoFusionScheduling(CppScheduling):
     """Placeholder device scheduling for fallback-only bring-up. Any attempt to
     codegen a fused (non-extern) kernel hard-errors here, so a fusion that
@@ -295,15 +326,11 @@ def enable_device_via_fallback(device: str, gm_backend: "Callable | None" = None
     from torch._inductor.codegen.common import (
         custom_backend_passes,
         device_codegens,
+        init_backend_registration,
         register_backend_for_device,
     )
     from torch._inductor.codegen.cpp_wrapper_cpu import CppWrapperCpu
     from torch._inductor.codegen.wrapper import PythonWrapperCodegen
-
-    from torch_dispatch_capture.v3.fallback_hijack import (
-        NO_FUSION_CONFIG,
-        force_all_fallback_lowerings,
-    )
 
     def _validating_backend(gm, example_inputs):
         _assert_host_gm_all_extern(gm)
@@ -311,6 +338,12 @@ def enable_device_via_fallback(device: str, gm_backend: "Callable | None" = None
             return gm.forward  # default: run the host graph directly
         return gm_backend(gm, example_inputs)
 
+    # Register the standard devices first (idempotent, cached). Without this, a
+    # device the stock registration WOULD provide (e.g. cpu) may be absent at
+    # enter-time -> had=False -> popped on exit, and since init is @cache it never
+    # re-registers, breaking later compiles. After this, had is accurate: True for
+    # a stock device (restore it on exit), False for a genuinely new one (pop it).
+    init_backend_registration()
     had = device in device_codegens
     saved_dc = device_codegens.get(device)
     saved_pass = custom_backend_passes.get(device)
