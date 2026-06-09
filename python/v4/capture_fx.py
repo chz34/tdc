@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 import torch
+from torch._inductor.codegen.cpp import CppScheduling
 from torch._inductor.codegen.wrapper_fxir import WrapperFxCodegen
 
 
@@ -225,3 +226,109 @@ def compile_with_gm_backend(
             return compiled(*args, **kwargs)
 
     return runner
+
+
+# ---------------------------------------------------------------------------
+# enable_device_via_fallback: minimal inductor bring-up for a device with NO
+# codegen backend -- all-fallback (no fusion) + fx_wrapper to a user backend.
+# ---------------------------------------------------------------------------
+class _NoFusionScheduling(CppScheduling):
+    """Placeholder device scheduling for fallback-only bring-up. Any attempt to
+    codegen a fused (non-extern) kernel hard-errors here, so a fusion that
+    slipped past all-fallback fails loudly instead of miscompiling foreign-device
+    memory as host pointers. Extern/fallback nodes never reach these methods --
+    the scheduler routes them through codegen_extern_call, not the device backend.
+    """
+
+    def _reject(self, what: str):
+        raise RuntimeError(
+            f"enable_device_via_fallback: a {what} reached device codegen -- "
+            "all-fallback was not airtight (an op was fused instead of falling "
+            "back). Add a fallback for the offending op."
+        )
+
+    def codegen_node(self, *args, **kwargs):
+        self._reject("fused kernel")
+
+    def codegen_template(self, *args, **kwargs):
+        self._reject("template kernel")
+
+
+def _assert_host_gm_all_extern(gm) -> None:
+    from torch._higher_order_ops.triton_kernel_wrap import (
+        triton_kernel_wrapper_functional,
+        triton_kernel_wrapper_mutation,
+    )
+
+    fused = {triton_kernel_wrapper_mutation, triton_kernel_wrapper_functional}
+    bad = [n.name for n in gm.graph.nodes
+           if n.op == "call_function" and n.target in fused]
+    if bad:
+        raise RuntimeError(
+            f"enable_device_via_fallback: host gm is not all-extern; fused "
+            f"kernel node(s) present: {bad}"
+        )
+
+
+@contextlib.contextmanager
+def enable_device_via_fallback(device: str, gm_backend: Callable):
+    """Bring up inductor on a device that has NO codegen backend registered,
+    with zero device codegen:
+      - register the device with a no-op scheduling (fused kernel -> hard error),
+        placeholder python/cpp wrappers, and BackendFxWrapper;
+      - force every op to an aten fallback (nothing fuses; compute is plain
+        dispatched aten on the device);
+      - route the resulting all-extern host gm to gm_backend via fx_wrapper,
+        after asserting it really is all-extern.
+
+    This is an ENABLEMENT path (eager-grade perf, no fusion), not a perf path.
+    The device must have aten kernels for every op it runs. Restores all swapped
+    registries / lowerings / config on exit. Process-global, not thread-safe.
+    """
+    global _active_gm_backend
+    import torch._inductor.config as inductor_config
+    from torch._inductor.codegen.common import (
+        custom_backend_passes,
+        device_codegens,
+        register_backend_for_device,
+    )
+    from torch._inductor.codegen.cpp_wrapper_cpu import CppWrapperCpu
+    from torch._inductor.codegen.wrapper import PythonWrapperCodegen
+
+    from torch_dispatch_capture.v3.fallback_hijack import (
+        NO_FUSION_CONFIG,
+        force_all_fallback_lowerings,
+    )
+
+    def _validating_backend(gm, example_inputs):
+        _assert_host_gm_all_extern(gm)
+        return gm_backend(gm, example_inputs)
+
+    had = device in device_codegens
+    saved_dc = device_codegens.get(device)
+    saved_pass = custom_backend_passes.get(device)
+    saved_backend = _active_gm_backend
+
+    register_backend_for_device(
+        device, _NoFusionScheduling, PythonWrapperCodegen, CppWrapperCpu,
+        BackendFxWrapper,
+    )
+    _active_gm_backend = _validating_backend
+    try:
+        with force_all_fallback_lowerings(), inductor_config.patch(
+            {
+                "fx_wrapper": True,
+                "size_asserts": False,
+                "alignment_asserts": False,
+                **NO_FUSION_CONFIG,
+            }
+        ):
+            yield
+    finally:
+        _active_gm_backend = saved_backend
+        if had:
+            device_codegens[device] = saved_dc
+            custom_backend_passes[device] = saved_pass
+        else:
+            device_codegens.pop(device, None)
+            custom_backend_passes.pop(device, None)

@@ -8,11 +8,13 @@ from .capture_fx import (
     FxCaptureResult,
     capture_fx,
     compile_with_gm_backend,
+    enable_device_via_fallback,
 )
 
 __all__ = [
     "capture_fx",
     "compile_with_gm_backend",
+    "enable_device_via_fallback",
     "FxCaptureResult",
     "CaptureFxWrapper",
     "BackendFxWrapper",
