@@ -143,10 +143,20 @@ import contextlib
 
 import torch
 
-from . import _C as _ext
+try:
+    from . import _C as _ext
 
-Trace = _ext.Trace
-is_capturing = _ext.is_capturing
+    Trace = _ext.Trace
+    is_capturing = _ext.is_capturing
+    _HAS_EXT = True
+except ImportError:
+    # Pure-Python install (TDC_PURE_PYTHON=1): the C++ extension was not built.
+    # v1 capture()/Trace are unavailable, but pure-Python submodules (e.g.
+    # torch_dispatch_capture.v4) import and work without it.
+    _ext = None
+    Trace = None
+    is_capturing = None
+    _HAS_EXT = False
 
 
 @contextlib.contextmanager
@@ -238,6 +248,12 @@ def capture(allow_grad: bool = False):
         RuntimeError: if called with grad enabled and ``allow_grad=False``.
         RuntimeError: if another capture is already active on this thread.
     """
+    if _ext is None:
+        raise RuntimeError(
+            "tdc.capture() (v1) needs the C++ extension, which was not built "
+            "(pure-Python install). Reinstall without TDC_PURE_PYTHON, or use "
+            "torch_dispatch_capture.v4 (pure Python)."
+        )
     if not allow_grad and torch.is_grad_enabled():
         raise RuntimeError(
             "tdc.capture() requires torch.no_grad() by default; pass "
