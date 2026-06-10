@@ -305,10 +305,11 @@ def _assert_host_gm_all_extern(gm) -> None:
 def enable_device_via_fallback(
     device: str, gm_backend: "Callable | None" = None, decompose: bool = True
 ):
-    """Bring up inductor on a device that has NO codegen backend registered,
-    with zero device codegen:
-      - register the device with a no-op scheduling (fused kernel -> hard error),
-        placeholder python/cpp wrappers, and BackendFxWrapper;
+    """Bring up inductor on a device TYPE (whole backend, e.g. "cpu"/"cuda";
+    a torch.device or indexed "cuda:0" is reduced to its type) that has NO codegen
+    backend registered, with zero device codegen:
+      - register the device type with a no-op scheduling (fused kernel -> hard
+        error), placeholder python/cpp wrappers, and BackendFxWrapper;
       - force every op to an aten fallback (nothing fuses; compute is plain
         dispatched aten on the device);
       - route the resulting all-extern host gm to gm_backend via fx_wrapper,
@@ -344,6 +345,13 @@ def enable_device_via_fallback(
     )
     from torch._inductor.codegen.cpp_wrapper_cpu import CppWrapperCpu
     from torch._inductor.codegen.wrapper import PythonWrapperCodegen
+
+    # This overrides a whole backend, which inductor keys by device TYPE
+    # ("cpu"/"cuda"/...) in device_codegens -- never by a specific index like
+    # "cuda:0". Reduce a torch.device / indexed string to that type string (any
+    # index is irrelevant: the override applies to the entire backend). Without
+    # this, registering under a torch.device object misses inductor's str lookup.
+    device = torch.device(device).type
 
     def _validating_backend(gm, example_inputs):
         _assert_host_gm_all_extern(gm)

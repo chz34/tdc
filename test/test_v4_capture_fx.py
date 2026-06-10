@@ -123,5 +123,71 @@ class TestCompileWithGmBackend(unittest.TestCase):
         self.assertGreaterEqual(seen["n"], 2)  # both compiles went through backend
 
 
+class _LNGelu(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.lin = torch.nn.Linear(16, 16)
+        self.ln = torch.nn.LayerNorm(16)
+
+    def forward(self, x):
+        return torch.nn.functional.gelu(self.ln(self.lin(x)))
+
+
+def _record_backend(info):
+    def backend(gm, example_inputs):
+        ops = [str(n.target) for n in gm.graph.nodes if n.op == "call_function"]
+        info["n_call"] = len(ops)
+        info["layer_norm"] = any("native_layer_norm" in o for o in ops)
+        info["gelu"] = any("gelu" in o for o in ops)
+        return gm.forward
+
+    return backend
+
+
+class TestEnableDeviceViaFallback(unittest.TestCase):
+    """All-fallback + fx_wrapper bring-up, incl. the decompose=False option."""
+
+    def _compile(self, model, x, decompose):
+        # Reset Dynamo + disable inductor caches around the compile so the host
+        # gm is actually codegen'd (and reaches the recording backend) rather than
+        # served from a prior on-disk FxGraphCache entry for the same graph.
+        info = {}
+        torch._dynamo.reset()
+        with torch._inductor.config.patch(force_disable_caches=True), torch.no_grad(), \
+                tdcv4.enable_device_via_fallback(
+                    DEVICE, _record_backend(info), decompose=decompose
+                ):
+            out = torch.compile(model, backend="inductor", dynamic=False)(x)
+        return out, info
+
+    def test_all_extern_and_numeric(self):
+        torch.manual_seed(0)
+        m = _LNGelu().eval()
+        x = torch.randn(4, 16, device=DEVICE)
+        out, info = self._compile(m, x, decompose=True)
+        self.assertTrue(torch.allclose(out, m(x), atol=1e-4))
+        self.assertGreater(info["n_call"], 0)  # the host gm reached the backend
+
+    def test_decompose_false_preserves_big_ops(self):
+        torch.manual_seed(0)
+        m = _LNGelu().eval()
+        x = torch.randn(4, 16, device=DEVICE)
+        ref = m(x)
+
+        out_t, info_t = self._compile(m, x, decompose=True)
+        out_f, info_f = self._compile(m, x, decompose=False)
+
+        self.assertTrue(torch.allclose(out_t, ref, atol=1e-4))
+        self.assertTrue(torch.allclose(out_f, ref, atol=1e-4))
+        # decompose=False keeps native_layer_norm + gelu as single fallback ops...
+        self.assertTrue(info_f["layer_norm"])
+        self.assertTrue(info_f["gelu"])
+        # ...while the default (decompose=True) decomposes them into primitives
+        self.assertFalse(info_t["layer_norm"])
+        self.assertFalse(info_t["gelu"])
+        # so the preserved-op graph is strictly smaller
+        self.assertLess(info_f["n_call"], info_t["n_call"])
+
+
 if __name__ == "__main__":
     unittest.main()
