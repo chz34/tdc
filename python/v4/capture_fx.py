@@ -302,7 +302,9 @@ def _assert_host_gm_all_extern(gm) -> None:
 
 
 @contextlib.contextmanager
-def enable_device_via_fallback(device: str, gm_backend: "Callable | None" = None):
+def enable_device_via_fallback(
+    device: str, gm_backend: "Callable | None" = None, decompose: bool = True
+):
     """Bring up inductor on a device that has NO codegen backend registered,
     with zero device codegen:
       - register the device with a no-op scheduling (fused kernel -> hard error),
@@ -317,11 +319,22 @@ def enable_device_via_fallback(device: str, gm_backend: "Callable | None" = None
     i.e. pure enablement, no backend substitution. Pass a gm_backend(gm,
     example_inputs) -> callable only if you want to process/replace the host graph.
 
+    decompose=False empties inductor's AOT decomposition table, so big aten ops
+    that would otherwise be decomposed (native_layer_norm, gelu, addmm, _softmax,
+    ...) survive as a SINGLE fallback dispatch -- fewer, larger ops, which can be
+    better for a device with efficient large-op kernels. Caveat: this only keeps
+    real aten ops that have an explicit decomp entry; CompositeImplicitAutograd
+    ops (e.g. scaled_dot_product_attention) still unfold during AOT tracing
+    regardless (full preservation needs export-style preserve_ops). The device
+    must then provide kernels for the preserved big ops.
+
     This is an ENABLEMENT path (eager-grade perf, no fusion), not a perf path.
     The device must have aten kernels for every op it runs. Restores all swapped
-    registries / lowerings / config on exit. Process-global, not thread-safe.
+    registries / lowerings / config / decomp table on exit. Process-global, not
+    thread-safe.
     """
     global _active_gm_backend
+    import torch._inductor.compile_fx as compile_fx_mod
     import torch._inductor.config as inductor_config
     from torch._inductor.codegen.common import (
         custom_backend_passes,
@@ -348,12 +361,17 @@ def enable_device_via_fallback(device: str, gm_backend: "Callable | None" = None
     saved_dc = device_codegens.get(device)
     saved_pass = custom_backend_passes.get(device)
     saved_backend = _active_gm_backend
+    saved_select_decomp = compile_fx_mod.select_decomp_table
 
     register_backend_for_device(
         device, _NoFusionScheduling, PythonWrapperCodegen, CppWrapperCpu,
         BackendFxWrapper,
     )
     _active_gm_backend = _validating_backend
+    if not decompose:
+        # compile_fx (backend="inductor") with decompositions=None reads the
+        # module-level select_decomp_table; an empty table = no op decomposition.
+        compile_fx_mod.select_decomp_table = lambda: {}
     try:
         with force_all_fallback_lowerings(), inductor_config.patch(
             {
@@ -366,6 +384,7 @@ def enable_device_via_fallback(device: str, gm_backend: "Callable | None" = None
             yield
     finally:
         _active_gm_backend = saved_backend
+        compile_fx_mod.select_decomp_table = saved_select_decomp
         if had:
             device_codegens[device] = saved_dc
             custom_backend_passes[device] = saved_pass
