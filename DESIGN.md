@@ -2269,3 +2269,54 @@ inductor 编译。
   一个以 gm 为输入的后端 `backend(gm, flattened_inputs)`,且:① 输入要用 gm 的扁平化
   placeholder(symint + tensor,非原始 fn 参数);② 后端要能处理宿主图节点(triton HOP /
   alloc / aten fallback),inductor 本身不行(它期望 aten 图)。
+
+### 18.5 `enable_device_via_fallback`:无 codegen 后端设备的最小使能
+
+v4 的三个入口:`capture_fx`(抓宿主 gm 供观察)、`compile_with_gm_backend`(每次
+(重)编译都把宿主 gm 路由给用户后端,approach B,对 recompile 鲁棒)、
+`enable_device_via_fallback`(给一个**没有注册任何 inductor codegen 后端**的设备做最小
+使能)。这里展开第三个。
+
+目标:让一个只有 aten kernel、没有 Triton/C++ codegen 的设备也能走 inductor +
+fx_wrapper,产出一张**全 extern** 的宿主 gm(全部是 aten extern 调用,无任何融合核),
+因而可被 FX 转换并交给用户后端。它是**使能路径(eager 级性能,零融合),不是性能路径**。
+
+做的几件事(都在 contextmanager 进出时打补丁/还原,进程级,非线程安全):
+1. 把设备类型(`torch.device(device).type`,丢弃任何 index)注册成 `(_NoFusionScheduling,
+   PythonWrapperCodegen, CppWrapperCpu, BackendFxWrapper)`。`_NoFusionScheduling` 是
+   一道 fail-fast 断言:任何 op 一旦到达 device codegen(`codegen_node`/`codegen_template`)
+   就硬报错——意味着 all-fallback 没兜住(详见对该类的说明:它拦的是"零 device codegen",
+   而非 `can_fuse` 那种"零融合")。
+2. `force_all_fallback_lowerings()` 把 `lowerings` 字典里每个 OpOverload key 重指向
+   `fallback_handler`,叠加 `NO_FUSION_CONFIG`(关 epilogue_fusion / max_fusion_size /
+   cudagraphs / freezing)+ `fx_wrapper=True` + 关 size/alignment assert。于是没有 op 被
+   融合,全部以 extern 形态进宿主图。
+3. `_active_gm_backend` 设为 `_validating_backend`:先 `_assert_host_gm_all_extern(gm)`
+   (确认图里没有 `triton_kernel_wrapper_mutation/functional`),再 `gm.forward`
+   (`gm_backend=None`,纯使能)或 `gm_backend(gm, example_inputs)`(替换/处理宿主图)。
+
+**`decompose=False` 与隐式 fallback 的坑(及修复)。** `decompose=False` 把
+`compile_fx.select_decomp_table` 换成空表,让 `native_layer_norm`/`gelu`/`addmm`/`_softmax`
+等大算子不被拆解、以单个 fallback dispatch 存活——对"有高效大算子核"的设备更友好。但这里
+有一个交互陷阱:
+
+- `force_all_fallback_lowerings` 只重指向**已经在 `lowerings` 里**的 key。而上述大算子
+  inductor 正常是靠 **decomposition** 处理的,**它们从不是 `lowerings` 的 key** → 覆盖不到。
+- `decompose=False` 又不拆它们 → 它们以大算子原样进 lowering → `target not in lowerings`
+  → 落入 inductor 的 **implicit_fallbacks** 分支 → 该分支的 `log.info("Creating implicit
+  fallback...", operator_str(target, args, kwargs))` **eager** 求值 `operator_str`,对深层
+  嵌套、无去重的 IR DAG 做 `str()`,展开成树 → 体量爆炸 → **看似卡死**(数值其实正确,纯粹
+  是这条日志字符串的构造代价)。
+
+修复:`force_all_fallback_lowerings(extra_ops=...)` 新增 `extra_ops`,为不在 `lowerings`
+里的 op 也注册 `fallback_handler`。`enable_device_via_fallback` 在清空 decomp 表**之前**取
+`select_decomp_table().keys()`(正是即将被反 decompose 的那批 op)作为 `extra_ops` 传入。
+于是这些 op 进了 `lowerings`,`target in lowerings` 成立,隐式 fallback 分支(连带那条
+eager 日志)永不触发。运行行为不变(两种路径都是 aten extern 调用),只是从"隐式"变"显式",
+契合 v4 全 extern 设计。注册都在 `force_all_fallback_lowerings` 的 `dict(lowerings)`
+快照/恢复范围内,退出自动还原。回归用例:`test_v4_capture_fx.py::TestEnableDeviceViaFallback
+::test_decompose_false_no_implicit_fallback`(短路 `operator_str` 记录调用,断言
+`decompose=False` 下该路径零触发且数值一致)。
+
+注:真正的上游缺陷是那条 `log.info` 把 `operator_str` eager 求值(应 `isEnabledFor` 守卫
+或用 lazy 包装);v4 的修复是绕开触发条件,根因仍值得上报。

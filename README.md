@@ -177,6 +177,57 @@ forward-only in v0.1.
 See `docs/specs/2026-05-28-v3-design.md` for the design and
 `prototypes/v3_benchmark.py` for the canonical comparison.
 
+## v4: capture Inductor's `fx_wrapper` host graph (pure Python)
+
+`tdcv4` is a pure-Python module (no C++ extension) that grabs the
+`torch.fx.GraphModule` Inductor builds when `config.fx_wrapper=True` —
+the *host* graph of allocations + Triton-kernel-launch HOPs + aten
+extern calls, captured at Inductor's only stable hook,
+`WrapperFxCodegen.compile_graph(gm)`. Unlike v1/v2/v3 it does not
+translate to a C++ `Trace`; it hands you the host gm itself. Requires
+PyTorch >= 2.9 (when `config.fx_wrapper` and per-device
+`fx_wrapper_codegen` landed).
+
+Three entry points:
+
+```python
+import torch_dispatch_capture.v4 as tdcv4
+
+# 1. Capture the host gm(s) for inspection.
+res = tdcv4.capture_fx(fn, *example_args)        # -> FxCaptureResult
+res.compiled(*args)         # the normal fused callable
+res.gms                     # captured host GraphModules, in compile order
+
+# 2. Route the host gm through your own backend on EVERY (re)compile.
+runner = tdcv4.compile_with_gm_backend(fn, gm_backend=my_backend)
+# my_backend(gm, example_inputs) -> callable; robust to recompiles.
+
+# 3. Bring up Inductor on a device with NO codegen backend.
+with tdcv4.enable_device_via_fallback("cpu", my_backend, decompose=False):
+    torch.compile(model, backend="inductor")(x)
+```
+
+`enable_device_via_fallback` forces every op to an aten extern (no
+fusion -> all-extern host graph -> FX-convertible) and routes the
+result through `fx_wrapper` to your backend, after asserting the graph
+really is all-extern. `gm_backend=None` just runs the host gm via
+`gm.forward` (pure enablement, no substitution). `decompose=False`
+empties Inductor's decomposition table so big aten ops
+(native_layer_norm, gelu, ...) survive as a single fallback dispatch;
+those de-decomposed ops are registered as explicit fallbacks
+(`force_all_fallback_lowerings(extra_ops=...)`) so they do not reach
+Inductor's implicit-fallback path, whose debug log eagerly stringifies
+the deeply nested IR and effectively hangs.
+
+Pure-Python install (no C++ build) for v4 only:
+
+```bash
+TDC_PURE_PYTHON=1 pip install -e .
+```
+
+See `docs/specs/2026-06-04-v4-fx-capture-design.md` and DESIGN.md
+section 18 for the fx_wrapper interaction points.
+
 ## v1: dispatcher-level capture
 
 Use v1 when the one-time `torch.compile` cost of v2 is unacceptable —
@@ -476,7 +527,9 @@ python/
   v2/compile.py             v2 capture() + recipe building
   v2/translator.py          FX graph -> C++ Trace translator
   v2/fx_passes.py           FX rewrites used before translation
-setup.py                    CppExtension config (MAX_JOBS<=4)
+  v4/__init__.py            v4 entry (re-exports capture_fx etc.)
+  v4/capture_fx.py          capture_fx / compile_with_gm_backend / enable_device_via_fallback
+setup.py                    CppExtension config (MAX_JOBS<=4; TDC_PURE_PYTHON=1 for v4-only)
 test/
   _device.py                shared DEVICE / SYNC helper (reads TDC_DEVICE)
   test_correctness.py       v1 correctness
@@ -489,6 +542,7 @@ test/
   test_v2_inplace_mutation.py  v2 in-place op cross-replay behaviour
   test_v2_backward.py       v2 backward + parameter routing + BN buffer writeback
   test_v2_triton.py         v2 + torch.library.triton_op custom ops
+  test_v4_capture_fx.py     v4 fx_wrapper capture + enable_device_via_fallback
 prototypes/                 exploratory / benchmark scripts (gitignored runs)
   v2_benchmark.py           v1 / v2 / inductor speed comparison
   training_benchmark.py     fw+bw+SGD across all variants (in-house + torchbench)
@@ -519,3 +573,12 @@ objects, so mutations propagate) and invokes each step's op via
 Dynamic shape is automatic in v1 for ops that read shape from input
 TensorImpls; v2 handles the full SymInt case because the FX graph
 preserves shape-derived literals as explicit `sym_*` Steps.
+
+**v4:** Registers a `WrapperFxCodegen` subclass for the target device
+and flips `config.fx_wrapper=True`, so Inductor emits its host wrapper
+as a `torch.fx.GraphModule` instead of Python/C++ text. The subclass
+overrides `compile_graph(gm)` — Inductor's last and only touch of that
+gm — to capture it or route it to a user backend. No C++ `Trace`,
+no replay engine; the captured object is a real FX GraphModule whose
+nodes are `empty_strided` allocs, `triton_kernel_wrapper_mutation`
+HOP launches, and aten extern calls.
