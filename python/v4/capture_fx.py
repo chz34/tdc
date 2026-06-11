@@ -247,9 +247,18 @@ NO_FUSION_CONFIG = {
 
 
 @contextlib.contextmanager
-def force_all_fallback_lowerings():
+def force_all_fallback_lowerings(extra_ops=()):
     """Replace every OpOverload lowering with its fallback_handler (no fusion),
-    restoring the lowerings dict on exit. No config changes."""
+    restoring the lowerings dict on exit. No config changes.
+
+    extra_ops registers a fallback for ops that are NOT already lowering keys.
+    This matters when decomposition is disabled: big aten ops (native_layer_norm,
+    gelu, ...) are normally handled by decomposition, not by a lowering, so they
+    are absent from `lowerings`. Reaching lowering undecomposed, they would hit
+    inductor's implicit-fallback path, whose log eagerly str()s the op's nested
+    IR args -- which blows up (effectively hangs) on a deep IR. Registering an
+    explicit fallback keeps `target in lowerings` true, skipping that path; the
+    runtime behavior is identical (an aten extern call either way)."""
     from torch._inductor.lowering import fallback_handler, lowerings
 
     saved = dict(lowerings)
@@ -257,6 +266,9 @@ def force_all_fallback_lowerings():
         for key in list(lowerings.keys()):
             if isinstance(key, torch._ops.OpOverload):
                 lowerings[key] = fallback_handler(key, add_to_fallback_set=False)
+        for op in extra_ops:
+            if isinstance(op, torch._ops.OpOverload) and op not in lowerings:
+                lowerings[op] = fallback_handler(op, add_to_fallback_set=False)
         yield
     finally:
         lowerings.clear()
@@ -376,12 +388,17 @@ def enable_device_via_fallback(
         BackendFxWrapper,
     )
     _active_gm_backend = _validating_backend
+    decomp_ops: tuple = ()
     if not decompose:
         # compile_fx (backend="inductor") with decompositions=None reads the
         # module-level select_decomp_table; an empty table = no op decomposition.
+        # The de-decomposed ops are exactly the table's keys -- they reach lowering
+        # as big aten ops, so register an explicit fallback for each (passed to
+        # force_all_fallback_lowerings) to avoid inductor's implicit-fallback path.
+        decomp_ops = tuple(saved_select_decomp().keys())
         compile_fx_mod.select_decomp_table = lambda: {}
     try:
-        with force_all_fallback_lowerings(), inductor_config.patch(
+        with force_all_fallback_lowerings(decomp_ops), inductor_config.patch(
             {
                 "fx_wrapper": True,
                 "size_asserts": False,

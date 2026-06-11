@@ -188,6 +188,29 @@ class TestEnableDeviceViaFallback(unittest.TestCase):
         # so the preserved-op graph is strictly smaller
         self.assertLess(info_f["n_call"], info_t["n_call"])
 
+    def test_decompose_false_no_implicit_fallback(self):
+        # Regression: with decompose=False, big aten ops (native_layer_norm, gelu,
+        # ...) reach lowering undecomposed. They must be registered as explicit
+        # fallbacks; otherwise they hit inductor's implicit-fallback path whose
+        # log eagerly str()s the nested IR args and effectively hangs. Assert the
+        # path is never taken (operator_str is never called).
+        import torch._inductor.exc as exc
+
+        seen = []
+        orig = exc.OperatorIssue.operator_str
+        exc.OperatorIssue.operator_str = staticmethod(
+            lambda target, args, kwargs: seen.append(str(target)) or f"target: {target}"
+        )
+        try:
+            torch.manual_seed(0)
+            m = _LNGelu().eval()
+            x = torch.randn(4, 16, device=DEVICE)
+            out, _ = self._compile(m, x, decompose=False)
+        finally:
+            exc.OperatorIssue.operator_str = orig
+        self.assertTrue(torch.allclose(out, m(x), atol=1e-4))
+        self.assertEqual(seen, [], f"ops hit the implicit-fallback path: {seen}")
+
 
 if __name__ == "__main__":
     unittest.main()
