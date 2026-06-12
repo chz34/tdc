@@ -12,6 +12,18 @@ from .capture_fx import (
     enable_device_via_fallback,
     force_all_fallback_lowerings,
 )
+from .compiled_kernel_hop import (
+    CompiledKernelSideTable,
+    compiled_kernel_side_table,
+    compiled_kernel_wrapper_functional,
+    compiled_kernel_wrapper_mutation,
+    register_kernel_compiler,
+)
+from .cpp_fusion import (
+    CompiledKernelFxConverter,
+    CompiledKernelFxWrapper,
+    enable_device_with_fusion,
+)
 
 __all__ = [
     "capture_fx",
@@ -22,4 +34,12 @@ __all__ = [
     "FxCaptureResult",
     "CaptureFxWrapper",
     "BackendFxWrapper",
+    "enable_device_with_fusion",
+    "CompiledKernelFxConverter",
+    "CompiledKernelFxWrapper",
+    "compiled_kernel_wrapper_mutation",
+    "compiled_kernel_wrapper_functional",
+    "compiled_kernel_side_table",
+    "CompiledKernelSideTable",
+    "register_kernel_compiler",
 ]
