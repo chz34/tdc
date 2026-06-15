@@ -32,13 +32,15 @@ from .cpp_fusion import (
     register_compiled_kernel_backend,
 )
 
-# Compile APIs torch_npu emits for dvm/mlir fused kernels. A kernel-definition
-# body containing any of these is ours:
-#   async_compile.mlir / mlir_auto_fallback   (mlir codegen; the first covers both)
-#   async_compile.akg / akg_auto_fallback     (akg codegen)
-#   async_compile.import_fx                    (fx-graph fallback when a kernel
-#                                               produced no launchers; loads as a
-#                                               plain callable, not a tuner)
+# dvm fused kernels are named "dvm_" + get_fused_kernel_name(...) in both define
+# modes (torch_npu _define_dvm_kernel), so the name prefix is the stable signal.
+_DVM_KERNEL_NAME_PREFIX = "dvm_"
+
+# Secondary signal -- compile APIs that may appear in a definition body:
+#   async_compile.import_fx   (fx-graph fallback mode; whole kernel def in the body)
+# The native dvm-codegen mode instead puts the builder function in the *metadata*
+# arg and leaves kernel_body as just "<name>_build", so body matching alone is
+# insufficient; the name prefix above covers that mode.
 _DVM_COMPILE_APIS = (
     "async_compile.mlir",
     "async_compile.akg",
@@ -88,6 +90,9 @@ class DvmBackend(CompiledKernelBackend):
     HOP nodes."""
 
     def handles_definition(self, defn_line) -> bool:
+        name = getattr(defn_line, "kernel_name", "") or ""
+        if name.startswith(_DVM_KERNEL_NAME_PREFIX):
+            return True
         body = getattr(defn_line, "kernel_body", "") or ""
         return any(api in body for api in _DVM_COMPILE_APIS)
 

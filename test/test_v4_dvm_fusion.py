@@ -18,11 +18,22 @@ def _defn(body, **kw):
 
 
 class TestDvmBackendSelection(unittest.TestCase):
-    def test_claims_mlir_akg_and_fx_fallback_definitions(self):
+    def test_claims_native_dvm_kernel_by_name(self):
+        # native dvm-codegen mode: body is just the "<name>_build" builder token,
+        # the real code is in metadata. Only the dvm_ name prefix identifies it.
+        b = DvmBackend()
+        line = types.SimpleNamespace(
+            kernel_name="dvm_fused_add_mul_relu_0",
+            kernel_body="dvm_fused_add_mul_relu_0_build",
+            metadata="def dvm_fused_add_mul_relu_0_build(...): ...",
+            gpu=True,
+        )
+        self.assertTrue(b.handles_definition(line))
+
+    def test_claims_fx_fallback_definitions_by_body(self):
         b = DvmBackend()
         bodies = [
             "k = async_compile.mlir('k', '''<src>''', device_str='npu')",
-            "k = async_compile.mlir_auto_fallback('k', '''<src>''', kernel_meta={})",
             "k = async_compile.akg_auto_fallback('k', '''<src>''', kernel_meta={})",
             "k = async_compile.import_fx('k', kernel_meta={})",
         ]
