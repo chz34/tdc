@@ -32,9 +32,18 @@ from .cpp_fusion import (
     register_compiled_kernel_backend,
 )
 
-# Compile APIs torch_npu emits for dvm/mlir fused kernels (default + autotune
-# fallback + akg). A kernel-definition body containing any of these is ours.
-_DVM_COMPILE_APIS = ("async_compile.mlir", "async_compile.akg")
+# Compile APIs torch_npu emits for dvm/mlir fused kernels. A kernel-definition
+# body containing any of these is ours:
+#   async_compile.mlir / mlir_auto_fallback   (mlir codegen; the first covers both)
+#   async_compile.akg / akg_auto_fallback     (akg codegen)
+#   async_compile.import_fx                    (fx-graph fallback when a kernel
+#                                               produced no launchers; loads as a
+#                                               plain callable, not a tuner)
+_DVM_COMPILE_APIS = (
+    "async_compile.mlir",
+    "async_compile.akg",
+    "async_compile.import_fx",
+)
 
 
 def _current_npu_raw_stream():

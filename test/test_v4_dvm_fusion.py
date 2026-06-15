@@ -18,11 +18,16 @@ def _defn(body, **kw):
 
 
 class TestDvmBackendSelection(unittest.TestCase):
-    def test_claims_mlir_and_akg_definitions(self):
+    def test_claims_mlir_akg_and_fx_fallback_definitions(self):
         b = DvmBackend()
-        for api in ("async_compile.mlir", "async_compile.akg"):
-            line = _defn(f"k = {api}('k', '''<src>''', device_str='npu')", gpu=True)
-            self.assertTrue(b.handles_definition(line), api)
+        bodies = [
+            "k = async_compile.mlir('k', '''<src>''', device_str='npu')",
+            "k = async_compile.mlir_auto_fallback('k', '''<src>''', kernel_meta={})",
+            "k = async_compile.akg_auto_fallback('k', '''<src>''', kernel_meta={})",
+            "k = async_compile.import_fx('k', kernel_meta={})",
+        ]
+        for body in bodies:
+            self.assertTrue(b.handles_definition(_defn(body, gpu=True)), body)
 
     def test_inert_for_triton_and_cpp(self):
         b = DvmBackend()

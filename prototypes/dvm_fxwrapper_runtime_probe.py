@@ -167,6 +167,7 @@ def main():
     print("=" * 70)
     try:
         import torch_dispatch_capture.v4 as tdcv4  # auto-registers DvmBackend
+        import torch_dispatch_capture.v4.cpp_fusion as cf
         from torch_dispatch_capture.v4.compiled_kernel_hop import (
             compiled_kernel_side_table,
             compiled_kernel_wrapper_mutation,
@@ -175,6 +176,35 @@ def main():
         print(f"[skip] torch_dispatch_capture not importable: {e}")
         return
 
+    # ---- diagnostics: which backends are registered, and how each kernel
+    # definition line is classified (so a "None" selection is explainable). ----
+    registered = [type(b).__name__ for b in cf._COMPILED_BACKENDS]
+    print(f"[diag] registered backends: {registered}")
+    has_dvm = any(type(b).__name__ == "DvmBackend" for b in cf._COMPILED_BACKENDS)
+    print(f"[diag] DvmBackend present : {has_dvm}")
+    if not has_dvm:
+        print(
+            "  => DvmBackend is NOT registered in this tdc checkout. Pull the"
+            "\n     commit that adds python/v4/dvm_fusion.py (and its import in"
+            "\n     __init__.py), then re-run."
+        )
+
+    sel_log = []
+    _orig_select = cf._select_backend
+
+    def _logging_select(line):
+        result = _orig_select(line)
+        body = (getattr(line, "kernel_body", "") or "").replace("\n", " ")
+        sel_log.append(
+            (
+                getattr(line, "kernel_name", None),
+                getattr(line, "gpu", None),
+                body[:140],
+                type(result).__name__ if result is not None else None,
+            )
+        )
+        return result
+
     captured2 = {}
 
     def capture_backend2(gm, example_inputs):
@@ -182,6 +212,7 @@ def main():
         return gm.forward
 
     compiled_kernel_side_table.reset_table()
+    cf._select_backend = _logging_select
     err2 = None
     try:
         torch._dynamo.reset()
@@ -192,6 +223,14 @@ def main():
             torch.npu.synchronize()
     except Exception as e:
         err2 = e
+    finally:
+        cf._select_backend = _orig_select
+
+    if sel_log:
+        print("[diag] kernel-definition lines seen by _select_backend:")
+        for name, gpu, body, sel in sel_log:
+            print(f"    - {name} (gpu={gpu}) -> {sel}")
+            print(f"        body[:140]: {body}")
 
     if err2 is not None:
         msg = str(err2)
