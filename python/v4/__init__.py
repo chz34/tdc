@@ -27,6 +27,7 @@ from .cpp_fusion import (
     enable_device_with_fusion,
     register_compiled_kernel_backend,
 )
+from .dvm_fusion import DvmBackend
 
 __all__ = [
     "capture_fx",
@@ -41,6 +42,7 @@ __all__ = [
     "register_compiled_kernel_backend",
     "CompiledKernelBackend",
     "CppPybindingBackend",
+    "DvmBackend",
     "CompiledKernelFxConverter",
     "CompiledKernelFxWrapper",
     "compiled_kernel_wrapper_mutation",
