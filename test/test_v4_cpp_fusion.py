@@ -1,11 +1,13 @@
 """End-to-end: cpp_fused_* kernels embedded into the fx_wrapper host gm via the
 CompiledKernelWrapperMutation HOP, under enable_device_with_fusion on CPU.
 """
+import types
 import unittest
 
 import torch
 
 import torch_dispatch_capture.v4 as tdcv4
+import torch_dispatch_capture.v4.cpp_fusion as cf
 from torch_dispatch_capture.v4.compiled_kernel_hop import (
     compiled_kernel_side_table,
     compiled_kernel_wrapper_mutation,
@@ -67,6 +69,51 @@ class TestCppFusion(unittest.TestCase):
         a = torch.randn(8, 8)
         self._capture(_fn, a, a)
         self.assertIs(device_codegens["cpu"].fx_wrapper_codegen, before)
+
+
+class TestBackendRegistry(unittest.TestCase):
+    """Adding a compiler backend must not require editing the converter: a newly
+    registered backend is selected purely via handles_definition."""
+
+    def test_new_backend_selected_without_converter_changes(self):
+        sentinel = object()
+
+        class FakeBackend(cf.CompiledKernelBackend):
+            def handles_definition(self, defn_line):
+                return getattr(defn_line, "kind", None) == "fake"
+
+            def compile_kernel(self, converter, defn_line):
+                return sentinel
+
+            def mutated_arg_indices(self, call_line):
+                return (0,)
+
+        fake = FakeBackend()
+        cf.register_compiled_kernel_backend(fake)
+        try:
+            # a line this backend claims -> selected
+            self.assertIs(cf._select_backend(types.SimpleNamespace(kind="fake")), fake)
+            # a cpp line (gpu=False) -> still the default CppPybindingBackend
+            cpp = cf._select_backend(types.SimpleNamespace(gpu=False))
+            self.assertIsInstance(cpp, cf.CppPybindingBackend)
+            # a triton line (gpu=True, unclaimed) -> None (falls back to super)
+            self.assertIsNone(cf._select_backend(types.SimpleNamespace(gpu=True)))
+        finally:
+            cf._COMPILED_BACKENDS.remove(fake)
+
+    def test_cpp_backend_mutation_from_arg_types(self):
+        b = cf.CppPybindingBackend()
+        self.assertEqual(
+            b.mutated_arg_indices(types.SimpleNamespace(arg_types=["float*"])), (0,)
+        )
+        self.assertEqual(
+            b.mutated_arg_indices(
+                types.SimpleNamespace(
+                    arg_types=["const float*", "const float*", "float*"]
+                )
+            ),
+            (2,),
+        )
 
 
 if __name__ == "__main__":

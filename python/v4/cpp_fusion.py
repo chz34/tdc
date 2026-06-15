@@ -1,17 +1,24 @@
-"""Embed Inductor cpp_fused_* kernels into the fx_wrapper host graph.
+"""Embed non-Triton compiled fused kernels into the fx_wrapper host graph.
 
 Inductor's stock FxConverter only converts Triton kernel-call lines. This module
-adds the CPU/compiled path: a non-Triton kernel definition is compiled+cached via
-the existing async_compile path (its kernel_body already calls
-async_compile.cpp_pybinding, loaded through PyCodeCache), stored in the global
+adds a backend-agnostic compiled path: a kernel definition handled by a registered
+CompiledKernelBackend is compiled to a callable, stored in the global
 CompiledKernelSideTable, and its call line becomes a CompiledKernelWrapperMutation
 HOP node.
 
+Adding a new compiler backend requires NO change to the converter / wrapper here:
+subclass CompiledKernelBackend (three methods -- does it handle this kernel, how to
+compile it, which args it mutates) and call register_compiled_kernel_backend(...).
+The CPU Inductor cpp_pybinding path is the default backend, registered at import as
+the reference implementation.
+
 enable_device_with_fusion is the fusion-enabled counterpart to v4's
-enable_device_via_fallback: same fx_wrapper capture, but fused CPU kernels survive
-as HOP nodes instead of being fallback-expanded.
+enable_device_via_fallback: same fx_wrapper capture, but fused kernels survive as
+HOP nodes instead of being fallback-expanded.
 """
+import abc
 import contextlib
+import dataclasses
 from collections.abc import Callable
 from typing import Any
 
@@ -30,52 +37,74 @@ from .compiled_kernel_hop import (
 _active_fusion_backend: "Callable | None" = None
 
 
-def _mutated_arg_indices(arg_types: list) -> tuple[int, ...]:
-    """A cpp kernel arg is mutated iff it is a non-const pointer. cpp_argdefs()
-    emits writeable buffers (inplace + output) as 'T*' and read-only inputs as
-    'const T*'; sizevars have no '*'."""
-    return tuple(
-        i
-        for i, t in enumerate(arg_types)
-        if isinstance(t, str) and "*" in t and not t.strip().startswith("const")
-    )
+# --- pluggable compiler backends -------------------------------------------
+class CompiledKernelBackend(abc.ABC):
+    """Teaches the converter how to handle one class of non-Triton fused kernel.
+
+    A backend is selected per kernel-definition line via handles_definition; the
+    converter then asks it to compile the kernel to a callable and, at call time,
+    which positional args the kernel writes. Nothing else in the converter is
+    backend-specific, so a new compiler is added purely by registering one of these.
+    """
+
+    @abc.abstractmethod
+    def handles_definition(self, defn_line) -> bool:
+        """True if this backend owns the given KernelDefinitionLine."""
+
+    @abc.abstractmethod
+    def compile_kernel(self, converter: "CompiledKernelFxConverter", defn_line) -> Callable:
+        """Compile the kernel to a callable taking the flat positional args and
+        writing its outputs in place (the contract the HOP's dense impl calls)."""
+
+    @abc.abstractmethod
+    def mutated_arg_indices(self, call_line) -> tuple[int, ...]:
+        """Positions in the call args the kernel writes (for functionalization)."""
 
 
+_COMPILED_BACKENDS: list[CompiledKernelBackend] = []
+
+
+def register_compiled_kernel_backend(backend: CompiledKernelBackend) -> None:
+    """Register a CompiledKernelBackend. First registered that handles a kernel
+    wins, so register more specific backends before more general ones."""
+    _COMPILED_BACKENDS.append(backend)
+
+
+def _select_backend(defn_line) -> "CompiledKernelBackend | None":
+    for backend in _COMPILED_BACKENDS:
+        if backend.handles_definition(defn_line):
+            return backend
+    return None
+
+
+# --- converter / wrapper (backend-agnostic) --------------------------------
 class CompiledKernelFxConverter(FxConverter):
-    """FxConverter that also handles non-Triton (compiled) kernels."""
+    """FxConverter that routes non-Triton kernels through registered backends."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        self.compiled_kernels: dict[str, int] = {}  # kernel_name -> side-table idx
+        # kernel_name -> (side-table idx, owning backend)
+        self.compiled_kernels: dict[str, tuple[int, CompiledKernelBackend]] = {}
 
     def _generate_kernel_definition(self, line) -> None:
-        if getattr(line, "gpu", True):
-            return super()._generate_kernel_definition(line)
-        # CPU/compiled kernel: kernel_body is `async_compile.cpp_pybinding(...)`.
-        kernel_code = PythonWrapperCodegen._format_kernel_definition(
-            line.kernel_name, line.kernel_body, metadata=line.metadata
-        )
-        mod = PyCodeCache.load("\n".join([self.prologue, kernel_code]))
-        kernel = getattr(mod, line.kernel_name)
-        if isinstance(kernel, LambdaFuture):
-            kernel = kernel.result()
-        if isinstance(kernel, CachingAutotuner):
-            raise AssertionError("Triton kernel reached the compiled (cpp) path")
-        self.compiled_kernels[line.kernel_name] = (
-            compiled_kernel_side_table.add_kernel(kernel)
-        )
+        backend = _select_backend(line)
+        if backend is None:
+            return super()._generate_kernel_definition(line)  # Triton
+        kernel = backend.compile_kernel(self, line)
+        idx = compiled_kernel_side_table.add_kernel(kernel)
+        self.compiled_kernels[line.kernel_name] = (idx, backend)
 
     def _generate_kernel_call(self, line) -> None:
-        if line.triton:
-            return super()._generate_kernel_call(line)
-        idx = self.compiled_kernels[line.kernel_name]
-        call_args = tuple(self._lookup_args(line.call_args))
+        entry = self.compiled_kernels.get(line.kernel_name)
+        if entry is None:
+            return super()._generate_kernel_call(line)  # Triton
+        idx, backend = entry
         self.gm.graph.call_function(
             compiled_kernel_wrapper_mutation,
             kwargs={
                 "kernel_idx": idx,
-                "mutated_arg_indices": _mutated_arg_indices(line.arg_types),
-                "args": call_args,
+                "mutated_arg_indices": tuple(backend.mutated_arg_indices(line)),
+                "args": tuple(self._lookup_args(line.call_args)),
             },
         )
 
@@ -110,36 +139,32 @@ class CompiledKernelFxWrapper(WrapperFxCodegen):
 def enable_device_with_fusion(
     device: str, gm_backend: "Callable | None" = None
 ):
-    """Bring up inductor on a device type with fx_wrapper + CPU fusion enabled.
+    """Enable fx_wrapper capture on a device while keeping its real fusion.
 
-    Unlike enable_device_via_fallback (all-fallback, zero fusion), this keeps the
-    real CppScheduling, so fused cpp kernels are codegen'd and embedded into the
-    host gm as CompiledKernelWrapperMutation HOP nodes. gm_backend is optional;
-    when omitted the host gm runs via gm.forward. Restores swapped registries /
-    config on exit. Process-global, not thread-safe.
+    Unlike enable_device_via_fallback (all-fallback, zero fusion), this swaps only
+    the device's fx_wrapper_codegen for CompiledKernelFxWrapper and leaves its
+    scheduling / wrapper / cpp_wrapper untouched, so the device's own fused kernels
+    are codegen'd and embedded into the host gm as CompiledKernelWrapperMutation HOP
+    nodes. gm_backend is optional; when omitted the host gm runs via gm.forward.
+    Restores the swapped registry / config on exit. Process-global, not thread-safe.
     """
     global _active_fusion_backend
     import torch._inductor.config as inductor_config
     from torch._inductor.codegen.common import (
-        custom_backend_passes,
         device_codegens,
         init_backend_registration,
-        register_backend_for_device,
     )
-    from torch._inductor.codegen.cpp import CppScheduling
-    from torch._inductor.codegen.cpp_wrapper_cpu import CppWrapperCpu
-    from torch._inductor.codegen.wrapper import PythonWrapperCodegen as PyWrapper
 
     device = torch.device(device).type
 
     init_backend_registration()
-    had = device in device_codegens
-    saved_dc = device_codegens.get(device)
-    saved_pass = custom_backend_passes.get(device)
+    if device not in device_codegens:
+        raise RuntimeError(f"no inductor backend registered for device {device!r}")
+    saved_dc = device_codegens[device]
     saved_backend = _active_fusion_backend
 
-    register_backend_for_device(
-        device, CppScheduling, PyWrapper, CppWrapperCpu, CompiledKernelFxWrapper
+    device_codegens[device] = dataclasses.replace(
+        saved_dc, fx_wrapper_codegen=CompiledKernelFxWrapper
     )
     _active_fusion_backend = gm_backend
     try:
@@ -149,9 +174,42 @@ def enable_device_with_fusion(
             yield
     finally:
         _active_fusion_backend = saved_backend
-        if had:
-            device_codegens[device] = saved_dc
-            custom_backend_passes[device] = saved_pass
-        else:
-            device_codegens.pop(device, None)
-            custom_backend_passes.pop(device, None)
+        device_codegens[device] = saved_dc
+
+
+# --- default backend: Inductor CPU cpp_pybinding ----------------------------
+def cpp_mutated_arg_indices(arg_types) -> tuple[int, ...]:
+    """A cpp kernel arg is mutated iff it is a non-const pointer. cpp_argdefs()
+    emits writeable buffers (inplace + output) as 'T*' and read-only inputs as
+    'const T*'; sizevars have no '*'. Reusable by other C-ABI backends."""
+    return tuple(
+        i
+        for i, t in enumerate(arg_types)
+        if isinstance(t, str) and "*" in t and not t.strip().startswith("const")
+    )
+
+
+class CppPybindingBackend(CompiledKernelBackend):
+    """Inductor CPU cpp_fused_* kernels: kernel_body is async_compile.cpp_pybinding(...),
+    loaded+cached through PyCodeCache; a non-const pointer arg is a written buffer."""
+
+    def handles_definition(self, defn_line) -> bool:
+        return not getattr(defn_line, "gpu", True)
+
+    def compile_kernel(self, converter, defn_line) -> Callable:
+        code = PythonWrapperCodegen._format_kernel_definition(
+            defn_line.kernel_name, defn_line.kernel_body, metadata=defn_line.metadata
+        )
+        mod = PyCodeCache.load("\n".join([converter.prologue, code]))
+        kernel = getattr(mod, defn_line.kernel_name)
+        if isinstance(kernel, LambdaFuture):
+            kernel = kernel.result()
+        if isinstance(kernel, CachingAutotuner):
+            raise AssertionError("Triton kernel reached the compiled (cpp) backend")
+        return kernel
+
+    def mutated_arg_indices(self, call_line) -> tuple[int, ...]:
+        return cpp_mutated_arg_indices(call_line.arg_types)
+
+
+register_compiled_kernel_backend(CppPybindingBackend())

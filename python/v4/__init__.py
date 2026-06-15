@@ -20,9 +20,12 @@ from .compiled_kernel_hop import (
     register_kernel_compiler,
 )
 from .cpp_fusion import (
+    CompiledKernelBackend,
     CompiledKernelFxConverter,
     CompiledKernelFxWrapper,
+    CppPybindingBackend,
     enable_device_with_fusion,
+    register_compiled_kernel_backend,
 )
 
 __all__ = [
@@ -35,6 +38,9 @@ __all__ = [
     "CaptureFxWrapper",
     "BackendFxWrapper",
     "enable_device_with_fusion",
+    "register_compiled_kernel_backend",
+    "CompiledKernelBackend",
+    "CppPybindingBackend",
     "CompiledKernelFxConverter",
     "CompiledKernelFxWrapper",
     "compiled_kernel_wrapper_mutation",
