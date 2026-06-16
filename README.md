@@ -219,6 +219,49 @@ those de-decomposed ops are registered as explicit fallbacks
 Inductor's implicit-fallback path, whose debug log eagerly stringifies
 the deeply nested IR and effectively hangs.
 
+### Keep fused kernels (CompiledKernel HOP)
+
+`enable_device_with_fusion` is the fusion-*preserving* counterpart: it
+keeps the device's real scheduling, so fused kernels survive in the host
+gm as `compiled_kernel_wrapper_mutation` HOP nodes (a non-Triton analog
+of Inductor's `triton_kernel_wrapper_mutation`) instead of being
+fallback-expanded.
+
+```python
+import torch_dispatch_capture.v4 as tdcv4
+
+# CPU C++ fused kernels -> HOP nodes (zero PyTorch changes):
+with tdcv4.enable_device_with_fusion("cpu", my_backend):
+    out = torch.compile(fn, backend="inductor")(a, b)
+# host gm now has compiled_kernel_wrapper_mutation node(s); the cpp
+# kernel is compiled via PyCodeCache and stored in a global side table.
+```
+
+Adding another compiler is "subclass + register", no edit to the
+converter/wrapper:
+
+```python
+from torch_dispatch_capture.v4 import (
+    CompiledKernelBackend, register_compiled_kernel_backend,
+)
+
+class MyBackend(CompiledKernelBackend):
+    def handles_definition(self, defn_line): ...   # claim a kernel def
+    def compile_kernel(self, converter, defn_line): ...  # -> callable
+    def mutated_arg_indices(self, call_line): ...  # which args it writes
+
+register_compiled_kernel_backend(MyBackend())
+```
+
+`CppPybindingBackend` (CPU cpp) and `DvmBackend` (torch_npu
+`TORCHINDUCTOR_NPU_BACKEND=dvm`) ship registered. The dvm path is
+validated end to end on NPU (`relu(a@b+a)*2` -> 1 HOP node, numerics
+match eager) and needs one small torch_npu change so its call line
+carries `arg_types` (the written-arg set); see the probes
+`prototypes/dvm_fxwrapper_{runtime,static}_probe.py` and design section
+10. Mutation indices otherwise come from the existing `arg_types`
+(writeable buffers are non-const pointers).
+
 Pure-Python install (no C++ build) for v4 only:
 
 ```bash
@@ -226,7 +269,9 @@ TDC_PURE_PYTHON=1 pip install -e .
 ```
 
 See `docs/specs/2026-06-04-v4-fx-capture-design.md` and DESIGN.md
-section 18 for the fx_wrapper interaction points.
+section 18 for the fx_wrapper interaction points, and
+`docs/specs/2026-06-11-compiled-kernel-hop-design.md` for the
+CompiledKernel HOP and its cpp/dvm backends.
 
 ## v1: dispatcher-level capture
 
