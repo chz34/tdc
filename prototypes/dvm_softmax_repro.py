@@ -83,14 +83,39 @@ def main():
         captured["gm"] = gm
         return gm.forward
 
+    # MODE=native  -> plain dvm compile (no fx_wrapper, no DvmBackend): the
+    #                 baseline that "works". If THIS segfaults too, the dvm build
+    #                 of the kernel is the bug, independent of our integration.
+    #                 If it runs, native handles the softmax kernel differently
+    #                 (likely import_fx) -- run with TORCH_LOGS=output_code and
+    #                 grep the kernel name to see `_build` vs async_compile.import_fx.
+    # MODE=fusion  -> our enable_device_with_fusion path (default; reproduces).
+    mode = os.environ.get("MODE", "fusion")
+
     print(
-        f"[info] device={device} heads={heads} head_dim={head_dim} "
+        f"[info] device={device} mode={mode} heads={heads} head_dim={head_dim} "
         f"seq={seq} kv={kv} dynamic={dynamic}"
     )
     print("[info] compiling -- if it segfaults here, it died in a dvm kernel build")
     sys.stdout.flush()
 
     import torch._inductor.config as inductor_config
+
+    if mode == "native":
+        with torch.no_grad(), inductor_config.patch({"force_disable_caches": True}):
+            out = torch.compile(model, backend="inductor", dynamic=dynamic)(q, k, v)
+            if device == "npu":
+                torch.npu.synchronize()
+        print(
+            f"[ok] native dvm compiled + ran, no crash. "
+            f"numerics match eager: {torch.allclose(out, ref, atol=1e-3)}"
+        )
+        print(
+            "  => native did NOT crash building this kernel. Re-run with "
+            "TORCH_LOGS=output_code and grep the kernel name to confirm whether "
+            "native used `_build` (real dvm build) or async_compile.import_fx."
+        )
+        return
 
     with torch.no_grad(), inductor_config.patch(
         {"force_disable_caches": True, "generate_intermediate_hooks": False}
