@@ -1,7 +1,12 @@
-"""Minimal reproducer for the dvm-fxwrapper softmax compile-time coredump.
+"""Minimal reproducer for the dvm softmax compile-time coredump.
+
+FINDING (2026-06-16): this is a torch_npu DVM build bug, NOT a tdc/fx_wrapper
+issue. MODE=native (plain dvm torch.compile, no tdc) segfaults on the same kernel
+with an identical fused subgraph, so the crash is in the dvm C build (kobj.setup)
+of the bool/select/-inf 'vector' kernel. Use MODE=native as a pure upstream repro.
 
 Distilled from t5_cpu.py's T5Attention at the decode step (seq_len=1): the fused
-kernel that segfaults during DvmBackend.compile_kernel is
+kernel that segfaults is
   dvm_fused__softmax_div_eq_masked_fill_matmul_ones_tril_*
 i.e. matmul/scale -> tril(ones)==0 -> masked_fill(-inf) -> softmax -> matmul.
 
@@ -11,10 +16,13 @@ ones fuse into the kernel (hence the `_ones_tril` suffix), and the mask compare
 kernel (ktype='vector') from the layernorm kernels (ktype='spec') that compile
 fine. Shapes default to the exact crashing decode shapes; override via env.
 
-Run on NPU (reproduces the coredump in the dvm build of the softmax kernel):
+Pure dvm repro on NPU (no tdc; segfaults in the dvm build):
+  TORCHINDUCTOR_NPU_BACKEND=dvm TDC_DEVICE=npu MODE=native python dvm_softmax_repro.py
+
+Via the tdc fx_wrapper path on NPU (same crash):
   TORCHINDUCTOR_NPU_BACKEND=dvm TDC_DEVICE=npu python dvm_softmax_repro.py
 
-Control on CPU (cpp backend; should compile + run, NO crash):
+Control on CPU (cpp backend; compiles + runs, NO crash):
   TDC_DEVICE=cpu python dvm_softmax_repro.py
 
 Env knobs: HEADS (8), HEAD_DIM (128), SEQ (1), KV (1), DYNAMIC (0).
@@ -67,8 +75,6 @@ def main():
             print("[skip] no NPU device")
             return
 
-    import torch_dispatch_capture.v4 as tdcv4
-
     torch.manual_seed(0)
     q = torch.randn(1, heads, seq, head_dim, device=device)
     k = torch.randn(1, heads, kv, head_dim, device=device)
@@ -86,10 +92,14 @@ def main():
     # MODE=native  -> plain dvm compile (no fx_wrapper, no DvmBackend): the
     #                 baseline that "works". If THIS segfaults too, the dvm build
     #                 of the kernel is the bug, independent of our integration.
-    #                 If it runs, native handles the softmax kernel differently
-    #                 (likely import_fx) -- run with TORCH_LOGS=output_code and
-    #                 grep the kernel name to see `_build` vs async_compile.import_fx.
-    # MODE=fusion  -> our enable_device_with_fusion path (default; reproduces).
+    # FINDING (2026-06-16): MODE=native ALSO segfaults on this kernel, with an
+    # identical fused subgraph -- so this is a torch_npu DVM build bug (kobj.setup
+    # for the bool/select/-inf 'vector' kernel), NOT a tdc/fx_wrapper issue. Use
+    # this script (MODE=native, no tdc needed) as the upstream repro. The full T5
+    # native run avoids the crash only because its richer fused subgraph trips the
+    # is_node_dvm_supported fallback to import_fx; this minimal subgraph is all-
+    # supported, so dvm actually builds it and crashes.
+    # MODE=fusion  -> our enable_device_with_fusion path (default; same crash).
     mode = os.environ.get("MODE", "fusion")
 
     print(
@@ -106,16 +116,17 @@ def main():
             out = torch.compile(model, backend="inductor", dynamic=dynamic)(q, k, v)
             if device == "npu":
                 torch.npu.synchronize()
+        # Note: for the default softmax kernel this line is NOT reached -- the dvm
+        # build segfaults above (a pure dvm bug; no tdc / fx_wrapper involved). It
+        # prints only for kernels dvm can build (or with shapes that fall back).
         print(
             f"[ok] native dvm compiled + ran, no crash. "
             f"numerics match eager: {torch.allclose(out, ref, atol=1e-3)}"
         )
-        print(
-            "  => native did NOT crash building this kernel. Re-run with "
-            "TORCH_LOGS=output_code and grep the kernel name to confirm whether "
-            "native used `_build` (real dvm build) or async_compile.import_fx."
-        )
         return
+
+    # fusion mode only: import tdc lazily so MODE=native is a pure dvm repro.
+    import torch_dispatch_capture.v4 as tdcv4
 
     with torch.no_grad(), inductor_config.patch(
         {"force_disable_caches": True, "generate_intermediate_hooks": False}

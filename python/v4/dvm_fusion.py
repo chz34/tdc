@@ -100,9 +100,12 @@ class DvmBackend(CompiledKernelBackend):
         code = PythonWrapperCodegen._format_kernel_definition(
             defn_line.kernel_name, defn_line.kernel_body, metadata=defn_line.metadata
         )
+        # The dvm kernel body is compiled eagerly by the @dvm.kernel decorator at
+        # module-load time (dvm does not use async_compile), so this load is where
+        # the dvm C build runs.
         mod = PyCodeCache.load("\n".join([converter.prologue, code]))
         kernel = getattr(mod, defn_line.kernel_name)
-        # async_compile.* may hand back a future (NPUTritonFuture /
+        # import_fx fallback may hand back a future (NPUTritonFuture /
         # MulitprocessCompileFuture / LambdaFuture); materialize it.
         while isinstance(kernel, (CodeCacheFuture, LambdaFuture)):
             kernel = kernel.result()
