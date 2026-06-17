@@ -275,6 +275,35 @@ def force_all_fallback_lowerings(extra_ops=()):
         lowerings.update(saved)
 
 
+@contextlib.contextmanager
+def _cheap_operator_str():
+    """Neuter the eager `operator_str` in inductor's implicit-fallback log.
+
+    When an op is neither a lowering key nor decomposed, inductor's
+    implicit-fallback branch (graph.py) runs
+    `log.info("Creating implicit fallback for:\\n%s",
+             OperatorIssue.operator_str(target, args, kwargs))`.
+    The arg is built eagerly (before the log level is checked), and
+    `operator_str` str()s each IR arg; `IRNode.__str__` recurses over nested
+    fields with no DAG sharing, so on a deep graph (e.g. T5 on NPU) it blows up
+    and effectively hangs. force_all_fallback_lowerings covers the ops it knows
+    about, but a device-specific op can still slip through. This is the
+    device-agnostic safety net: make operator_str cheap for the duration, so the
+    implicit fallback (a plain aten extern -- fine for the all-fallback path)
+    proceeds instead of hanging in a log message.
+    """
+    from torch._inductor import exc
+
+    saved = exc.OperatorIssue.operator_str
+    exc.OperatorIssue.operator_str = staticmethod(
+        lambda target, args, kwargs: f"  target: {target}"
+    )
+    try:
+        yield
+    finally:
+        exc.OperatorIssue.operator_str = saved
+
+
 class _NoFusionScheduling(CppScheduling):
     """Placeholder device scheduling for fallback-only bring-up. Any attempt to
     codegen a fused (non-extern) kernel hard-errors here, so a fusion that
@@ -398,7 +427,9 @@ def enable_device_via_fallback(
         decomp_ops = tuple(saved_select_decomp().keys())
         compile_fx_mod.select_decomp_table = lambda: {}
     try:
-        with force_all_fallback_lowerings(decomp_ops), inductor_config.patch(
+        with _cheap_operator_str(), force_all_fallback_lowerings(
+            decomp_ops
+        ), inductor_config.patch(
             {
                 "fx_wrapper": True,
                 "size_asserts": False,

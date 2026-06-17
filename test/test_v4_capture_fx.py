@@ -188,28 +188,33 @@ class TestEnableDeviceViaFallback(unittest.TestCase):
         # so the preserved-op graph is strictly smaller
         self.assertLess(info_f["n_call"], info_t["n_call"])
 
-    def test_decompose_false_no_implicit_fallback(self):
-        # Regression: with decompose=False, big aten ops (native_layer_norm, gelu,
-        # ...) reach lowering undecomposed. They must be registered as explicit
-        # fallbacks; otherwise they hit inductor's implicit-fallback path whose
-        # log eagerly str()s the nested IR args and effectively hangs. Assert the
-        # path is never taken (operator_str is never called).
-        import torch._inductor.exc as exc
+    def test_implicit_fallback_log_cannot_hang(self):
+        # An op that slips past the explicit fallbacks (e.g. a device-specific op
+        # not covered by force_all_fallback_lowerings) reaches inductor's
+        # implicit-fallback branch, which eagerly builds
+        # OperatorIssue.operator_str(target, args, kwargs) for a log message.
+        # operator_str str()s each IR arg, and IRNode.__str__ recurses over nested
+        # fields with no DAG sharing -- on a deep graph (T5 on NPU) it blows up and
+        # effectively hangs. enable_device_via_fallback installs a cheap
+        # operator_str as a device-agnostic safety net. Verify it: inside the
+        # context operator_str must not str() its args (a Boom() arg would raise),
+        # and it is restored on exit. (The explicit-fallback coverage itself is
+        # exercised by test_decompose_false_preserves_big_ops.)
+        from torch._inductor import exc
 
-        seen = []
+        from torch_dispatch_capture.v4.capture_fx import _cheap_operator_str
+
+        class Boom:
+            def __str__(self):
+                raise AssertionError("operator_str str()'d a (deep) IR arg")
+
         orig = exc.OperatorIssue.operator_str
-        exc.OperatorIssue.operator_str = staticmethod(
-            lambda target, args, kwargs: seen.append(str(target)) or f"target: {target}"
-        )
-        try:
-            torch.manual_seed(0)
-            m = _LNGelu().eval()
-            x = torch.randn(4, 16, device=DEVICE)
-            out, _ = self._compile(m, x, decompose=False)
-        finally:
-            exc.OperatorIssue.operator_str = orig
-        self.assertTrue(torch.allclose(out, m(x), atol=1e-4))
-        self.assertEqual(seen, [], f"ops hit the implicit-fallback path: {seen}")
+        with _cheap_operator_str():
+            s = exc.OperatorIssue.operator_str(
+                "aten.foo.default", [Boom(), Boom()], {"k": Boom()}
+            )
+            self.assertIn("aten.foo.default", s)
+        self.assertIs(exc.OperatorIssue.operator_str, orig)
 
 
 if __name__ == "__main__":
