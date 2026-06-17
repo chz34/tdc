@@ -255,12 +255,25 @@ register_compiled_kernel_backend(MyBackend())
 
 `CppPybindingBackend` (CPU cpp) and `DvmBackend` (torch_npu
 `TORCHINDUCTOR_NPU_BACKEND=dvm`) ship registered. The dvm path is
-validated end to end on NPU (`relu(a@b+a)*2` -> 1 HOP node, numerics
-match eager) and needs one small torch_npu change so its call line
-carries `arg_types` (the written-arg set); see the probes
-`prototypes/dvm_fxwrapper_{runtime,static}_probe.py` and design section
-10. Mutation indices otherwise come from the existing `arg_types`
-(writeable buffers are non-const pointers).
+validated end to end on NPU -- from a single `relu(a@b+a)*2` kernel up to
+**T5 running through dvm + fx_wrapper + the HOP**. It needs one small
+torch_npu change (branch `migrate-dvm-to-master`) so its call line carries
+`arg_types`: `NpuTritonKernel.call_kernel` marks the trailing `num_outputs`
+buffers as non-const pointers (the cpp path already emits this). Mutation
+indices are then recovered from `arg_types` like cpp.
+
+Notes from the dvm bring-up (design section 10):
+- dvm compiles at `@dvm.kernel` decorator/import time (no `async_compile`),
+  so `compile_kernel`'s `PyCodeCache.load` is where its build runs.
+- `DvmBackend` selects kernels by the `dvm_` name prefix (dvm and Triton are
+  both `gpu=True`).
+- If a kernel build segfaults, reduce to a pure-dvm repro first
+  (`prototypes/dvm_softmax_repro.py MODE=native`, no tdc) -- the build crash
+  we hit was an upstream dvm-compiler bug, not the integration.
+- Keep the dvm runtime version aligned with torch_npu/torch; version skew
+  showed up as a spurious runtime `reshape(... None ...)`, not a code bug.
+- Probes/repros: `prototypes/dvm_fxwrapper_{runtime,static}_probe.py`,
+  `prototypes/dvm_softmax_repro.py`, `prototypes/dvm_softmax_causal_repro.py`.
 
 Pure-Python install (no C++ build) for v4 only:
 

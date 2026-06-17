@@ -314,27 +314,31 @@ Subclassing `FxConverter` + `WrapperFxCodegen._generate` (rather than monkeypatc
 torch internals) keeps the feature self-contained and copy-migratable, consistent
 with v4's design philosophy.
 
-## 10. Second backend: torch_npu dvm/mlir (validated on NPU, 2026-06-15)
+## 10. Second backend: torch_npu dvm/mlir (validated on NPU, 2026-06-15..17)
 
 The CPU cpp backend proved the HOP path; the dvm/mlir Inductor backend
 (`TORCHINDUCTOR_NPU_BACKEND=dvm`, an out-of-tree torch_npu graph-fusion compiler)
 proved its **extensibility to a non-Triton, non-cpp compiler on a real accelerator**.
-This section records what was found, the resulting refactor, and the one torch_npu
-change required.
+This section records what was found, the resulting refactor, the one torch_npu
+change required, and the debugging journey to full T5.
 
 ### 10.1 Result
 
-`relu(a @ b + a) * 2` compiled on NPU under `enable_device_with_fusion("npu", ...)`:
-the dvm-fused pointwise kernel (`dvm_fused_add_mul_relu_0`, the `a@b` stays an extern)
-is embedded as **one `compiled_kernel_wrapper_mutation` HOP node**, the side table
-holds one kernel, and `out` matches eager (`numerics match eager: True`). The dvm
-launch ran at run time through the HOP's dense impl, so the launcher contract and the
-mutation set are both correct end to end.
+Small kernel: `relu(a @ b + a) * 2` on NPU under `enable_device_with_fusion("npu", ...)`
+embeds the dvm-fused pointwise kernel (`dvm_fused_add_mul_relu_0`, the `a@b` stays an
+extern) as **one `compiled_kernel_wrapper_mutation` HOP node**; the side table holds
+one kernel and `out` matches eager. The dvm launch runs at run time through the HOP's
+dense impl, so the launcher contract and the mutation set are correct end to end.
 
-End-to-end validation lives out of tree in
-`prototypes/dvm_fxwrapper_runtime_probe.py` (Phase 1 = stock WrapperFxCodegen blocks
-at the definition gate; Phase 2 = DvmBackend succeeds) and a static
-source-analysis companion `prototypes/dvm_fxwrapper_static_probe.py`.
+Full model: **T5 runs end to end through dvm + fx_wrapper + the HOP** (static shapes,
+then dynamic shapes once the dvm runtime version was aligned, see 10.5). This is the
+real-model validation the cpp backend got, on a different compiler and accelerator.
+
+Validation/repro scripts (out of tree): `prototypes/dvm_fxwrapper_runtime_probe.py`
+(Phase 1 stock WrapperFxCodegen blocks at the definition gate; Phase 2 DvmBackend
+succeeds), the static companion `prototypes/dvm_fxwrapper_static_probe.py`, and the
+softmax-kernel repros `prototypes/dvm_softmax_repro.py` /
+`prototypes/dvm_softmax_causal_repro.py` (10.5).
 
 ### 10.2 How dvm differs from cpp (and why each assumption broke)
 
@@ -387,17 +391,55 @@ So the honest extensibility cost of a new compiler backend is: **tdc** = one fil
 one `register_compiled_kernel_backend(...)`; **the compiler** = make its scheduling
 emit `arg_types` (or otherwise surface its written-arg set) if it does not already.
 
-### 10.5 Open edges for dvm (not yet covered)
+### 10.5 Debugging journey and lessons (what bringing up T5 taught us)
+
+These cost real time; record them so the next backend bring-up is faster.
+
+1. **dvm compiles at decorator/import time, not via `async_compile`.** The generated
+   code is `@dvm.kernel(...) def <name>_build(k): ...`; the decorator runs
+   `builder(kobj); kobj.setup()` (the C build) the moment the module is loaded. So
+   `DvmBackend.compile_kernel`'s `PyCodeCache.load(...)` *is* where the dvm build runs
+   -- a build-time crash surfaces there, and there is no future to await for the
+   native path. (We briefly added a "load under the dvm wrapper header" workaround;
+   it was unnecessary and reverted -- the load context was not the problem.)
+
+2. **A DVM build segfault is usually a dvm-compiler limitation, not a tdc bug --
+   isolate with `MODE=native`.** T5's `dvm_fused__softmax_div_eq_masked_fill_matmul_ones_tril`
+   kernel (`ktype='vector'`, bool/`select`/`full(-inf)`) segfaulted inside `kobj.setup`.
+   `dvm_softmax_repro.py MODE=native` (plain dvm, no tdc) reproduces the same crash with
+   an identical fused subgraph, proving it is upstream. Always reduce to a pure-dvm
+   repro before suspecting the integration.
+
+3. **Why native "works" but fx_wrapper crashed on the same model: the int64 fallback.**
+   `_codegen_dvm_kernel` falls back to `import_fx` (no dvm build) iff some node is
+   unsupported -- in particular a placeholder whose dtype is not in `DVM_SUPPORT_TYPE`
+   (`[bf16, f16, f32, int32, bool]`; **int64 is excluded**). Native T5's softmax kernel
+   computes the causal mask in-graph from **int64** position indices (`sub` + `le`), so
+   it has int64 placeholders -> fallback -> never builds -> no crash. The kernel that
+   crashed had only bool/float inputs (the int64 math fused/folded elsewhere), so dvm
+   built it and hit the bug. `dvm_softmax_causal_repro.py` keeps the int64 position
+   arithmetic to mirror this; `dvm_softmax_repro.py` (bool mask direct) does not, so it
+   builds and crashes in both modes -- a clean repro of the *build bug* but not of the
+   divergence. Lesson: whether a kernel is built vs falls back is a fragile property of
+   the fused subgraph's dtypes; do not rely on it.
+
+4. **Version skew bites silently.** With a mismatched dvm runtime, dynamic-shape T5
+   failed at run time with `aten::reshape(... [64, None, 128])` -- a backed symint
+   (`s77`) reaching the kernel as `None`. The fx graph and host-gm input binding were
+   correct; the fault was a **dvm version mismatch**, not the `_uwu_`/symbolic-arg path
+   we first suspected. Aligning the dvm/torch_npu/torch versions fixed it. Before
+   deep-diving a runtime symint/None error on this stack, verify the dvm build matches.
+
+### 10.6 Open edges for dvm (not yet covered)
 
 - In-place mutated buffers: dvm duplicates such a buffer into both the input and the
   output section of `call_args`; arg_types marks the output occurrence written and the
-  input occurrence const. The validated kernel is pure pointwise (no in-place), so the
+  input occurrence const. The validated kernels are pure pointwise (no in-place), so the
   duplicate-arg case vs HOP functionalization is unverified. Overlaps with the
   section-8 multi-output/aliasing edge.
-- Dynamic shape / `_uwu_` symbolic-arg lines (R1): dvm's `call_kernel` writes those as
-  bare-string host lines, which FxConverter cannot convert. Not reached by the static
-  example; a dynamic-shape subgraph would surface it (see the static probe's R1
-  finding).
-- Larger / real models (T5-scale): multi-kernel, reductions, extern interleaving --
-  same validation we did for cpp.
-- The `.run`+stream launcher form and the `import_fx` fallback kernel.
+- The `.run`+stream launcher form and the `import_fx` fallback kernel (the validated
+  kernels used the plain builder-function call path).
+- `_uwu_` symbolic-arg bare-string host lines (R1) remain a theoretical gap if a kernel
+  ever needs them under fx_wrapper -- not hit by T5 (the dynamic failure there was the
+  version skew in 10.5.4, not R1), but still worth routing through WrapperLine IR if it
+  appears.
