@@ -129,6 +129,9 @@ class CompiledKernelFxWrapper(WrapperFxCodegen):
     def compile_graph(self, gm):
         if _active_fusion_backend is None:
             return super().compile_graph(gm)
+        for n in gm.graph.nodes:
+            if "example_value" not in n.meta and n.meta.get("val") is not None:
+                n.meta["example_value"] = n.meta["val"]
         example_inputs = [
             n.meta["val"] for n in gm.graph.nodes if n.op == "placeholder"
         ]

@@ -12,7 +12,7 @@ operator-dispatch mechanisms, then dumps the generated C++ host code:
                           `aoti_torch_proxy_executor_call_function(...)`.
 
 Run:  python cpp_wrapper_dispatch_demo.py
-Writes the full generated C++ to cpp_wrapper_dump.cpp next to this file.
+Writes the full generated C++ to cpp_wrapper_dump.py next to this file.
 """
 import os
 
@@ -54,7 +54,7 @@ def main():
     result, code = run_and_get_cpp_code(compiled, a, b, x, y)
     print("numeric:", "MATCH" if torch.allclose(result, ref, atol=1e-4) else "MISMATCH")
 
-    out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cpp_wrapper_dump.cpp")
+    out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cpp_wrapper_dump.py")
     with open(out, "w") as f:
         f.write(code)
     print(f"dumped {len(code.splitlines())} lines of generated C++ to {out}")

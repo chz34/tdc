@@ -20,6 +20,8 @@ from torch_dispatch_capture.v3.fallback_hijack import (
     force_all_fallback_lowerings,
 )
 
+from torch._dynamo.backends.debugging import aot_eager
+
 #DEVICE = os.environ.get("TDC_DEVICE", "cuda")
 DEVICE = "cpu"
 
@@ -43,6 +45,12 @@ def main():
 
         # Choice 1: run the normal fused result.
         out = result.compiled(a, b)
+        print("compiled output:", out)
+        print("ref output:", ref)
+        assert torch.allclose(out, fn(a, b), atol=1e-3), "numeric mismatch"
+
+        compiled_fn = tdcv4.compile_with_gm_backend(fn, aot_eager)
+        out = compiled_fn(a, b)
         print("compiled output:", out)
         print("ref output:", ref)
         assert torch.allclose(out, fn(a, b), atol=1e-3), "numeric mismatch"

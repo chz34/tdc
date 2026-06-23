@@ -57,7 +57,11 @@ def main():
 
     gm = captured["gm"]
     print("=== host FX graph (fx_wrapper output) ===")
-    gm.graph.print_tabular()
+    gm.print_readable()
+    print("-----------------------------------------")
+    print(gm.graph)
+    print("=========================================")
+
 
     hop_nodes = [
         n for n in gm.graph.nodes
